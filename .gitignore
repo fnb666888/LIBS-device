@@ -1,0 +1,179 @@
+# ============================================================================
+# LIBS 仓库忽略规则
+#
+# 目标：只跟踪「我们自己写的、构成系统逻辑的」内容。
+#       构建产物、厂商 SDK 二进制、现场部署包、本机私有配置一律不进仓库。
+#
+# 原则：
+#   1. 二进制永远不进仓库（体积大、不可 review、diff 无意义）。
+#   2. 厂商参考资料保留「可读的协议文档」，丢弃「可重新下载的安装包 / 示例工程产物」。
+#   3. 含本机现场信息（COM 口、SDK 绝对路径）的配置文件永远不进仓库。
+#   4. 本文件同时作为根兜底；src/.gitignore 保留，两者规则一致不冲突。
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# 1. 编译 / 链接产物
+# ----------------------------------------------------------------------------
+# src/build/ 由 src/build.ps1 生成（静态库、测试 exe、假 SDK dll）
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.gch
+*.pch
+
+# 调试符号 / 映射文件
+*.pdb
+*.ilk
+*.idb
+*.exp
+*.map
+
+# 依赖与中间态
+*.d
+*.tlog
+*.lastbuildstate
+.vs/
+
+# ----------------------------------------------------------------------------
+# 2. 厂商参考资料 device-references
+# ----------------------------------------------------------------------------
+# AvaSpec 官方 SDK：628 MB（安装包 + 12 种语言的示例工程 + 各平台预编译产物）。
+# 全部内容都能从厂商官网重新取得，我方只用到 avaspecx64.dll 的导出表，
+# 因此整棵子树忽略；需要时按本文件与 README 的说明重新下载。
+device-references/spectrometer/avaspec-sdk/
+
+# 其余设备目录里跟随资料附带的安装包与示例工程归档：体积大且可重新获取。
+device-references/**/*.zip
+device-references/**/*.rar
+device-references/**/*.7z
+device-references/**/*.exe
+device-references/**/*.dll
+device-references/**/*.lib
+device-references/**/*.chm
+
+# 串口调试工具（sscom51 / 网口5色）的本机配置与日志：含本机 COM 口配置
+device-references/**/USB和485串口测试工具/
+
+# 刻意保留：上面只按「可重新获取的二进制/归档」列扩展名，.txt / .md / .xlsx /
+# .pdf / .png 一律不匹配，因此以下协议文档仍会正常入库——它们是解析代码的唯一依据：
+#   device-references/laser/air_cooled_laser_rs232_protocol.txt
+#   device-references/rangefinder/TOF101_Modbus通信协议说明.md 及配图 *.png
+#   device-references/air-conditioning/空调设备协议.pdf
+#   device-references/serial-devices/.../科隆威3色灯通讯协议v2.19.xlsx
+#   device-references/serial-devices/.../usb报警灯Python示例.txt
+# 合计 < 6 MB，必须随仓库走，否则换机器无法复现驱动行为。
+
+# ----------------------------------------------------------------------------
+# 3. 部署产物与现场运行数据
+# ----------------------------------------------------------------------------
+# output/ 是发布包输出目录（工控机上的运行时目录）
+output/*
+!output/.gitkeep
+
+# 原始光谱 / 测量记录等运行期落盘数据
+data/
+measurements/
+results/
+*.raw
+*.spe
+
+# 本机站点配置：含工控机 COM 口号与本地 SDK 绝对路径，刻意不进包也不进仓库
+site.json
+site.*.json
+!site.example.json
+*.local.json
+
+# ----------------------------------------------------------------------------
+# 4. IDE / 编辑器
+# ----------------------------------------------------------------------------
+.vscode/
+.idea/
+.cache/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ----------------------------------------------------------------------------
+# 5. Windows 垃圾文件
+# ----------------------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*~
+
+# ----------------------------------------------------------------------------
+# 6. Python（未来 remote / lpc_cli 工具链）
+# ----------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+.venv/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+*.egg
+dist/
+
+# ----------------------------------------------------------------------------
+# 7. 密钥与凭据（工控机部署涉及 SSH，绝不入库）
+# ----------------------------------------------------------------------------
+*.pem
+*.key
+*.pfx
+*.p12
+id_rsa
+id_rsa.*
+id_ed25519
+known_hosts
+.env
+.env.*
+!.env.example
+secrets/
+credentials/
+config.local.*
+
+# ----------------------------------------------------------------------------
+# 8. 日志与转储
+# ----------------------------------------------------------------------------
+*.log
+logs/
+*.dmp
+*.crash
+core
+nohup.out
+
+
+
