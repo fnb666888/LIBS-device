@@ -111,6 +111,10 @@ CaptureCoordinator::SyncView CaptureCoordinator::sync_view(const config::SiteCon
 
 json::Value CaptureCoordinator::to_payload(const std::vector<libs::devices::ScanGroup>& groups) {
     json::Value root = json::object();
+    // 这条链路来自激光诱导击穿光谱仪。明确标记来源，防止下游把原始
+    // wavelength/counts 误当成附件里的近红外十项成分或模型相似度结果。
+    root.set("spectrum_source", json::Value("LIBS"));
+    root.set("spectrum_format", json::Value("wavelength_nm+counts"));
     json::Value scan_groups = json::array();
     for (const libs::devices::ScanGroup& group : groups) {
         json::Value g = json::object();

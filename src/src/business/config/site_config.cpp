@@ -210,6 +210,27 @@ Result<GatewayConfig> parse_gateway(const json::Value& parent) {
     const Result<bool> en = optional_bool(node, "enabled", false);
     if (!en) return en.error();
     cfg.enabled = en.value();
+
+    const auto optional_string = [&](const char* key, std::string& out) -> VoidResult {
+        const json::Value& v = node[key];
+        if (v.is_null()) return VoidResult();
+        if (!v.is_string()) return invalid(std::string("gateway.") + key + " must be a string");
+        out = v.as_string();
+        return VoidResult();
+    };
+    for (auto field : {std::pair<const char*, std::string*>("base_url", &cfg.base_url),
+                       std::pair<const char*, std::string*>("product_id", &cfg.product_id),
+                       std::pair<const char*, std::string*>("device_id", &cfg.device_id),
+                       std::pair<const char*, std::string*>("token", &cfg.authorization_token),
+                       std::pair<const char*, std::string*>("equipment_id", &cfg.equipment_id),
+                       std::pair<const char*, std::string*>("equipment_type", &cfg.equipment_type),
+                       std::pair<const char*, std::string*>("customs", &cfg.customs)}) {
+        const VoidResult r = optional_string(field.first, *field.second);
+        if (!r) return r.error();
+    }
+    const Result<unsigned> timeout = optional_uint(node, "timeout_ms", "gateway", cfg.timeout_ms);
+    if (!timeout) return timeout.error();
+    cfg.timeout_ms = timeout.value();
     return cfg;
 }
 
@@ -425,6 +446,14 @@ json::Value to_json(const SiteConfig& config) {
     gw.set("observed_ip", json::Value(config.gateway.observed_ip));
     gw.set("port", json::Value(static_cast<double>(config.gateway.port)));
     gw.set("enabled", json::Value(config.gateway.enabled));
+    gw.set("base_url", json::Value(config.gateway.base_url));
+    gw.set("product_id", json::Value(config.gateway.product_id));
+    gw.set("device_id", json::Value(config.gateway.device_id));
+    gw.set("token", json::Value(config.gateway.authorization_token));
+    gw.set("equipment_id", json::Value(config.gateway.equipment_id));
+    gw.set("equipment_type", json::Value(config.gateway.equipment_type));
+    gw.set("customs", json::Value(config.gateway.customs));
+    gw.set("timeout_ms", json::Value(static_cast<double>(config.gateway.timeout_ms)));
     v.set("gateway", std::move(gw));
 
     json::Value cv = json::object();
@@ -445,6 +474,16 @@ json::Value to_json(const SiteConfig& config) {
     v.set("air_conditioner_address", json::Value(static_cast<double>(config.air_conditioner_address)));
     v.set("capture_timeout_ms", json::Value(static_cast<double>(config.capture_timeout_ms)));
     v.set("integration_ms", json::Value(config.integration_ms));
+    return v;
+}
+
+json::Value to_json_redacted(const SiteConfig& config) {
+    json::Value v = to_json(config);
+    auto it = v.as_object().find("gateway");
+    if (it != v.as_object().end() && it->second.is_object()) {
+        it->second.set("token", json::Value());
+        it->second.set("token_configured", json::Value(!config.gateway.authorization_token.empty()));
+    }
     return v;
 }
 
@@ -548,6 +587,26 @@ VoidResult validate(const SiteConfig& config) {
     // 联锁纪律：未标定不得启用（范围报告 §3.9.2）。
     if (config.ac_interlock.enabled && !config.ac_interlock.calibrated)
         return invalid("ac_interlock is enabled without a calibrated threshold");
+
+    if (config.gateway.timeout_ms == 0)
+        return invalid("gateway.timeout_ms must be positive");
+    if (config.gateway.enabled) {
+        if (config.gateway.base_url.empty())
+            return invalid("gateway.base_url is required when gateway.enabled=true");
+        if (config.gateway.base_url.rfind("http://", 0) != 0 &&
+            config.gateway.base_url.rfind("https://", 0) != 0)
+            return invalid("gateway.base_url must start with http:// or https://");
+        if (config.gateway.product_id.empty())
+            return invalid("gateway.product_id is required when gateway.enabled=true");
+        if (config.gateway.device_id.empty())
+            return invalid("gateway.device_id is required when gateway.enabled=true");
+        if (config.gateway.authorization_token.empty())
+            return invalid("gateway.token is required when gateway.enabled=true");
+        if (config.gateway.equipment_id.empty())
+            return invalid("gateway.equipment_id is required when gateway.enabled=true");
+        if (config.gateway.equipment_type.empty())
+            return invalid("gateway.equipment_type is required when gateway.enabled=true");
+    }
 
     const VoidResult lf = validate_laser_fire(config.laser_fire);
     if (!lf) return lf;

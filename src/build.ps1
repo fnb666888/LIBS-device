@@ -57,6 +57,7 @@ $layers = [ordered]@{
         "src/business/time_util.cpp",
         "src/business/json/json.cpp",
         "src/business/config/site_config.cpp",
+        "src/business/integration/heike_events.cpp",
         "src/business/session/device_session.cpp",
         "src/business/policy/detection_config.cpp",
         "src/business/policy/gate.cpp",

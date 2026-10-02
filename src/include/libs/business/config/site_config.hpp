@@ -68,6 +68,17 @@ struct GatewayConfig {
     std::string observed_ip;                // 快照中观察到的地址，如 192.168.100.100
     unsigned port = 0;                      // 0 = 协议未定，不猜
     bool enabled = false;                   // 无网络传输层，默认关闭（范围报告 §3.5.2 G2）
+
+    // 海关智能设备接入管理边端的出站上报配置。附件文档中的 IP、token
+    // 只是示例，绝不写死在代码里；enabled=false 时这些字段可以为空。
+    std::string base_url;                   // 例如 http://edge-host:port
+    std::string product_id;                 // 边端下发的产品 ID
+    std::string device_id;                  // 边端下发的设备 ID
+    std::string authorization_token;        // Bearer token；config_show 会脱敏
+    std::string equipment_id;               // HEARTBEAT/EVENT/OPENINIT 使用
+    std::string equipment_type;             // HEARTBEAT/EVENT/OPENINIT 使用
+    std::string customs;                    // 所属直属海关，可选
+    unsigned timeout_ms = 5000;             // 预留给 HTTP 客户端的请求超时
 };
 
 // 传送带是否由本软件控制（范围报告 §2.3：需要一次确认，暂列假设）。
@@ -155,6 +166,9 @@ libs::Result<SiteConfig> from_json(const json::Value& value);
 
 // 序列化为 JSON。用于 `config validate` 的回显与远端查询。
 json::Value to_json(const SiteConfig& config);
+
+// 与 to_json 相同，但不回显网关 Bearer token。用于 config_show、状态和日志。
+json::Value to_json_redacted(const SiteConfig& config);
 
 // 加载并解析一个配置文件（UTF-8）。
 //   * 文件不存在 -> ErrorKind::invalid_argument（不是 transport：这是配置问题）

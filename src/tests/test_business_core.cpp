@@ -8,6 +8,7 @@
 #include "check.hpp"
 #include "libs/business/json/json.hpp"
 #include "libs/business/config/site_config.hpp"
+#include "libs/business/integration/heike_events.hpp"
 #include "libs/business/policy/detection_config.hpp"
 #include "libs/business/policy/gate.hpp"
 
@@ -192,6 +193,92 @@ CASE(config_gateway_default_is_disabled_and_portless); {
     const config::SiteConfig fresh;
     CHECK(!fresh.gateway.enabled);
     CHECK_EQ(fresh.gateway.port, 0u);
+}
+
+CASE(config_gateway_enabled_requires_real_edge_fields); {
+    bool ok = false;
+    const Value bad = parsed(R"({
+        "station_id":"s1",
+        "laser":{"enabled":false}, "rangefinder":{"enabled":false},
+        "indicator":{"enabled":false}, "air_conditioner":{"enabled":false},
+        "spectrometer":{"enabled":false},
+        "gateway":{"enabled":true,"base_url":"http://127.0.0.1:18100",
+          "product_id":"p","device_id":"d","token":"secret"}
+    })", ok);
+    CHECK(ok);
+    CHECK(!config::from_json(bad).ok());
+
+    const Value good = parsed(R"({
+        "station_id":"s1",
+        "laser":{"enabled":false}, "rangefinder":{"enabled":false},
+        "indicator":{"enabled":false}, "air_conditioner":{"enabled":false},
+        "spectrometer":{"enabled":false},
+        "gateway":{"enabled":true,"base_url":"http://127.0.0.1:18100",
+          "product_id":"p","device_id":"d","token":"secret",
+          "equipment_id":"e","equipment_type":"LIBS"}
+    })", ok);
+    CHECK(ok);
+    const auto loaded = config::from_json(good);
+    CHECK(loaded.ok());
+    if (loaded.ok()) {
+        CHECK(config::to_json(loaded.value())["gateway"]["token"].as_string() == "secret");
+        CHECK(config::to_json_redacted(loaded.value())["gateway"]["token"].is_null());
+        CHECK(config::to_json_redacted(loaded.value())["gateway"]["token_configured"].as_bool());
+    }
+}
+
+CASE(heike_device_reports_are_separate_from_model_envelopes); {
+    integration::heike::DeviceIdentity identity{"dev-1", "LIBS", "黄埔海关",
+                                                 "2026-10-03 12:00:00"};
+    const auto heartbeat = integration::heike::make_heartbeat(identity);
+    CHECK(heartbeat.ok());
+    if (heartbeat.ok()) {
+        CHECK(heartbeat.value()["equipmentID"].as_string() == "dev-1");
+        CHECK(heartbeat.value()["timeseries"].as_string() == "2026-10-03 12:00:00");
+        CHECK(!heartbeat.value().has("eventCode"));
+    }
+
+    const auto event = integration::heike::make_runtime_event(identity, "1", "1");
+    CHECK(event.ok());
+    if (event.ok()) CHECK(event.value()["data"]["code"].as_string() == "1");
+
+    integration::heike::EnvelopeInput input;
+    input.biz_id = "DECL-1";
+    input.customs_code = "4401";
+    input.event_code = "MODEL003";
+    input.event_source = "LIBS-device";
+    input.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    input.event_content = json::object();
+    input.event_content.set("nirSimlarityRESULT", json::object());
+    const auto model = integration::heike::make_model_event(input);
+    CHECK(model.ok());
+    if (model.ok()) {
+        CHECK(model.value()["eventCode"].as_string() == "MODEL003");
+        CHECK(model.value()["eventContent"].is_object());
+        CHECK_EQ(integration::heike::model_event_name("MODEL003"),
+                 std::string("SpectrumIdentify"));
+    }
+}
+
+CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
+    integration::heike::LibsCaptureContext context;
+    context.biz_id = "DECL-1";
+    context.customs_code = "4401";
+    context.belt_code = "B01";
+    context.edge_code = "ZG";
+    context.collect_time = "2026-10-03 12:00:00";
+    context.seq_no = 1;
+    context.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    context.event_code = "LIBS_RAW_V1";
+    json::Value raw = json::object();
+    raw.set("scan_groups", json::array());
+    const auto result = integration::heike::make_libs_raw_event(context, raw, true);
+    CHECK(result.ok());
+    if (result.ok()) {
+        CHECK(result.value()["eventContent"].is_string());
+        CHECK(!result.value()["contentSize"].as_string().empty());
+        CHECK(result.value()["eventCode"].as_string() == "LIBS_RAW_V1");
+    }
 }
 
 CASE(config_conveyor_not_software_controlled_by_default); {

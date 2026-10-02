@@ -105,6 +105,33 @@ CASE(config_show_echoes_the_running_config); {
     CHECK(!response.payload["laser"]["enabled"].as_bool(true));
 }
 
+CASE(heike_report_preview_never_sends_and_keeps_libs_distinct); {
+    Fixture f("heike_preview");
+    const app::Response response = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"libs_raw","biz_id":"DECL-1","customs_code":"4401",
+        "belt_code":"B01","edge_code":"ZG","collect_time":"2026-10-03 12:00:00",
+        "seq_no":1,"message_id":"123e4567-e89b-12d3-a456-426614174000",
+        "event_code":"LIBS_RAW_V1","raw_capture":{"spectrum_source":"LIBS","scan_groups":[]},
+        "event_content_as_string":true}})");
+    CHECK(response.ok);
+    if (response.ok) {
+        CHECK(!response.payload["sent"].as_bool(true));
+        CHECK_EQ(response.payload["transport"].as_string(), std::string("dry_run"));
+        CHECK(response.payload["payload"]["eventContent"].is_string());
+        CHECK(response.payload["warning"].as_string().find("不能冒充") != std::string::npos);
+    }
+}
+
+CASE(heike_report_preview_rejects_invalid_model_without_fabricating_result); {
+    Fixture f("heike_model_bad");
+    const app::Response response = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"model","biz_id":"DECL-1","customs_code":"4401",
+        "event_code":"MODEL003","event_source":"LIBS-device",
+        "message_id":"not-a-uuid","event_content":{}}})");
+    CHECK(!response.ok);
+    CHECK_EQ(response.error.kind, ErrorKind::invalid_argument);
+}
+
 CASE(status_reports_gate_and_stage_without_claiming_sync); {
     Fixture f("status");
     const app::Response response = f.facade.dispatch(R"({"command":"status","args":{}})");

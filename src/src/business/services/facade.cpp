@@ -6,6 +6,7 @@
 #include <sstream>
 #include <utility>
 
+#include "libs/business/integration/heike_events.hpp"
 #include "libs/business/services/composition.hpp"
 #include "libs/business/services/capture.hpp"
 #include "libs/business/services/data_delivery.hpp"
@@ -208,6 +209,8 @@ std::vector<std::string> BusinessFacade::commands() {
         "recovery_write",
         "health",
         "spectrum_stream",
+        // 海关报文只提供离线构造/校验；未配置正式边端时绝不联网。
+        "heike_report_preview",
     };
 }
 
@@ -264,6 +267,7 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "recovery_list")   return cmd_recovery_list(args);
     if (command == "recovery_write")  return cmd_recovery_write(args);
     if (command == "health")          return cmd_health(args);
+    if (command == "heike_report_preview") return cmd_heike_report_preview(args);
     return Response::failure(libs::Error::make(
         libs::ErrorKind::unsupported, "unknown_command",
         "未知命令: " + command + "；可用命令见 commands 字段"));
@@ -284,7 +288,8 @@ Response BusinessFacade::cmd_ping(const json::Value& args) {
 Response BusinessFacade::cmd_config_show(const json::Value& args) {
     (void)args;
     // 回显当前生效配置。注意这是**内存里正在用的**配置，不是磁盘上那份文件。
-    return Response::success(config::to_json(runtime_.config()));
+    // 网关 Bearer token 属于凭证，不能通过命名管道、日志或 UI 回显。
+    return Response::success(config::to_json_redacted(runtime_.config()));
 }
 
 Response BusinessFacade::cmd_status(const json::Value& args) {
@@ -963,6 +968,133 @@ Response BusinessFacade::cmd_recovery_write(const json::Value& args) {
     v.set("path", json::Value(path.value()));
     v.set("written", json::Value(true));
     v.set("note", json::Value("只写快照，不执行任何恢复动作（任务书 §6.2）"));
+    return Response::success(std::move(v));
+}
+
+Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
+    // 这是报文构造/契约检查入口，不是网络发送入口。附件里的边端地址和
+    // Bearer token 仍需甲方确认，且当前 LIBS 没有 NIR/模型结果可供伪造。
+    const std::string kind = args.has("kind") ? args["kind"].as_string() : "";
+    if (kind.empty()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "heike_report_kind_required",
+            "heike_report_preview 需要 kind=heartbeat/event/openinit/alarm/libs_raw/model"));
+    }
+
+    libs::Result<json::Value> payload = libs::Error::make(
+        libs::ErrorKind::invalid_argument, "heike_report_not_built", "未构造报文");
+    std::string event_name;
+
+    if (kind == "heartbeat" || kind == "event" || kind == "openinit" || kind == "alarm") {
+        integration::heike::DeviceIdentity identity;
+        identity.equipment_id = args["equipment_id"].as_string();
+        identity.equipment_type = args["equipment_type"].as_string();
+        identity.customs = args["customs"].as_string();
+        identity.timeseries = args["timeseries"].as_string();
+
+        if (kind == "heartbeat") {
+            event_name = "HEARTBEAT";
+            payload = integration::heike::make_heartbeat(identity);
+        } else if (kind == "event") {
+            event_name = "EVENT";
+            payload = integration::heike::make_runtime_event(
+                identity, args["code"].as_string(), args["value"].as_string());
+        } else if (kind == "openinit") {
+            event_name = "OPENINIT";
+            if (!args.has("stats") || !args["stats"].is_array()) {
+                payload = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                             "heike_stats_required",
+                                             "openinit 需要 stats 数组");
+            } else {
+                std::vector<integration::heike::DailyStat> stats;
+                for (const json::Value& item : args["stats"].as_array()) {
+                    if (!item.is_object()) {
+                        payload = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                                    "heike_stat_bad_item",
+                                                    "stats 每项必须是对象");
+                        break;
+                    }
+                    integration::heike::DailyStat stat;
+                    stat.date = item["date"].as_string();
+                    stat.count = static_cast<std::int64_t>(item["count"].as_number(-1));
+                    stat.online_period_s = static_cast<std::int64_t>(
+                        item["online_period_s"].as_number(-1));
+                    stats.push_back(std::move(stat));
+                    payload = integration::heike::make_openinit(identity, stats);
+                }
+            }
+        } else {
+            event_name = "ALARM";
+            if (!args.has("alarms") || !args["alarms"].is_array()) {
+                payload = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                             "heike_alarms_required",
+                                             "alarm 需要 alarms 数组");
+            } else {
+                std::vector<integration::heike::Alarm> alarms;
+                for (const json::Value& item : args["alarms"].as_array()) {
+                    if (!item.is_object()) {
+                        payload = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                                    "heike_alarm_bad_item",
+                                                    "alarms 每项必须是对象");
+                        break;
+                    }
+                    integration::heike::Alarm alarm;
+                    alarm.name = item["name"].as_string();
+                    alarm.type = item["type"].as_string();
+                    alarm.color = item["color"].as_string();
+                    alarm.firsttime = item["firsttime"].as_string();
+                    alarm.time = item["time"].as_string();
+                    alarm.value = item["value"].as_string();
+                    alarm.remake = item["remake"].as_string();
+                    alarms.push_back(std::move(alarm));
+                    payload = integration::heike::make_alarm(identity, alarms);
+                }
+            }
+        }
+    } else if (kind == "libs_raw") {
+        event_name = args["event_name"].as_string();
+        integration::heike::LibsCaptureContext context;
+        context.biz_id = args["biz_id"].as_string();
+        context.customs_code = args["customs_code"].as_string();
+        context.belt_code = args["belt_code"].as_string();
+        context.edge_code = args["edge_code"].as_string();
+        context.collect_time = args["collect_time"].as_string();
+        context.seq_no = static_cast<std::int64_t>(args["seq_no"].as_number(0));
+        context.event_source = args.has("event_source")
+                                   ? args["event_source"].as_string()
+                                   : "LIBS-device";
+        context.message_id = args["message_id"].as_string();
+        context.event_code = args["event_code"].as_string();
+        payload = integration::heike::make_libs_raw_event(
+            context, args["raw_capture"], args["event_content_as_string"].as_bool(false));
+    } else if (kind == "model") {
+        integration::heike::EnvelopeInput input;
+        input.biz_id = args["biz_id"].as_string();
+        input.customs_code = args["customs_code"].as_string();
+        input.event_code = args["event_code"].as_string();
+        input.event_source = args["event_source"].as_string();
+        input.message_id = args["message_id"].as_string();
+        input.event_content = args["event_content"];
+        input.event_content_as_string = args["event_content_as_string"].as_bool(false);
+        input.notes = args["notes"].as_string();
+        input.version = args["version"].as_string();
+        event_name = integration::heike::model_event_name(input.event_code);
+        payload = integration::heike::make_model_event(input);
+    } else {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "heike_report_bad_kind",
+            "kind 只能是 heartbeat/event/openinit/alarm/libs_raw/model"));
+    }
+
+    if (!payload) return Response::failure(payload.error());
+    json::Value v = json::object();
+    v.set("transport", json::Value("dry_run"));
+    v.set("sent", json::Value(false));
+    v.set("event_name", json::Value(event_name));
+    v.set("payload", std::move(payload.value()));
+    v.set("gateway_enabled", json::Value(runtime_.config().gateway.enabled));
+    v.set("warning", json::Value(
+        "仅完成报文校验与预览，未访问外部边端；LIBS 原始光谱不能冒充近红外/模型结果"));
     return Response::success(std::move(v));
 }
 
