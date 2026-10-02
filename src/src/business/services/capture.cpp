@@ -85,7 +85,10 @@ libs::Result<libs::devices::CaptureResult> CaptureCoordinator::capture(libs::dev
 libs::Result<libs::devices::CaptureResult> CaptureCoordinator::capture(libs::devices::Spectrometer* device,
                                                                       const CapturePace& pace,
                                                                       bool wait_for_laser_trigger,
-                                                                      double integration_delay_ns) const {
+                                                                      double integration_delay_ns,
+                                                                      bool spectrometer_triggers_laser,
+                                                                      std::uint32_t laser_delay_cycles,
+                                                                      std::uint32_t laser_width_cycles) const {
     if (device == nullptr) {
         return libs::Error::make(libs::ErrorKind::unsupported, "spectrometer_not_open",
                                  "光谱仪未打开或未启用，无法采集");
@@ -96,6 +99,9 @@ libs::Result<libs::devices::CaptureResult> CaptureCoordinator::capture(libs::dev
     // 其余（通道、积分时间、扫描次数）仍由配置给出。
     request.value().wait_for_laser_trigger = wait_for_laser_trigger;
     request.value().integration_delay_ns = integration_delay_ns;
+    request.value().spectrometer_triggers_laser = spectrometer_triggers_laser;
+    request.value().laser_delay_cycles = laser_delay_cycles;
+    request.value().laser_width_cycles = laser_width_cycles;
     return device->capture(request.value());
 }
 

@@ -116,6 +116,7 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture() {
     // 不带覆盖：全部取站点配置，等价于"按已标定值出光"。
     FireParameters params;
     params.laser = runtime_.config().laser_fire;
+    params.laser_clock_mode = static_cast<std::uint8_t>(params.laser.laser_clock_mode);
     params.integration_ms = static_cast<double>(runtime_.config().integration_ms);
     params.capture_timeout_ms = runtime_.config().capture_timeout_ms;
     return fire_and_capture(params);
@@ -123,6 +124,9 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture() {
 
 libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters& params) {
     FireRecord record;
+    const bool spectrometer_fires = params.spectrometer_triggers_laser;
+    record.trigger_direction = spectrometer_fires ? "spectrometer_to_laser"
+                                                  : "laser_to_spectrometer";
 
     // ── 1. 设备在位 ──────────────────────────────────────────────────────────
     libs::devices::Laser* laser = this->laser();
@@ -201,6 +205,56 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
     // 但厂家工具整个日志历史里从没用过它，跑的是
     //   工作=1 -> 等设备进入「正在工作且放电」-> 光闸=1 -> 保持 -> 光闸=0 -> 停机。
     const config::LaserFireConfig& cfg = params.laser;
+    libs::Error fire_error{};
+
+    // 反向路径必须先把激光器切到外部时钟模式，否则 Pin 23 的 TTL
+    // 只会在光谱仪端有波形，激光器仍按内部时钟工作，表现为“采到背景谱”。
+    // 0x22 不是 EEPROM 保存动作；仅在本次会话下发。正向会话写 0 恢复
+    // 内部时钟，避免前一发反向会话的外部时钟设置残留。
+    std::uint32_t laser_trigger_delay_cycles = 0;
+    std::uint32_t laser_trigger_width_cycles = 0;
+    if (spectrometer_fires) {
+        if (spectrometer == nullptr) {
+            fire_error = libs::Error::make(libs::ErrorKind::unsupported,
+                                           "spectrometer_not_open",
+                                           "反向触发需要已打开的光谱仪，无法输出 Pin 23 TTL");
+            record.failed_step = "spectrometer_open";
+            record.error_code = fire_error.code;
+            record.error_message = fire_error.message;
+        }
+        if (runtime_.config().spectrometer.master_serial.empty()) {
+            fire_error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                           "spectrometer_master_required",
+                                           "反向触发需要在 spectrometer.master_serial 中明确指定主通道");
+            record.failed_step = "spectrometer_master";
+            record.error_code = fire_error.code;
+            record.error_message = fire_error.message;
+        }
+        if (params.laser_clock_mode != 1 && params.laser_clock_mode != 2) {
+            fire_error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                           "bad_laser_clock_mode",
+                                           "反向触发要求 laser_clock_mode 为 1 或 2");
+            record.failed_step = "set_clock_mode";
+            record.error_code = fire_error.code;
+            record.error_message = fire_error.message;
+        } else {
+            const double width_ns = params.laser_trigger_width_ns > 0.0
+                                        ? params.laser_trigger_width_ns
+                                        : static_cast<double>(cfg.pulse_width_us) * 1000.0;
+            if (!libs::devices::FpgaTime::laser_nanos_to_cycles(
+                    params.laser_trigger_delay_ns, &laser_trigger_delay_cycles) ||
+                !libs::devices::FpgaTime::laser_nanos_to_cycles(
+                    width_ns, &laser_trigger_width_cycles) ||
+                laser_trigger_width_cycles == 0) {
+                fire_error = libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "bad_laser_output_timing",
+                    "反向触发的 Pin 23 延时/脉宽无法换算为有效 FPGA 计数");
+                record.failed_step = "set_laser_output_timing";
+                record.error_code = fire_error.code;
+                record.error_message = fire_error.message;
+            }
+        }
+    }
 
     // 只写**会话参数**（每次检测可调的部分）。
     // 机器配置 0x17 电压限值 / 0x18 Q 分频 / 0x15 温度保护一律不碰：
@@ -215,14 +269,26 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
         {cmd::kQWarmup,             cfg.q_warmup_s,          "set_q_warmup"},
     };
 
-    libs::Error fire_error{};
-
     // 5a. 写会话参数（协议 §3.1，高位在前）
-    for (const Param& p : session_writes) {
-        const libs::Bytes payload{static_cast<std::uint8_t>((p.value >> 8) & 0xFF),
-                                  static_cast<std::uint8_t>(p.value & 0xFF)};
-        const libs::VoidResult r = step(laser, p.command, payload, record, p.name);
-        if (!r) { fire_error = r.error(); break; }
+    if (fire_error.ok()) {
+        for (const Param& p : session_writes) {
+            const libs::Bytes payload{static_cast<std::uint8_t>((p.value >> 8) & 0xFF),
+                                      static_cast<std::uint8_t>(p.value & 0xFF)};
+            const libs::VoidResult r = step(laser, p.command, payload, record, p.name);
+            if (!r) { fire_error = r.error(); break; }
+        }
+    }
+
+    // 5a.1 明确设置本次会话的时钟来源。反向模式必须使用外部时钟；
+    // 正向模式也要恢复内部时钟，避免上一次反向会话把设备留在外时钟状态。
+    if (fire_error.ok()) {
+        const libs::VoidResult r = step(laser, cmd::kClockMode,
+                                        {static_cast<std::uint8_t>(spectrometer_fires
+                                                                        ? params.laser_clock_mode
+                                                                        : 0)},
+                                        record, spectrometer_fires ? "set_external_clock_mode"
+                                                                    : "set_internal_clock_mode");
+        if (!r) fire_error = r.error();
     }
 
     // 5b. 工作状态 = 1（0x21）
@@ -236,7 +302,7 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
     // 工作使能后设备先停在 02「自适应中」，厂家日志里要 5~6 秒才转到
     // 01「正在工作且放电」。固定 sleep 解决不了：太短则触发落空
     // （本项目原先只等 50 ms），太长则白等。所以轮询状态位，看到放电或超时。
-    if (fire_error.ok()) {
+    if (fire_error.ok() && !spectrometer_fires) {
         const auto settle_start = std::chrono::steady_clock::now();
         const auto deadline = settle_start + std::chrono::milliseconds(cfg.settle_timeout_ms);
         bool discharging = false;
@@ -277,12 +343,28 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
         }
     }
 
-    // 5d. 光谱仪 arm 到"等 pin 6 TTL"。
+    // 5d. 按方向布防触发链。
     //
     // 放在这里而不是流程开头：设备此刻已确认在放电，光闸马上要开，
     // 采集超时才只需要覆盖出光窗口本身，而不是把 5~6 秒的自适应时间也算进去。
-    // 方向仍是"激光器触发光谱仪"——光谱仪等外部脉冲，不主动发脉冲。
-    if (fire_error.ok() && spectrometer != nullptr) {
+    // 正向时光谱仪等 Pin 6 外部脉冲；反向时由主通道 Pin 23 发脉冲。
+    if (fire_error.ok() && spectrometer_fires) {
+        // 反向时先打开 Q 门，再让 AVS_Measure 发 Pin 23；不能等待 Pin 6。
+        const libs::VoidResult r = step(laser, cmd::kQGate, {0x01}, record,
+                                        "set_q_gate_1_before_spectrometer_trigger");
+        if (!r) fire_error = r.error();
+        if (fire_error.ok()) {
+            capture_thread = std::thread([&]() {
+                captured = runtime_.capture().capture(
+                    spectrometer, pace, false, delay_ns, true,
+                    laser_trigger_delay_cycles, laser_trigger_width_cycles);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            // 必须在收光前等 SDK 完成本次测量，避免 TTL 在线程退出后才到达。
+            capture_thread.join();
+            record.trigger_output_programmed = true;
+        }
+    } else if (fire_error.ok() && spectrometer != nullptr) {
         capture_thread = std::thread([&]() {
             captured = runtime_.capture().capture(spectrometer, pace, true, delay_ns);
         });
@@ -292,13 +374,13 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
     }
 
     // 5e. 光闸 = 1（0x24）。设备此刻已在放电，打开光闸即开始连续出光。
-    if (fire_error.ok()) {
+    if (fire_error.ok() && !spectrometer_fires) {
         const libs::VoidResult r = step(laser, cmd::kQGate, {0x01}, record, "set_q_gate_1");
         if (!r) fire_error = r.error();
     }
 
     // 5f. 连续出光窗口：按配置保持，光谱仪在这个窗口里等 pin 6 的 TTL。
-    if (fire_error.ok()) {
+    if (fire_error.ok() && !spectrometer_fires) {
         std::this_thread::sleep_for(std::chrono::milliseconds(cfg.emission_hold_ms));
     }
 
@@ -492,6 +574,14 @@ libs::Result<RunRecord> LaserFireService::run_continuous(const FireParameters& p
             record.error_message = run_error.message;
             return run_error;
         }
+    }
+
+    // 明确恢复内部时钟，避免上一次反向会话留下外部时钟模式。
+    if (!record_step(cmd::kClockMode, {0x00}, "set_internal_clock_mode")) {
+        record.failed_step = "set_internal_clock_mode";
+        record.error_code = run_error.code;
+        record.error_message = run_error.message;
+        return run_error;
     }
 
     // 工作 = 1

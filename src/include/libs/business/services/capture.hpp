@@ -92,16 +92,19 @@ public:
     libs::Result<libs::devices::CaptureResult> capture(libs::devices::Spectrometer* device,
                                                       const CapturePace& pace) const;
 
-    // 同上，但**显式覆盖触发方式**。用于出光流程（AvaSoft 手册 §4.9 接法二）：
-    // 那里的触发源就是激光器，光谱仪必须从 pin 6 等它的 TTL，
-    // 因此不能只依赖站点配置里那个"是否等触发"的开关——
-    // 出光流程下它是**必然为真**的物理事实，配置没填也要等。
+    // 同上，但**显式覆盖触发方式**。出光流程按接线方向选择：
+    // laser_to_spectrometer 时从 Pin 6 等激光 TTL；
+    // spectrometer_to_laser 时主通道由 Pin 23 输出 TTL，传入的
+    // laser_*_cycles 写入 AvaSpec Control，且从通道只跟随 SYNC。
     //
     // integration_delay_ns 仍来自站点配置，业务层不猜这个数值。
     libs::Result<libs::devices::CaptureResult> capture(libs::devices::Spectrometer* device,
                                                       const CapturePace& pace,
                                                       bool wait_for_laser_trigger,
-                                                      double integration_delay_ns) const;
+                                                      double integration_delay_ns,
+                                                      bool spectrometer_triggers_laser = false,
+                                                      std::uint32_t laser_delay_cycles = 0,
+                                                      std::uint32_t laser_width_cycles = 0) const;
 
     // 把一次 ScanGroup 抽成"软件视角的同步判断"——原样透传 SDK 标志，
     // 额外记录"业务层是否请求过 synchronized"，但**不合并成一个布尔**。

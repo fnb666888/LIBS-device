@@ -603,6 +603,19 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(!libs::devices::FpgaTime::nanos_to_cycles(1.0e18, &cycles));   // 溢出 uint32
       CHECK(!libs::devices::FpgaTime::nanos_to_cycles(1.0, nullptr));
     }
+    { CASE(laser_output_time_uses_the_unbiased_sdk_formula);
+      // Pin 23 的 laser delay/width 与积分延时使用不同公式：不加 20.84 ns
+      // 偏置。200 us 应得到 9600 个计数，而非积分公式多出来的一个计数。
+      std::uint32_t cycles = 0;
+      CHECK(libs::devices::FpgaTime::laser_nanos_to_cycles(0.0, &cycles));
+      CHECK_EQ(cycles, 0u);
+      CHECK(libs::devices::FpgaTime::laser_nanos_to_cycles(200000.0, &cycles));
+      CHECK_EQ(cycles, 9600u);
+      CHECK(!libs::devices::FpgaTime::laser_nanos_to_cycles(-1.0, &cycles));
+      CHECK_EQ(cycles, 9600u);  // 失败时不得改写出参
+      CHECK(!libs::devices::FpgaTime::laser_nanos_to_cycles(1.0e18, &cycles));
+      CHECK(!libs::devices::FpgaTime::laser_nanos_to_cycles(1.0, nullptr));
+    }
     { CASE(laser_triggered_capture_waits_on_pin6_and_never_drives_the_laser);
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened); if(!opened) show("open", opened.error());
@@ -625,6 +638,72 @@ TEST_MAIN_BEGIN_ARGV()
           // 这两个字段是"光谱仪发 TTL 出去点火激光器"，方向反了现场就永远不出光。
           CHECK_EQ(fake_config_u32(0, 27), 0u);
           CHECK_EQ(fake_config_u32(0, 31), 0u);
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(spectrometer_triggered_capture_programs_pin23_only_on_master);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened); if(!opened) show("open", opened.error());
+      if (opened) {
+          auto& session = *opened.value();
+          libs::devices::CaptureRequest request;
+          request.serials = {"MASTER", "SLAVE1"};
+          request.master_serial = "MASTER";
+          request.synchronized = true;
+          request.spectrometer_triggers_laser = true;
+          request.laser_delay_cycles = 7;
+          request.laser_width_cycles = 42;
+          const auto result = session.capture(request);
+          CHECK(result); if(!result) show("reverse capture", result.error());
+          if (result) CHECK_EQ(result.value().groups.size(), std::size_t(1));
+
+          // Pin 23 output is generated only by the master. The slave follows
+          // the internal SYNC chain and must never emit a second laser pulse.
+          CHECK_EQ(fake_config_u8(0, 22), 0);       // master software-started
+          CHECK_EQ(fake_config_u32(0, 27), 7u);     // laser delay cycles
+          CHECK_EQ(fake_config_u32(0, 31), 42u);    // laser pulse width cycles
+          CHECK_EQ(fake_config_u8(1, 22), 1);       // slave follows SYNC
+          CHECK_EQ(fake_config_u32(1, 27), 0u);
+          CHECK_EQ(fake_config_u32(1, 31), 0u);
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(trigger_direction_conflict_is_rejected_before_sdk);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened); if(!opened) show("open", opened.error());
+      if (opened) {
+          auto& session = *opened.value();
+          libs::devices::CaptureRequest request;
+          request.serials = {"MASTER"};
+          request.wait_for_laser_trigger = true;
+          request.spectrometer_triggers_laser = true;
+          request.laser_width_cycles = 42;
+          const auto result = session.capture(request);
+          CHECK(!result);
+          if (!result) CHECK_EQ(result.error().code, std::string("trigger_direction_conflict"));
+          CHECK_EQ(fake_counter(0), 0);
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(spectrometer_trigger_requires_explicit_master);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened); if(!opened) show("open", opened.error());
+      if (opened) {
+          auto& session = *opened.value();
+          libs::devices::CaptureRequest request;
+          request.serials = {"MASTER"};
+          request.spectrometer_triggers_laser = true;
+          request.laser_width_cycles = 42;
+          const auto result = session.capture(request);
+          CHECK(!result);
+          if (!result) CHECK_EQ(result.error().code, std::string("laser_output_master_required"));
+          CHECK_EQ(fake_counter(0), 0);
           CHECK(session.close());
       }
       fake_reset(0);

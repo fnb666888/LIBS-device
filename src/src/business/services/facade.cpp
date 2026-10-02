@@ -105,6 +105,44 @@ bool BusinessFacade::parse_fire_parameters(const json::Value& args,
     out.laser = runtime_.config().laser_fire;
     out.integration_ms = static_cast<double>(runtime_.config().integration_ms);
     out.capture_timeout_ms = runtime_.config().capture_timeout_ms;
+    out.laser_clock_mode = static_cast<std::uint8_t>(runtime_.config().laser_fire.laser_clock_mode);
+
+    // 触发方向是物理接线语义，必须由后端白名单解析；不能把任意字符串
+    // 透传成设备动作。缺省保持现场已验证的激光器 -> 光谱仪方向。
+    if (args.has("trigger_direction")) {
+        if (!args["trigger_direction"].is_string()) {
+            error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                      "trigger_direction_bad",
+                                      "trigger_direction 必须是 laser_to_spectrometer 或 spectrometer_to_laser");
+            return false;
+        }
+        const std::string direction = args["trigger_direction"].as_string();
+        if (direction == "spectrometer_to_laser") {
+            out.spectrometer_triggers_laser = true;
+        } else if (direction != "laser_to_spectrometer") {
+            error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                      "trigger_direction_bad",
+                                      "trigger_direction 必须是 laser_to_spectrometer 或 spectrometer_to_laser");
+            return false;
+        }
+    }
+
+    if (args.has("laser_clock_mode")) {
+        if (!args["laser_clock_mode"].is_number()) {
+            error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                      "laser_clock_mode_bad",
+                                      "laser_clock_mode 必须是 1 或 2");
+            return false;
+        }
+        const double v = args["laser_clock_mode"].as_number();
+        if (!(v == 1.0 || v == 2.0)) {
+            error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                      "laser_clock_mode_bad",
+                                      "laser_clock_mode 必须是 1（外时钟/内Q）或 2（外时钟/外Q）");
+            return false;
+        }
+        out.laser_clock_mode = static_cast<std::uint8_t>(v);
+    }
 
     if (args.has("laser")) {
         const json::Value& o = args["laser"];
@@ -182,6 +220,21 @@ bool BusinessFacade::parse_fire_parameters(const json::Value& args,
                 return false;
             }
             out.capture_timeout_ms = static_cast<unsigned>(v);
+        }
+        const auto read_delay = [&](const char* key, double* dst) -> bool {
+            if (!o.has(key)) return true;
+            if (!o[key].is_number()) return false;
+            const double v = o[key].as_number();
+            if (!std::isfinite(v) || v < 0.0) return false;
+            *dst = v;
+            return true;
+        };
+        if (!read_delay("laser_delay_ns", &out.laser_trigger_delay_ns) ||
+            !read_delay("laser_width_ns", &out.laser_trigger_width_ns)) {
+            error = libs::Error::make(libs::ErrorKind::invalid_argument,
+                                      "spectrometer_overrides_bad",
+                                      "spectrometer.laser_delay_ns/laser_width_ns 必须是非负有限数字");
+            return false;
         }
     }
     return true;
@@ -607,14 +660,40 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
 Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
     std::lock_guard<std::mutex> lock(runtime_.device_mutex());
 
+    services::FireParameters params;
+    libs::Error param_error{};
+    if (!parse_fire_parameters(args, params, param_error)) {
+        return Response::failure(param_error);
+    }
+
     // 门禁预检：allow_when_blocked 是显式旁路，默认绝不允许。
     // 允许旁路时也只跳"门禁这一条"，其他失败（设备未开、串口错）照样拒绝。
     if (args.has("precheck_only") && args["precheck_only"].as_bool()) {
+        if (params.spectrometer_triggers_laser) {
+            if (runtime_.devices().spectrometer() == nullptr) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::unsupported, "spectrometer_not_open",
+                    "反向触发预检需要已打开的光谱仪（Pin 23 输出端）"));
+            }
+            if (runtime_.config().spectrometer.master_serial.empty()) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "laser_output_master_required",
+                    "反向触发预检需要配置 spectrometer.master_serial 作为 Pin 23 主通道"));
+            }
+        }
         const libs::VoidResult r = runtime_.laser_fire().precheck();
         if (!r) return Response::failure(r.error());
         json::Value v = json::object();
         v.set("precheck", json::Value(true));
         v.set("gate", runtime_.gate().to_json());
+        v.set("trigger_direction", json::Value(
+            params.spectrometer_triggers_laser ? "spectrometer_to_laser"
+                                                : "laser_to_spectrometer"));
+        v.set("trigger_path", json::Value(
+            params.spectrometer_triggers_laser
+                ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
+                : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
+        v.set("trigger_output_programmed", json::Value(false));
         v.set("note", json::Value("预检通过，门禁允许出光；本次未发出任何写指令"));
         return Response::success(std::move(v));
     }
@@ -638,16 +717,16 @@ Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
     plan.set("trigger_mode", json::Value(
         "连续出光；**不使用 0x34 单次触发**。协议文本把 0x34 写成单次触发，"
         "但厂家工具实测从不使用它，本项目照协议文本实现的版本真机上一次都没出过光"));
+    plan.set("trigger_direction", json::Value(
+        params.spectrometer_triggers_laser ? "spectrometer_to_laser" : "laser_to_spectrometer"));
+    plan.set("trigger_path", json::Value(
+        params.spectrometer_triggers_laser
+            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
+            : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
+    plan.set("laser_clock_mode", json::Value(static_cast<double>(params.laser_clock_mode)));
     plan.set("cleanup", json::Value("0x24=0 与 0x21=0 无条件执行，出光失败也会收光停机"));
     plan.set("eeprom", json::Value(
         "本流程不写 0x31 保存 EEPROM：每打一发就固化一次参数会把任何写列表错误永久写进设备"));
-
-    services::FireParameters params;
-    libs::Error param_error{};
-    if (!parse_fire_parameters(args, params, param_error)) {
-        return Response::failure(param_error);
-    }
-
 
     const libs::Result<services::FireRecord> result =
         runtime_.laser_fire().fire_and_capture(params);
@@ -683,6 +762,12 @@ Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
     v.set("settle_ms", json::Value(static_cast<double>(r.settle_ms)));
     v.set("discharge_counter_before", json::Value(static_cast<double>(r.discharge_counter_before)));
     v.set("discharge_counter_after", json::Value(static_cast<double>(r.discharge_counter_after)));
+    v.set("trigger_direction", json::Value(r.trigger_direction));
+    v.set("trigger_output_programmed", json::Value(r.trigger_output_programmed));
+    v.set("trigger_path", json::Value(
+        r.trigger_direction == "spectrometer_to_laser"
+            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
+            : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
     v.set("parameters_saved", json::Value(false));
 
     // ── 交付出口（能力 6.3.1）───────────────────────────────────────────────
@@ -838,6 +923,11 @@ Response BusinessFacade::cmd_laser_run(const json::Value& args) {
     libs::Error param_error{};
     if (!parse_fire_parameters(args, params, param_error)) {
         return Response::failure(param_error);
+    }
+    if (params.spectrometer_triggers_laser) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "reverse_trigger_continuous_unsupported",
+            "laser_run 只支持激光器连续出光；光谱仪触发激光器必须使用有界 laser_fire 流程"));
     }
 
     const libs::Result<services::RunRecord> result =

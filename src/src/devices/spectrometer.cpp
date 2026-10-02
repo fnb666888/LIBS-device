@@ -488,17 +488,29 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
         for (std::size_t i : active)
             if (impl_->devices[i].serial == request.master_serial) order.push_back(i);
 
-        // ── 触发方向：激光器触发光谱仪（AvaSoft 手册 §4.9 接法二）──────────
+        // ── 联合触发方向（AvaSoft HD-26 Pin 6 / Pin 23）────────────────────
         //
         // 手册把 LIBS 分成两种接法：
         //   接法一：光谱仪发 TTL 出（pin 23）去点火激光器，积分延时与该输出同源。
         //   接法二：激光器/外部脉冲发生器控制时序，光谱仪跑**外触发模式**，
         //           从 pin 6 收 TTL 输入，收到后再等积分延时才开始积分。
         //
-        // 本项目走**接法二**。所以这里绝不能设 laser_width：
-        // 那会让光谱仪反过来去点火激光器，方向与现场接线相反，
-        // 现场表现为"激光永远不出光，光谱仪一直等触发直到超时"。
+        // 正向接法二时必须清零 laser_width/laser_delay；反向接法一则只在
+        // 明确的 master 通道写入输出脉冲，不能让四个通道各自点火。
         const bool laser_fires = request.wait_for_laser_trigger;
+        const bool spectrometer_fires = request.spectrometer_triggers_laser;
+        if (laser_fires && spectrometer_fires) {
+            return Error::make(ErrorKind::invalid_argument, "trigger_direction_conflict",
+                               "wait_for_laser_trigger and spectrometer_triggers_laser cannot both be true");
+        }
+        if (spectrometer_fires && request.laser_width_cycles == 0) {
+            return Error::make(ErrorKind::invalid_argument, "laser_output_width_required",
+                               "laser_width_cycles must be positive when the spectrometer drives the laser");
+        }
+        if (spectrometer_fires && request.master_serial.empty()) {
+            return Error::make(ErrorKind::invalid_argument, "laser_output_master_required",
+                               "spectrometer_to_laser requires an explicit master_serial for Pin 23 output");
+        }
 
         // 积分延时：调用方给纳秒，这里按手册换算成 FPGA 计数。
         std::uint32_t integration_delay_cycles = 0;
@@ -507,7 +519,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
                                "integration_delay_ns must be a finite non-negative number; "
                                "negative delays are only valid when the spectrometer drives the laser");
         }
-        if (request.integration_delay_ns > 0.0 && !laser_fires) {
+        if (request.integration_delay_ns > 0.0 && !laser_fires && !spectrometer_fires) {
             // 自由触发模式下没有"触发"可等，延时会变成采集开始前的空等。
             // 不静默忽略：直接报出来，避免现场白等一场。
             return Error::make(ErrorKind::invalid_argument, "delay_without_trigger",
@@ -535,15 +547,16 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
             // 预览走自由触发），于是四个通道一起等一个永远不来的 TTL，
             // 每帧 capture_timeout：现场表现就是"点了开始检测，一条谱都没有"。
             // 调用方说"不等 trigger"，就该真的不等。
+            // 反向时由 AVS_Measure 启动 Pin 23 输出，主通道必须是软件触发；
+            // 从通道仍通过内部 SYNC 跟随主通道。
             d.config.trigger.mode = laser_fires ? 1 : 0;
             if (request.synchronized && !master) { d.config.trigger.mode = 1; d.config.trigger.source = 1; }
 
-            // 走接法二时**不设** laser_width/laser_delay：
-            // 那两个字段是"光谱仪发 TTL 出去点火激光器"用的，
-            // 在本方向上必须为 0，否则方向反了。
-            d.config.control.laser_width = 0;
-            d.config.control.laser_delay = 0;
-            d.output_possible = false;
+            // 旧方向必须清零；反向只允许主通道驱动 Pin 23，避免四路各发一脉冲。
+            const bool output_laser = spectrometer_fires && master;
+            d.config.control.laser_width = output_laser ? request.laser_width_cycles : 0;
+            d.config.control.laser_delay = output_laser ? request.laser_delay_cycles : 0;
+            d.output_possible = output_laser;
             d.touched = true;
 
             // 下发前先把设备上可能残留的上一次测量停掉。

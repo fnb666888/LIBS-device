@@ -271,7 +271,7 @@ Result<AirConditionerInterlockConfig> parse_interlock(const json::Value& parent)
 // 出光标定参数。**所有字段都必须显式写出**，不给任何"聪明"的默认值：
 // 这里每个数的默认值都意味着"能出光"，回落就等于替现场做了一次未标定的决定。
 Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
-    LaserFireConfig cfg;                 // commissioned=false, 全部 0
+    LaserFireConfig cfg;                 // commissioned=false；会话参数为 0，外部时钟候选为 1
     const json::Value& node = parent["laser_fire"];
     if (node.is_null()) return cfg;      // 整段缺失 = 未标定，合法且安全
     if (!node.is_object()) return invalid("laser_fire must be an object");
@@ -288,6 +288,7 @@ Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
         {"discharge_delay_us",  &cfg.discharge_delay_us},
         {"q_delay_us",          &cfg.q_delay_us},
         {"q_warmup_s",          &cfg.q_warmup_s},
+        {"laser_clock_mode",    &cfg.laser_clock_mode},
         {"settle_timeout_ms",   &cfg.settle_timeout_ms},
         {"emission_hold_ms",    &cfg.emission_hold_ms},
         {"min_discharges",      &cfg.min_discharges},
@@ -435,6 +436,7 @@ json::Value to_json(const SiteConfig& config) {
     lf.set("discharge_delay_us", json::Value(static_cast<double>(config.laser_fire.discharge_delay_us)));
     lf.set("q_delay_us", json::Value(static_cast<double>(config.laser_fire.q_delay_us)));
     lf.set("q_warmup_s", json::Value(static_cast<double>(config.laser_fire.q_warmup_s)));
+    lf.set("laser_clock_mode", json::Value(static_cast<double>(config.laser_fire.laser_clock_mode)));
     lf.set("settle_timeout_ms", json::Value(static_cast<double>(config.laser_fire.settle_timeout_ms)));
     lf.set("emission_hold_ms", json::Value(static_cast<double>(config.laser_fire.emission_hold_ms)));
     lf.set("min_discharges", json::Value(static_cast<double>(config.laser_fire.min_discharges)));
@@ -632,6 +634,8 @@ VoidResult validate_laser_fire(const LaserFireConfig& lf) {
         return invalid("laser_fire.q_delay_us must be 2..500 us (protocol §3.1)");
     if (lf.settle_timeout_ms == 0)
         return invalid("laser_fire.settle_timeout_ms must be positive");
+    if (lf.laser_clock_mode != 1 && lf.laser_clock_mode != 2)
+        return invalid("laser_fire.laser_clock_mode must be 1 (external clock/internal Q) or 2 (external clock/external Q)");
     return libs::VoidResult();
 }
 

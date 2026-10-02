@@ -121,6 +121,10 @@ struct LaserFireConfig {
     unsigned q_delay_us = 0;                // 0x16  协议量程 2~500 us
     unsigned q_warmup_s = 0;                // 0x19  未标量程
 
+    // 反向联合触发使用的 0x22 模式：1=外时钟/内 Q，2=外时钟/外 Q。
+    // 激光器触发光谱仪时不下发此字段；保留默认 1 只为反向模式提供安全候选值。
+    unsigned laser_clock_mode = 1;
+
     // 设备使能后要从 02「自适应中」走到 01「正在工作且放电」才开始出光。
     // 厂家日志里这个过渡约 5~6 秒且不是常数，所以只能轮询状态位、不能固定 sleep。
     unsigned settle_timeout_ms = 20000;

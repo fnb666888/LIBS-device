@@ -91,14 +91,13 @@ const FieldSpec kLaserFields[] = {
 // 光谱仪只留两个真正需要按样品调的。
 //
 // 刻意不放 integration_delay_cycles / laser_delay_cycles / laser_width_cycles：
-// 单位是 FPGA 计数而不是 μs/ns，属于驱动内部换算；而且后两个在本项目的
-// 触发方向（**激光器触发光谱仪**，AvaSoft 手册 §4.9 接法二）下**必须恒为 0**，
-// 摆到界面上等于给现场准备了一个"一调就永远不出光"的开关。
+// 单位是 FPGA 计数而不是 μs/ns，属于驱动内部换算；后两个只在反向模式由
+// 后端根据激光脉宽生成，避免现场直接编辑原始计数造成错误脉冲。
 const FieldSpec kSpecFields[] = {
     {"integration_ms", "integration_ms", "积分时间", 0.002, 60000.0, 10.0, 3, "ms",
      "驱动硬校验 0.002~60000 ms。超范围会被业务层直接拒绝。"},
     {"timeout_ms", "capture_timeout_ms", "采集超时", 1.0, 600000.0, 10000.0, 0, "ms",
-     "等 pin6 触发的超时，必须覆盖整个出光窗口；本机配置为 10 s。"},
+     "触发等待与采集收尾的超时；本机配置为 10 s。"},
 };
 
 // 取某个参数分组对应的 FieldSpec 表。UI 不在这里"发明"范围：每一个
@@ -460,9 +459,8 @@ QWidget* MainWindow::build_left_column() {
     build_param_card(spec_card_, QStringLiteral("spectrometer"), spec_fields_);
     col->addWidget(spec_card_);
 
-    // 触发时序参数整张卡片已移除：它的两个字段（laser_delay / laser_width）
-    // 在本项目的触发方向下**必须恒为 0**，驱动会强制清零。留在界面上
-    // 只会让人以为"调一下时序就好了"，实际一调就永远不出光。
+    // 触发时序参数整张卡片已移除：laser_delay / laser_width 是驱动内部
+    // FPGA 计数。反向模式由后端根据已标定激光脉宽生成，避免 UI 直接编辑原始计数。
 
     col->addStretch(1);
     scroll->setWidget(panel);
@@ -933,10 +931,10 @@ void MainWindow::on_precheck_fire() {
             : trigger_direction_->currentData().toString();
 
     // 业务层的"核心参数齐备"要求 laser / spectrometer / trigger 三组都存在
-    // （见 runtime.cpp 的 default_required_groups）。trigger 组里的两个字段是
-    // **FPGA 计数**，在本接线方向（激光器触发光谱仪）下必须恒为 0 ——
-    // 驱动会强制清零。把它们摆到界面上给现场调，等于提供一个"一调就永远
-    // 不出光"的开关，所以界面上不再出现这两个字段，改由这里按已知正确值写入。
+    // （见 runtime.cpp 的 default_required_groups）。这里写入 trigger 组只是
+    // 创建/刷新参数分组以满足门禁的齐备性；反向触发的实际 Pin 23 时序由
+    // 后端根据 laser_width_ns/laser_delay_ns 和激光器脉宽在本次 capture 请求
+    // 中计算，不读取这两个持久字段，因此不会被下面的 0 覆盖。
     try {
         client_.command(QStringLiteral("param_set"),
                         QJsonObject{{QStringLiteral("group"), QStringLiteral("trigger")},
@@ -946,7 +944,7 @@ void MainWindow::on_precheck_fire() {
                                     {QStringLiteral("timing"), QStringLiteral("immediately")}});
     } catch (const QString& e) {
         // 写不进去也不必中断：门禁会在预检结果里如实报"参数未齐备"。
-        log_line(Level::Warn, QStringLiteral("写入 trigger 组（恒 0 的 FPGA 计数）失败：%1").arg(e));
+        log_line(Level::Warn, QStringLiteral("写入 trigger 组（门禁占位字段）失败：%1").arg(e));
     }
 
     try {
@@ -1411,7 +1409,10 @@ void MainWindow::render_gate(const MachineSnapshot& s) {
     if (fire_btn_ && !firing_) fire_btn_->setEnabled(g.allowed);
     // 连续出光：**开始**看门禁；**停止**永远可点（见下面 build 里的注释与
     // on_stop_continuous —— 停止不该有任何前置条件）。
-    if (run_btn_ && !firing_) run_btn_->setEnabled(g.allowed && !s.laser_running);
+    const bool reverse_trigger = trigger_direction_ &&
+        trigger_direction_->currentData().toString() == QLatin1String("spectrometer_to_laser");
+    if (run_btn_ && !firing_)
+        run_btn_->setEnabled(g.allowed && !s.laser_running && !reverse_trigger);
     if (stop_run_btn_ && !firing_) stop_run_btn_->setEnabled(true);
     Level lvl;
     QString detail = g.detail;
@@ -1823,6 +1824,10 @@ void MainWindow::on_trigger_direction_changed(int index) {
 
     const QString direction = trigger_direction_->currentData().toString();
     const bool reverse = direction == QLatin1String("spectrometer_to_laser");
+
+    // 连续出光没有光谱仪的逐发 AVS_Measure 作为触发源，反向模式只能走
+    // laser_fire 有界测量；后端也会拒绝 laser_run，前端提前禁用避免误操作。
+    if (run_btn_ && !firing_) run_btn_->setEnabled(!reverse);
 
     // “跟随激光触发”只适用于激光器输出 → 光谱仪 Pin 6 的预览。
     // 反向模式由光谱仪的 LASER OUT 产生触发，继续让预览等待 Pin 6

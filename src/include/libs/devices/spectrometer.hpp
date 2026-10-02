@@ -68,6 +68,17 @@ struct FpgaTime {
         return true;
     }
 
+    // 纳秒 -> FPGA 计数（光谱仪 Pin 23 输出脉冲专用）。AvaSoft SDK
+    // 对 laser delay/width 使用无偏置公式；不要复用上面的积分延时公式，
+    // 否则会额外加入 20.84 ns，导致外部激光器触发时序偏移一个计数。
+    static bool laser_nanos_to_cycles(double nanos, std::uint32_t* out) {
+        if (out == nullptr || !(nanos >= 0.0)) return false;
+        const double cycles = 6.0 * nanos / 125.0;
+        if (cycles > 4294967295.0) return false;
+        *out = static_cast<std::uint32_t>(cycles);
+        return true;
+    }
+
     // FPGA 计数 -> 纳秒（积分延时专用，含 -1 计数偏置）。仅用于回显与日志，
     // 不参与下发。计数为 0 时返回负值，说明这一栏本来就没有有效读数。
     static double cycles_to_nanos(std::uint32_t cycles) {
@@ -97,6 +108,11 @@ struct CaptureRequest {
     // 默认 false = 自由触发，采集随时可开始，不需要外部信号。
     // 置 true 后没有外触发信号就永远等不到数据，采集会超时。
     bool wait_for_laser_trigger = false;
+
+    // 光谱仪通过 HD-26 Pin 23 LASER OUT 输出 TTL 点火激光器。
+    // 该方向使用软件/自由启动的 AVS_Measure；它不能与
+    // wait_for_laser_trigger 同时打开，否则会把同一条触发链配置成互相等待。
+    bool spectrometer_triggers_laser = false;
 
     // 收到触发后延迟多久开始积分。**纳秒**，非 FPGA 计数。
     // 典型 LIBS 场景是"等激光烧蚀产生的等离子体冷却发光"，

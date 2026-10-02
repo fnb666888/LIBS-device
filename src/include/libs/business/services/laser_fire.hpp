@@ -9,12 +9,10 @@
 //
 //   1. **门禁是唯一判定入口**。本类不自己判断"能不能出光"，
 //      只调用 Gate::evaluate() 并服从它。任一条 GateReason 不满足就中止。
-//   2. **触发方向已定：激光器触发光谱仪**（AvaSoft 手册 §4.9 接法二）。
-//      激光器的 TTL 输出接到光谱仪 pin 6，光谱仪跑外触发模式等这个脉冲，
-//      收到后再等 integration_delay 才开始积分。
-//      因此本流程**不允许**设置光谱仪的 laser_width/laser_delay——
-//      那两个字段是"光谱仪发 TTL 出去点火激光器"（接法一），方向反了会导致
-//      激光永远不被点火、采集一直等触发直到超时。
+//   2. 默认方向是**激光器触发光谱仪**（AvaSoft 手册 §4.9 接法二）：
+//      激光器 TTL 输出接到 Pin 6，光谱仪外触发等待该脉冲；
+//      FireParameters.spectrometer_triggers_laser=true 时切换为接法一，
+//      由主通道 Pin 23 输出 TTL，并先把激光器切换到 0x22 外部时钟模式。
 //
 //      **出光方式：连续出光，不用 0x34 单次触发。**（2026-09-29 按厂家工具
 //      的实测日志订正。）协议文本把 0x34 写成"单次触发"，但厂家工具
@@ -63,7 +61,18 @@ using ::business::app::Runtime;
 struct FireParameters {
     config::LaserFireConfig laser;      // 会话参数（调用方已按协议量程校验）
     double integration_ms = 10.0;       // 光谱仪积分时间
-    unsigned capture_timeout_ms = 3000; // 等 pin6 触发的超时
+    unsigned capture_timeout_ms = 3000; // 采集超时
+
+    // 联合触发方向。默认保持现场已验证的激光器 -> 光谱仪路径。
+    bool spectrometer_triggers_laser = false;
+    // 激光器 0x22：1=外时钟/内 Q，2=外时钟/外 Q。
+    // 反向模式必须显式写入；旧方向不写该机器配置。
+    std::uint8_t laser_clock_mode = 1;
+    // Avantes Pin 23 LASER OUT 的业务时序，单位纳秒；驱动层再换算成
+    // AvaSpec 的 FPGA 计数（laser_*_cycles）。脉宽未给出时由业务层使用
+    // 激光器会话脉宽作为同量级值。
+    double laser_trigger_delay_ns = 0.0;
+    double laser_trigger_width_ns = 0.0;
 };
 
 // 一次出光流程的完整记录。**任何失败都要有记录**——现场排障靠它，
@@ -95,6 +104,8 @@ struct FireRecord {
     std::vector<libs::devices::ScanGroup> spectra;
 
     std::string note;                       // 中文小结，可直接写日志
+    std::string trigger_direction = "laser_to_spectrometer";
+    bool trigger_output_programmed = false;
 };
 
 // 一次**连续出光**的记录（对应 run_continuous / stop_continuous 这一对）。
