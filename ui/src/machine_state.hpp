@@ -68,11 +68,16 @@ struct OreState {
     QString basis;
     bool has_observation = false;
     std::optional<double> distance_raw;
+    std::optional<int> distance_register;
+    std::optional<double> distance_resolution_mm;
     std::optional<double> confidence_raw;
+    bool device_valid = false;
     bool in_range = false;
     bool read_ok = false;
     QString read_error;
     QString note;
+    // 后端按辅助读取节流周期报告的年龄。-1 表示后端还没有完成过一次读取。
+    qint64 read_age_ms = -1;
 };
 
 // 运动标定状态。

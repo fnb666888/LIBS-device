@@ -33,6 +33,8 @@ json::Value to_json(const DistanceObservation& obs) {
     v.set("read_ok", json::Value(obs.read_ok));
     if (!obs.read_ok) v.set("read_error", json::Value(obs.read_error));
     v.set("distance_raw", json::Value(static_cast<double>(obs.distance_raw)));
+    v.set("distance_register", json::Value(static_cast<double>(obs.distance_register)));
+    v.set("distance_resolution_mm", json::Value(obs.distance_resolution_mm));
     v.set("confidence_raw", json::Value(static_cast<double>(obs.confidence_raw)));
     v.set("sample_counter", json::Value(static_cast<double>(obs.sample_counter)));
     v.set("device_valid", json::Value(obs.device_valid));
@@ -43,7 +45,8 @@ json::Value to_json(const DistanceObservation& obs) {
         v.set("auxiliary_raw", std::move(aux));
     }
     v.set("note", json::Value("distance_raw/confidence_raw 原样记录，未换算为工程量；"
-                              "in_range=false 表示 raw 落在量程哨兵之外"));
+                              "0200/0201 是两种超量程哨兵表示，不是应用距离上下限；"
+                              "in_range=false 表示未读到有效距离或命中对应哨兵"));
     return v;
 }
 
@@ -54,24 +57,68 @@ DistanceObservation observe(const libs::rangefinder::Reading& reading,
     if (error_or_none) {
         obs.read_ok = false;
         obs.read_error = error_or_none.message;
+        // 读失败不是有效的零距离，也不能沿用结构体默认的 true 标志。
+        obs.device_valid = false;
+        obs.in_range = false;
         return obs;
     }
+    obs.read_ok = true;
 
-    const auto* dist = find(reading, libs::rangefinder::reg::kDistanceRaw);
-    const auto* conf = find(reading, libs::rangefinder::reg::kConfidence);
-    const auto* counter = find(reading, libs::rangefinder::reg::kSampleCounter);
-    obs.distance_raw = dist ? dist->raw : 0;
-    obs.confidence_raw = conf ? conf->raw : 0;
-    obs.sample_counter = counter ? counter->raw : 0;
-    obs.device_valid = dist ? dist->valid : true;
-
-    // 业务层自己判超量程：协议层 default valid=true 是"本层不判断"。
     const auto* zero = find(reading, libs::rangefinder::reg::kDistanceZeroOnOutOfRange);
     const auto* max = find(reading, libs::rangefinder::reg::kDistanceMaxOnOutOfRange);
-    if (zero && max) {
-        obs.in_range = (obs.distance_raw > zero->raw && obs.distance_raw < max->raw);
+    const auto* advanced = find(reading, libs::rangefinder::reg::kDistanceRaw);
+    const auto* conf = find(reading, libs::rangefinder::reg::kConfidence);
+    const auto* counter = find(reading, libs::rangefinder::reg::kSampleCounter);
+
+    // 0200 和 0201 是同一实时距离的两种兼容寄存器：一个用 0 表示超量程，
+    // 一个用 0xffff 表示超量程。它们绝不是设备动态返回的应用上下限。
+    // 高级版本的 0202 提供 0.1 mm 分辨率，存在有效值时优先使用它；
+    // 不支持 0202 或它命中零哨兵时回退到标准 0201/0200。
+    const libs::rangefinder::Register* dist = nullptr;
+    if (advanced && advanced->raw != 0) {
+        dist = advanced;
+        obs.distance_resolution_mm = 0.1;
+    } else if (max && max->raw != 0xFFFF) {
+        dist = max;
+        obs.distance_resolution_mm = 1.0;
+    } else if (zero && zero->raw != 0) {
+        dist = zero;
+        obs.distance_resolution_mm = 1.0;
+    } else if (advanced) {
+        // 保留高级寄存器的原始零值，便于现场确认设备确实回了超量程值。
+        dist = advanced;
+        obs.distance_resolution_mm = 0.1;
+    } else if (max) {
+        dist = max;
+        obs.distance_resolution_mm = 1.0;
+    } else if (zero) {
+        dist = zero;
+        obs.distance_resolution_mm = 1.0;
+    }
+
+    obs.distance_raw = dist ? dist->raw : 0;
+    obs.distance_register = dist ? dist->address : 0;
+    obs.confidence_raw = conf ? conf->raw : 0;
+    obs.sample_counter = counter ? counter->raw : 0;
+
+    // 协议层 Register::valid 只在它明确知道哨兵时才有意义；这里再次按所选
+    // 寄存器的语义判断，避免把 0200/0201 当成上下限比较。
+    if (!dist) {
+        obs.device_valid = false;
+        obs.in_range = false;
+    } else if (dist->address == libs::rangefinder::reg::kDistanceZeroOnOutOfRange) {
+        obs.device_valid = dist->raw != 0;
+        obs.in_range = obs.device_valid;
+    } else if (dist->address == libs::rangefinder::reg::kDistanceMaxOnOutOfRange) {
+        obs.device_valid = dist->raw != 0xFFFF;
+        obs.in_range = obs.device_valid;
+    } else if (dist->address == libs::rangefinder::reg::kDistanceRaw) {
+        // 0202 的手册没有规定独立哨兵；零值按无有效目标处理，且标准寄存器
+        // 已经优先参与回退选择。非零值可作为高级读数使用。
+        obs.device_valid = dist->raw != 0;
+        obs.in_range = obs.device_valid;
     } else {
-        // 哨兵寄存器没读到就不能说"在量程内"。未知 ≠ 在量程内。
+        obs.device_valid = false;
         obs.in_range = false;
     }
 

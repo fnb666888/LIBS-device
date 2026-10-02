@@ -108,8 +108,30 @@ MachineSnapshot parse_status(const QJsonObject& p) {
     }
     s.ore.basis = text_of(ore, "basis");
     s.ore.has_observation = bool_of(ore, "has_observation");
+    // `status.ore` 同时包含判定结果和最近一次原始观测。这里必须保留
+    // read_ok 与 in_range，不能把通信失败/超量程压成 distance=0 或 false。
+    const QJsonValue read_ok_value = ore.value("read_ok");
+    const bool has_read_ok = read_ok_value.isBool();
+    s.ore.read_ok = has_read_ok ? read_ok_value.toBool() : s.ore.has_observation;
+    s.ore.read_error = text_of(ore, "read_error");
+    s.ore.in_range = bool_of(ore, "in_range", false);
+    s.ore.device_valid = bool_of(ore, "device_valid", s.ore.in_range);
+    s.ore.read_age_ms = ore.contains("read_age_ms")
+                            ? static_cast<qint64>(ore.value("read_age_ms").toDouble(-1.0))
+                            : -1;
+    // 读失败时后端仍会带上占位 raw=0；只有 read_ok 才把它呈现为真实读数。
+    if (s.ore.read_ok) {
+        s.ore.distance_raw = opt_double(ore, "distance_raw");
+        const std::optional<double> distance_register = opt_double(ore, "distance_register");
+        if (distance_register.has_value()) {
+            s.ore.distance_register = static_cast<int>(*distance_register);
+        }
+        s.ore.distance_resolution_mm = opt_double(ore, "distance_resolution_mm");
+        s.ore.confidence_raw = opt_double(ore, "confidence_raw");
+    }
     const QJsonObject params = ore.value("parameters_snapshot").toObject();
-    s.ore.note = text_of(params, "basis");
+    s.ore.note = text_of(ore, "note");
+    if (s.ore.note.isEmpty()) s.ore.note = text_of(params, "basis");
 
     // ── motion ────────────────────────────────────────────────────────
     const QJsonObject m = p.value("motion").toObject();

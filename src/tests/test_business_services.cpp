@@ -30,23 +30,17 @@ libs::rangefinder::Register reg(std::uint16_t address, std::uint16_t raw) {
     return r;
 }
 
-// 本次读携带的量程边界（设备自己报的上下限，不是常量）。
-constexpr std::uint16_t kRangeLow = 100;
-constexpr std::uint16_t kRangeHigh = 5000;
-
 // 造一次测距读。
 //
-// 必须**同时带上两个量程边界寄存器**：业务层是拿它们判 in_range 的，
-// 读不到就判 in_range=false（未知 ≠ 在量程内）。
-// 注意 kDistanceZeroOnOutOfRange / kDistanceMaxOnOutOfRange 是**寄存器地址**，
-// 寄存器里装的是本设备的实际量程上下限，不是固定值。
+// 0200/0201 是两种兼容距离表示，不是动态量程上下限；这里放入正常的
+// 非哨兵值，确保测试覆盖高级 0202 读数的选择。
 libs::rangefinder::Reading good_reading(std::uint16_t distance_raw) {
     libs::rangefinder::Reading reading;
     reading.address = 1;
     reading.start = libs::rangefinder::reg::kDistanceZeroOnOutOfRange;
     reading.count = 17;
-    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceZeroOnOutOfRange, kRangeLow));
-    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceMaxOnOutOfRange, kRangeHigh));
+    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceZeroOnOutOfRange, 72));
+    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceMaxOnOutOfRange, 73));
     reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceRaw, distance_raw));
     reading.registers.push_back(reg(libs::rangefinder::reg::kConfidence, 900));
     reading.registers.push_back(reg(libs::rangefinder::reg::kSampleCounter, 7));
@@ -74,30 +68,55 @@ CASE(distance_observation_preserves_raw_verbatim); {
     CHECK(obs.in_range);
 }
 
-CASE(distance_below_range_is_out_of_range); {
-    // 落在量程下限之外：raw 原样保留，但 in_range=false。
+CASE(distance_raw_is_not_compared_with_0200_as_lower_bound); {
+    // 0200/0201 的值不是应用上下限；距离 50 仍是有效读数。
     const libs::rangefinder::Reading reading = good_reading(50);
     const services::DistanceObservation obs = services::observe(reading, libs::Error{});
     CHECK_EQ(static_cast<int>(obs.distance_raw), 50);   // 原样记录
-    CHECK(!obs.in_range);                               // 业务层自己判的
+    CHECK(obs.in_range);
 }
 
-CASE(distance_above_range_is_out_of_range); {
+CASE(distance_raw_is_not_compared_with_0201_as_upper_bound); {
     const libs::rangefinder::Reading reading = good_reading(9000);
     const services::DistanceObservation obs = services::observe(reading, libs::Error{});
     CHECK_EQ(static_cast<int>(obs.distance_raw), 9000);
-    CHECK(!obs.in_range);
+    CHECK(obs.in_range);
 }
 
-CASE(distance_exactly_on_boundary_is_out_of_range); {
-    // 边界是闭区间之外的判据：等于下限/上限都算超量程。
-    const services::DistanceObservation low = services::observe(good_reading(kRangeLow), libs::Error{});
-    const services::DistanceObservation high = services::observe(good_reading(kRangeHigh), libs::Error{});
-    CHECK(!low.in_range);
-    CHECK(!high.in_range);
-    // 刚好在区间内一格。
-    const services::DistanceObservation inside = services::observe(good_reading(kRangeLow + 1), libs::Error{});
-    CHECK(inside.in_range);
+CASE(distance_zero_and_max_sentinels_are_out_of_range); {
+    // 标准寄存器的哨兵值分别是 0 和 0xffff；边界值本身不代表距离上下限。
+    auto zero = good_reading(0);
+    for (auto& r : zero.registers) {
+        if (r.address == libs::rangefinder::reg::kDistanceZeroOnOutOfRange) r.raw = 0;
+        if (r.address == libs::rangefinder::reg::kDistanceMaxOnOutOfRange) r.raw = 0xffff;
+        if (r.address == libs::rangefinder::reg::kDistanceRaw) r.raw = 0;
+    }
+    const services::DistanceObservation zero_obs = services::observe(zero, libs::Error{});
+    CHECK(!zero_obs.in_range);
+
+    auto max = good_reading(0);
+    for (auto& r : max.registers) {
+        if (r.address == libs::rangefinder::reg::kDistanceZeroOnOutOfRange) r.raw = 0;
+        if (r.address == libs::rangefinder::reg::kDistanceMaxOnOutOfRange) r.raw = 0xffff;
+        if (r.address == libs::rangefinder::reg::kDistanceRaw) r.raw = 0;
+    }
+    const services::DistanceObservation max_obs = services::observe(max, libs::Error{});
+    CHECK(!max_obs.in_range);
+}
+
+CASE(distance_standard_register_fallback_uses_sentinel_semantics); {
+    libs::rangefinder::Reading reading;
+    reading.address = 1;
+    reading.start = libs::rangefinder::reg::kDistanceZeroOnOutOfRange;
+    reading.count = 2;
+    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceZeroOnOutOfRange, 456));
+    reading.registers.push_back(reg(libs::rangefinder::reg::kDistanceMaxOnOutOfRange, 0xffff));
+    const services::DistanceObservation obs = services::observe(reading, libs::Error{});
+    CHECK(obs.in_range);
+    CHECK_EQ(static_cast<int>(obs.distance_raw), 456);
+    CHECK_EQ(static_cast<int>(obs.distance_register),
+             static_cast<int>(libs::rangefinder::reg::kDistanceZeroOnOutOfRange));
+    CHECK_EQ(static_cast<int>(obs.distance_resolution_mm), 1);
 }
 
 CASE(distance_read_failure_is_not_distance_zero); {
@@ -107,15 +126,18 @@ CASE(distance_read_failure_is_not_distance_zero); {
     const services::DistanceObservation obs = services::observe(reading, err);
     CHECK(!obs.read_ok);
     CHECK(!obs.read_error.empty());
+    CHECK(!obs.device_valid);
+    CHECK(!obs.in_range);
 }
 
 CASE(protocol_valid_true_does_not_mean_in_range); {
-    // 协议层 Register::valid 默认 true（"本层不判断"），业务层必须自己算 in_range。
-    // distance_raw=9000 超量程，但协议层仍然给 valid=true。
+    // 协议层 Register::valid 默认 true（"本层不判断"）。
+    // 业务层按所选寄存器的哨兵语义判断；0202 没有独立的量程哨兵，
+    // 非零 raw 只能说明读数存在，不能把它误判成超量程。
     const services::DistanceObservation obs =
         services::observe(good_reading(9000), libs::Error{});
-    CHECK(obs.device_valid);      // 协议层没给 false
-    CHECK(!obs.in_range);         // 业务层判出来的
+    CHECK(obs.device_valid);
+    CHECK(obs.in_range);
 }
 
 CASE(ore_judge_unconfigured_returns_unknown_not_false); {

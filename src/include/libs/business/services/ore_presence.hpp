@@ -32,22 +32,27 @@ namespace business::services {
 
 // 一次测距观测。**原样保留 raw 与哨兵标记**，不做工程量换算的判定。
 //
-// in_range 是业务层自己算出来的：distance_raw 落在
-// [kDistanceZeroOnOutOfRange, kDistanceMaxOnOutOfRange] 之外时为 false。
-// 这不是"把 raw 换算成工程量"，只是"这个 raw 是不是落在量程内"。
+// 0200/0201 不是应用距离的上下限：它们是同一实时距离的两种兼容表示，
+// 分别使用 0 和 0xffff 表示超量程。0202 是高级版本的 0.1 mm 分辨率读数。
+// 因此 in_range 只表示设备读数没有命中相应的超量程哨兵，不能把 0200/0201
+// 的 raw 值拿来组成一个 [下限, 上限] 区间。
 struct DistanceObservation {
     Milliseconds wall_clock_ms = 0;
     std::uint16_t distance_raw = 0;
+    // 实际选作 distance_raw 的寄存器地址；0 表示本次没有读到距离寄存器。
+    std::uint16_t distance_register = 0;
+    // 仅描述协议分辨率，不代表实际精度；0202=0.1 mm，0200/0201=1 mm。
+    double distance_resolution_mm = 0.0;
     std::uint16_t confidence_raw = 0;
     std::uint16_t sample_counter = 0;
 
-    // 设备自己说的 valid（协议层给文档哨兵时的判据）。业务层另有 in_range。
-    bool device_valid = true;
-    bool in_range = true;
+    // 按所选距离寄存器的哨兵语义整理出的有效性；协议层 valid 不能单独代替它。
+    bool device_valid = false;
+    bool in_range = false;
 
     // 本次读取是否通信成功。false 时 distance_raw 等字段无意义，
     // 读失败**不是**"距离为 0"。
-    bool read_ok = true;
+    bool read_ok = false;
     std::string read_error;
 
     // 设备温度/速度等辅助寄存器，原样带上，不做换算。

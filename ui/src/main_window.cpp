@@ -566,7 +566,9 @@ QWidget* MainWindow::build_right_column() {
     grid->setVerticalSpacing(10);
 
     dist_metric_ = new Metric(QStringLiteral("测距"), aux);
-    dist_metric_->set_unit(QStringLiteral("mm"));
+    // 后端当前只保证协议 raw，不做工程单位换算；标成 raw，避免现场把
+    // 设备寄存器值误当成 mm。
+    dist_metric_->set_unit(QStringLiteral("raw"));
     temp_metric_ = new Metric(QStringLiteral("室内温度"), aux);
     temp_metric_->set_unit(QStringLiteral("°C"));
     motion_metric_ = new Metric(QStringLiteral("正转标定时间"), aux);
@@ -1422,14 +1424,19 @@ QString MainWindow::detect_stage_text(const QString& stage) const {
 
 void MainWindow::render_aux(const MachineSnapshot& s) {
     // ── 测距 / 有矿 ─────────────────────────────────────────────────
-    // distance_raw 是 optional：null 时**不显示数字**，只说"无观测"。
+    // distance_raw 是 optional：通信失败时后端会带占位 0，但 UI 不把它
+    // 当成真实读数。raw 尚未完成工程单位标定，因此单位保持 raw。
     if (s.ore.distance_raw.has_value()) {
-        dist_metric_->set_value(fmt_fixed(*s.ore.distance_raw, 1), Level::Ok);
-        dist_metric_->set_unit(QStringLiteral("mm"));
+        const Level level = (s.ore.device_valid && s.ore.in_range) ? Level::Ok : Level::Warn;
+        dist_metric_->set_value(fmt_fixed(*s.ore.distance_raw, 0), level);
+        dist_metric_->set_unit(QStringLiteral("raw"));
     } else {
-        dist_metric_->set_unavailable(s.ore.read_error.isEmpty()
-                                          ? QStringLiteral("暂无测距观测")
-                                          : s.ore.read_error);
+        const QString why = !s.ore.read_error.isEmpty()
+                                ? QStringLiteral("测距读取失败：%1").arg(s.ore.read_error)
+                                : (s.ore.has_observation
+                                       ? QStringLiteral("测距无有效 raw 读数")
+                                       : QStringLiteral("暂无测距观测"));
+        dist_metric_->set_unavailable(why);
     }
     count_metric_->set_unit(QString());
     if (s.ore.decision_known && s.ore.ore_present.has_value()) {
@@ -1437,8 +1444,43 @@ void MainWindow::render_aux(const MachineSnapshot& s) {
                                                      : QStringLiteral("无矿"),
                                  *s.ore.ore_present ? Level::Ok : Level::Idle);
     } else {
-        count_metric_->set_unavailable(QStringLiteral("未标定 / 未观测，判定未知（这不等于「无矿」）"));
+        QString why;
+        if (!s.ore.has_observation) {
+            why = QStringLiteral("未观测，判定未知（这不等于「无矿」）");
+        } else if (!s.ore.read_ok) {
+            why = QStringLiteral("测距通信失败，判定未知");
+        } else if (!s.ore.device_valid) {
+            why = QStringLiteral("距离 raw 无效，判定未知");
+        } else if (!s.ore.in_range) {
+            why = QStringLiteral("距离 raw 超出量程，判定未知");
+        } else {
+            why = QStringLiteral("判定规则未标定，判定未知");
+        }
+        count_metric_->set_unavailable(why);
     }
+
+    QStringList ore_detail;
+    if (s.ore.confidence_raw.has_value()) {
+        ore_detail.push_back(QStringLiteral("confidence raw=%1")
+                                 .arg(fmt_fixed(*s.ore.confidence_raw, 0)));
+    }
+    if (s.ore.distance_register.has_value()) {
+        ore_detail.push_back(QStringLiteral("距离寄存器 0x%1")
+                                 .arg(QString::number(*s.ore.distance_register, 16).toUpper()));
+    }
+    if (s.ore.distance_resolution_mm.has_value() && *s.ore.distance_resolution_mm > 0.0) {
+        ore_detail.push_back(QStringLiteral("分辨率 %1 mm/LSB")
+                                 .arg(fmt_fixed(*s.ore.distance_resolution_mm, 1)));
+    }
+    if (s.ore.has_observation && s.ore.read_age_ms >= 0) {
+        ore_detail.push_back(QStringLiteral("读数%1 ms前").arg(s.ore.read_age_ms));
+    }
+    if (s.ore.read_ok && (!s.ore.device_valid || !s.ore.in_range)) {
+        ore_detail.push_back(QStringLiteral("raw无效或量程外"));
+    }
+    if (!s.ore.note.isEmpty()) ore_detail.push_back(s.ore.note);
+    if (!s.ore.read_error.isEmpty()) ore_detail.push_back(s.ore.read_error);
+    const QString ore_detail_text = ore_detail.join(QStringLiteral("；"));
     ore_dot_->set_state(s.ore.decision_known
                             ? (s.ore.ore_present.value_or(false) ? Level::Ok : Level::Idle)
                             : Level::Warn,
@@ -1446,7 +1488,10 @@ void MainWindow::render_aux(const MachineSnapshot& s) {
                             ? (s.ore.ore_present.value_or(false) ? QStringLiteral("有矿 已判定")
                                                                  : QStringLiteral("无矿 已判定"))
                             : QStringLiteral("有矿 判定未知"),
-                        s.ore.basis);
+                        s.ore.basis.isEmpty() ? ore_detail_text
+                                              : s.ore.basis + (ore_detail_text.isEmpty()
+                                                                   ? QString()
+                                                                   : QStringLiteral("；") + ore_detail_text));
 
     // ── 空调 ───────────────────────────────────────────────────────
     if (s.ac.indoor_temp_c.has_value()) {
