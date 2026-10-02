@@ -25,6 +25,7 @@
 #include <QStackedLayout>
 #include <QStringConverter>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStatusBar>
 #include <QTextStream>
@@ -348,6 +349,37 @@ QWidget* MainWindow::build_left_column() {
         "开光闸连续出光 → 收光停机 → 四通道同步采集 → 落盘。\n"
         "**先点「预检」布防**：门禁放行后「出光测量」才会亮。"
         "门禁不放行时，业务层一条写指令都不会发。"));
+
+    // 触发方向是物理接线的一部分，必须在真正出光的卡片里显式显示。
+    // 默认值保持现场当前已经验证的方向：激光器 TTL → 光谱仪 Pin 6。
+    // 选择反向时只改变 laser_fire 的意图参数，最终是否允许由后端根据
+    // 已确认的激光器输入接口和配置决定；UI 不自行宣称硬件已经联通。
+    auto* trigger_row = new QHBoxLayout;
+    trigger_row->setSpacing(10);
+    auto* trigger_label = new QLabel(QStringLiteral("联合触发方向"), measure);
+    trigger_label->setObjectName(QStringLiteral("dim"));
+    trigger_direction_ = new QComboBox(measure);
+    trigger_direction_->addItem(QStringLiteral("激光器触发光谱仪（当前接线）"),
+                                 QStringLiteral("laser_to_spectrometer"));
+    trigger_direction_->addItem(QStringLiteral("光谱仪触发激光器（反向）"),
+                                 QStringLiteral("spectrometer_to_laser"));
+    trigger_direction_->setCurrentIndex(0);
+    trigger_direction_->setToolTip(QStringLiteral(
+        "当前接线：激光器同步输出 → Avantes 主通道 Pin 6。\n"
+        "反向接线：Avantes 主通道 Pin 23 LASER OUT → 激光器外部触发输入；"
+        "RS-232/COM10 仍只负责参数与状态通信。\n"
+        "切换后要重新预检，不能在连续出光期间切换。"));
+    trigger_row->addWidget(trigger_label);
+    trigger_row->addWidget(trigger_direction_, 1);
+    measure->body()->addLayout(trigger_row);
+
+    trigger_path_label_ = new QLabel(QString(), measure);
+    trigger_path_label_->setObjectName(QStringLiteral("dim"));
+    trigger_path_label_->setWordWrap(true);
+    measure->body()->addWidget(trigger_path_label_);
+    on_trigger_direction_changed(0);
+    connect(trigger_direction_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, &MainWindow::on_trigger_direction_changed);
 
     auto* mrow = new QHBoxLayout;
     mrow->setSpacing(10);
@@ -895,6 +927,11 @@ void MainWindow::on_stop_detection() {
 void MainWindow::on_precheck_fire() {
     if (firing_) return;
 
+    const QString trigger_direction =
+        trigger_direction_ == nullptr
+            ? QStringLiteral("laser_to_spectrometer")
+            : trigger_direction_->currentData().toString();
+
     // 业务层的"核心参数齐备"要求 laser / spectrometer / trigger 三组都存在
     // （见 runtime.cpp 的 default_required_groups）。trigger 组里的两个字段是
     // **FPGA 计数**，在本接线方向（激光器触发光谱仪）下必须恒为 0 ——
@@ -920,7 +957,8 @@ void MainWindow::on_precheck_fire() {
         // 于是"预检永远显示不通过"，而后端其实是放行的。
         const QJsonObject response = client_.command(
             QStringLiteral("laser_fire"),
-            QJsonObject{{QStringLiteral("precheck_only"), true}}, 20000);
+            QJsonObject{{QStringLiteral("precheck_only"), true},
+                        {QStringLiteral("trigger_direction"), trigger_direction}}, 20000);
         const QJsonObject payload = response.value(QStringLiteral("payload")).toObject();
         const QJsonObject gate = payload.value(QStringLiteral("gate")).toObject();
         const bool allowed = gate.value(QStringLiteral("allowed")).toBool();
@@ -963,6 +1001,7 @@ void MainWindow::on_fire_measure() {
     stop_stream();
 
     firing_ = true;
+    if (trigger_direction_) trigger_direction_->setEnabled(false);
     fire_btn_->setEnabled(false);
     precheck_btn_->setEnabled(false);
     fire_state_label_->setText(QStringLiteral("状态：出光中…"));
@@ -1000,6 +1039,7 @@ void MainWindow::on_fire_measure() {
 
 void MainWindow::on_fire_result(const QJsonObject& payload) {
     firing_ = false;
+    if (trigger_direction_) trigger_direction_->setEnabled(true);
     precheck_btn_->setEnabled(true);
     fire_btn_->setEnabled(fire_allowed_);
 
@@ -1011,6 +1051,17 @@ void MainWindow::on_fire_result(const QJsonObject& payload) {
     const QJsonObject delivery = payload.value(QStringLiteral("delivery")).toObject();
     const bool saved = delivery.value(QStringLiteral("local_saved")).toBool();
     const QString path = delivery.value(QStringLiteral("local_path")).toString();
+
+    // 后端回显实际采用的触发路径。这个字段是现场核对“UI 选择”和
+    // 业务层实际编排是否一致的证据，不能只显示下拉框当前值。
+    const QString trigger_path = payload.value(QStringLiteral("trigger_path")).toString();
+    if (!trigger_path.isEmpty()) {
+        const bool programmed = payload.value(QStringLiteral("trigger_output_programmed"))
+                                     .toBool(false);
+        trigger_path_label_->setText(
+            QStringLiteral("本次实际触发路径：%1 · 光谱仪输出已编程：%2")
+                .arg(trigger_path, fmt_bool_zh(programmed)));
+    }
 
     fire_state_label_->setText(saved ? QStringLiteral("状态：出光完成，光谱已落盘")
                                      : QStringLiteral("状态：出光完成，但落盘失败"));
@@ -1071,6 +1122,7 @@ void MainWindow::on_fire_result(const QJsonObject& payload) {
 
 void MainWindow::on_fire_failed(const QString& message) {
     firing_ = false;
+    if (trigger_direction_) trigger_direction_->setEnabled(true);
     precheck_btn_->setEnabled(true);
     fire_btn_->setEnabled(fire_allowed_);
     fire_state_label_->setText(QStringLiteral("状态：出光测量失败"));
@@ -1104,6 +1156,12 @@ QJsonObject MainWindow::current_fire_args() const {
                 collect(kLaserFields, sizeof(kLaserFields) / sizeof(FieldSpec), laser_fields_));
     args.insert(QStringLiteral("spectrometer"),
                 collect(kSpecFields, sizeof(kSpecFields) / sizeof(FieldSpec), spec_fields_));
+    // 与后端约定的显式触发方向。缺省值保持旧版本行为，避免升级 UI 后
+    // 误把既有“激光器 → 光谱仪”接线切到反向。
+    args.insert(QStringLiteral("trigger_direction"),
+                trigger_direction_ == nullptr
+                    ? QStringLiteral("laser_to_spectrometer")
+                    : trigger_direction_->currentData().toString());
     return args;
 }
 
@@ -1148,6 +1206,7 @@ void MainWindow::on_run_continuous() {
     }
 
     const QJsonObject args = current_fire_args();
+    if (trigger_direction_) trigger_direction_->setEnabled(false);
     run_btn_->setEnabled(false);
     fire_state_label_->setText(QStringLiteral("状态：正在启动连续出光…"));
     fire_detail_label_->setText(QStringLiteral("等待设备进入「正在工作且放电」，约 5~7 秒。"));
@@ -1172,6 +1231,7 @@ void MainWindow::on_run_continuous() {
                 log_line(Level::Danger, QStringLiteral("连续出光启动失败：%1").arg(error));
                 set_banner(QStringLiteral("连续出光启动失败：%1").arg(error), 2);
                 run_btn_->setEnabled(fire_allowed_);
+                if (trigger_direction_) trigger_direction_->setEnabled(true);
                 if (state_poller_) state_poller_->request_refresh();
                 return;
             }
@@ -1213,6 +1273,7 @@ void MainWindow::on_stop_continuous() {
     }
     // 无论成败都把按钮放回去：失败时操作员更需要能再按一次。
     stop_run_btn_->setEnabled(true);
+    if (trigger_direction_) trigger_direction_->setEnabled(true);
     if (state_poller_) state_poller_->request_refresh();
 }
 
@@ -1754,6 +1815,49 @@ void MainWindow::on_pause_toggled(bool on) {
     paused_ = on;
     log_line(Level::Idle, on ? QStringLiteral("绘制已暂停（数据流仍在后台采集）。")
                              : QStringLiteral("绘制已恢复。"));
+}
+
+void MainWindow::on_trigger_direction_changed(int index) {
+    Q_UNUSED(index)
+    if (!trigger_direction_) return;
+
+    const QString direction = trigger_direction_->currentData().toString();
+    const bool reverse = direction == QLatin1String("spectrometer_to_laser");
+
+    // “跟随激光触发”只适用于激光器输出 → 光谱仪 Pin 6 的预览。
+    // 反向模式由光谱仪的 LASER OUT 产生触发，继续让预览等待 Pin 6
+    // 会造成看似“没有光谱”的假故障，因此自动关闭并锁定该复选框。
+    if (follow_trigger_) {
+        if (reverse && follow_trigger_->isChecked()) {
+            const QSignalBlocker blocker(follow_trigger_);
+            follow_trigger_->setChecked(false);
+        }
+        follow_trigger_->setEnabled(!reverse);
+        follow_trigger_->setToolTip(reverse
+            ? QStringLiteral("反向模式使用光谱仪 LASER OUT 触发激光器；预览不能等待 Pin 6，"
+                             "请使用出光测量查看逐发光谱。")
+            : QStringLiteral("勾上后光谱仪等激光的 pin6 TTL，每发激光采一帧。\n"
+                             "连续出光时能看到干净的 LIBS 谱；不出光时会一直等不到数据（正常）。\n"
+                             "不勾 = 自由触发，看背景谱。"));
+    }
+
+    if (trigger_path_label_) {
+        trigger_path_label_->setText(reverse
+            ? QStringLiteral("预期触发路径：Avantes 主通道 Pin 23 LASER OUT → 激光器外部触发输入。"
+                             "请确认现场电平、极性和接地后再预检。")
+            : QStringLiteral("预期触发路径：激光器同步输出 → Avantes 主通道 Pin 6；"
+                             "四通道由主通道内部 SYNC 同步。"));
+    }
+    if (!firing_ && fire_state_label_) {
+        fire_state_label_->setText(reverse
+            ? QStringLiteral("状态：已选择反向触发，等待预检")
+            : QStringLiteral("状态：已选择激光器触发光谱仪，等待预检"));
+    }
+    if (!firing_) {
+        log_line(Level::Idle, reverse
+            ? QStringLiteral("联合触发方向切换为：光谱仪触发激光器。")
+            : QStringLiteral("联合触发方向切换为：激光器触发光谱仪。"));
+    }
 }
 
 

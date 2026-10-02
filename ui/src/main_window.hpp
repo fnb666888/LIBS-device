@@ -86,6 +86,7 @@ private slots:
     void on_auto_y_toggled(bool on);
     void on_lock_y_toggled(bool on);
     void on_pause_toggled(bool on);
+    void on_trigger_direction_changed(int index);
 
 private:
     // ── 布局构建 ─────────────────────────────────────────────────────
@@ -162,6 +163,11 @@ private:
     // 连续出光：一直打，直到点停止。与"出光测量"是两个动作，按钮也分开。
     QPushButton* run_btn_ = nullptr;
     QPushButton* stop_run_btn_ = nullptr;
+    // 联合触发方向：默认保持现场已经验证的“激光器触发光谱仪”。
+    // 反向模式由后端 laser_fire 的 trigger_direction 字段执行，
+    // UI 只负责选择、显示和把值原样传递。
+    QComboBox* trigger_direction_ = nullptr;
+    QLabel* trigger_path_label_ = nullptr;
     QLabel* fire_state_label_ = nullptr;
     QLabel* fire_detail_label_ = nullptr;
     QLabel* fire_path_label_ = nullptr;
