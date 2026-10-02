@@ -974,12 +974,12 @@ Response BusinessFacade::cmd_recovery_write(const json::Value& args) {
 
 Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
     // 这是报文构造/契约检查入口，不是网络发送入口。附件里的边端地址和
-    // Bearer token 仍需甲方确认，且当前 LIBS 没有 NIR/模型结果可供伪造。
+    // Bearer token 仍需配置。LIBS 结果复用近红外反馈结构，数值必须来自真实分析。
     const std::string kind = args.has("kind") ? args["kind"].as_string() : "";
     if (kind.empty()) {
         return Response::failure(libs::Error::make(
             libs::ErrorKind::invalid_argument, "heike_report_kind_required",
-            "heike_report_preview 需要 kind=heartbeat/event/openinit/alarm/libs_raw/model"));
+            "heike_report_preview 需要 kind=heartbeat/event/openinit/alarm/composition/model/libs_raw"));
     }
 
     libs::Result<json::Value> payload = libs::Error::make(
@@ -1110,23 +1110,31 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
         if (seq_valid)
             payload = integration::heike::make_libs_raw_event(
                 context, args["raw_capture"], args["event_content_as_string"].as_bool(false));
-    } else if (kind == "model") {
+    } else if (kind == "model" || kind == "composition") {
         integration::heike::EnvelopeInput input;
         input.biz_id = args["biz_id"].as_string();
         input.customs_code = args["customs_code"].as_string();
-        input.event_code = args["event_code"].as_string();
+        input.event_code = kind == "composition" && !args.has("event_code")
+                               ? "PISYS001" : args["event_code"].as_string();
         input.event_source = args["event_source"].as_string();
         input.message_id = args["message_id"].as_string();
         input.event_content = args["event_content"];
         input.event_content_as_string = args["event_content_as_string"].as_bool(false);
         input.notes = args["notes"].as_string();
         input.version = args["version"].as_string();
-        event_name = integration::heike::model_event_name(input.event_code);
-        payload = integration::heike::make_model_event(input);
+        if (kind == "composition") {
+            // PISYS001 belongs to the inspection application's result interface.
+            // Reusing its schema does not create a device HTTP upload route.
+            event_name = "PISYS001";
+            payload = integration::heike::make_composition_event(input);
+        } else {
+            event_name = integration::heike::model_event_name(input.event_code);
+            payload = integration::heike::make_model_event(input);
+        }
     } else {
         return Response::failure(libs::Error::make(
             libs::ErrorKind::invalid_argument, "heike_report_bad_kind",
-            "kind 只能是 heartbeat/event/openinit/alarm/libs_raw/model"));
+            "kind 只能是 heartbeat/event/openinit/alarm/composition/model/libs_raw"));
     }
 
     if (!payload) return Response::failure(payload.error());
@@ -1134,10 +1142,29 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
     v.set("transport", json::Value("dry_run"));
     v.set("sent", json::Value(false));
     v.set("event_name", json::Value(event_name));
+    if (kind == "composition") {
+        // Completeness and acquisition source are local diagnostics, not new
+        // fields in the shared upstream message. Unknown results remain null.
+        json::Value content;
+        const auto parsed = json::parse(payload.value()["eventContent"].as_string(), content);
+        if (!parsed.ok) return Response::failure(libs::Error::make(
+            libs::ErrorKind::internal, "heike_composition_invalid",
+            "成分报文构造器返回了不可解析的 eventContent"));
+        json::Value missing = json::array();
+        for (const char* key : {"COMPO_AL2O3", "COMPO_CAO", "COMPO_FEO", "COMPO_MGO",
+                                "COMPO_MNO", "COMPO_P2O5", "COMPO_S", "COMPO_SIO2",
+                                "COMPO_TFE", "COMPO_TIO2"}) {
+            if (content[key].is_null()) missing.push_back(json::Value(key));
+        }
+        v.set("measurement_method", json::Value("LIBS"));
+        v.set("composition_complete", json::Value(missing.as_array().empty()));
+        v.set("missing_components", std::move(missing));
+        v.set("data_source_mapped", json::Value(!content["DATA_SOURCE"].as_string().empty()));
+    }
     v.set("payload", std::move(payload.value()));
     v.set("gateway_enabled", json::Value(runtime_.config().gateway.enabled));
     v.set("warning", json::Value(
-        "仅完成报文校验与预览，未访问外部边端；LIBS 原始光谱不能冒充近红外/模型结果"));
+        "仅构造预览，未访问外部边端；LIBS 分析结果复用近红外反馈结构，缺失值不补零"));
     return Response::success(std::move(v));
 }
 

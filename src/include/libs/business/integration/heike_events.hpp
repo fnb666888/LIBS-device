@@ -3,8 +3,8 @@
 // 海关智能设备接入管理边端的报文构造层。
 //
 // 这里仅负责把已经得到的业务事实整理成 JSON，不负责模型推理，也不自动联网。
-// 尤其要把 LIBS 原始光谱和近红外/模型结果分开：当前设备只有
-// wavelength_nm + counts，不能伪造 COMPO_*、predBrandResult 或相似度字段。
+// LIBS 与近红外复用同一反馈字段；来源差异保留在内部，不改变线上报文。
+// 原始 wavelength_nm + counts 必须先经算法得到结果，不能伪造成成分或相似度。
 
 #include <cstdint>
 #include <string>
@@ -34,6 +34,12 @@ struct EnvelopeInput {
 // 不写 filePath：本层上传的是内嵌 JSON；filePath 与 eventContent 的二选一由另一条
 // 文件目录接入链路负责。
 libs::Result<json::Value> make_envelope(const EnvelopeInput& input);
+
+// LIBS/近红外共用的 PISYS001 成分反馈。eventContent 接收对象或 JSON 对象串，
+// 输出固定为附件中的 19 个字段组成的 JSON 字符串。ID 必填，其他缺失值保留
+// null；不推断 DATA_SOURCE，不把元素 P 换算或重命名成 P2O5。
+// 此接口的 eventSource 可选，缺失时不写入外层报文。
+libs::Result<json::Value> make_composition_event(const EnvelopeInput& input);
 
 struct DeviceIdentity {
     std::string equipment_id;
@@ -72,9 +78,8 @@ struct Alarm {
 libs::Result<json::Value> make_alarm(const DeviceIdentity& identity,
                                      const std::vector<Alarm>& alarms);
 
-// 当前 LIBS 采集的可上传内部格式。它不是 PISYS001，也不是 MODEL003：
-// PISYS001 需要十项成分结果，MODEL003 需要算法相似度。event_code 由甲方确认后
-// 才能填入正式物模型；本函数只构造原始光谱的明确分层载荷。
+// 原始光谱仅用于本地诊断，不是正式反馈报文。PISYS001 需要成分结果，
+// MODEL003 需要算法相似度；两者均不能直接填入 wavelength_nm + counts。
 struct LibsCaptureContext {
     std::string biz_id;
     std::string customs_code;
@@ -84,7 +89,7 @@ struct LibsCaptureContext {
     std::int64_t seq_no = 0;
     std::string event_source = "LIBS-device";
     std::string message_id;
-    std::string event_code;                // 外部确认后的 LIBS 原始谱事件代码
+    std::string event_code;                // 本地诊断标识，禁止使用 PISYS/MODEL 命名空间
 };
 
 libs::Result<json::Value> make_libs_raw_event(const LibsCaptureContext& context,
@@ -92,6 +97,7 @@ libs::Result<json::Value> make_libs_raw_event(const LibsCaptureContext& context,
                                               bool event_content_as_string = false);
 
 // MODEL001..004 只允许透传调用方已经得到的模型结果（对象或 JSON 对象字符串）；
+// LIBS 与近红外使用同一结果结构。移除内部来源标记，拒绝混入原始谱。
 // 这里不生成任何预测字段。
 libs::Result<json::Value> make_model_event(const EnvelopeInput& input);
 

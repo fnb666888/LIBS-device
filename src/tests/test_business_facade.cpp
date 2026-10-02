@@ -118,7 +118,7 @@ CASE(heike_report_preview_never_sends_and_keeps_libs_distinct); {
         CHECK(!response.payload["sent"].as_bool(true));
         CHECK_EQ(response.payload["transport"].as_string(), std::string("dry_run"));
         CHECK(response.payload["payload"]["eventContent"].is_string());
-        CHECK(response.payload["warning"].as_string().find("不能冒充") != std::string::npos);
+        CHECK(response.payload["warning"].as_string().find("复用近红外反馈结构") != std::string::npos);
     }
 }
 
@@ -159,6 +159,66 @@ CASE(heike_report_preview_rejects_reserved_libs_route); {
         "seq_no":1,"message_id":"123e4567-e89b-12d3-a456-426614174000",
         "event_code":"MODEL003","raw_capture":{"scan_groups":[]}}})");
     CHECK(!response.ok);
+}
+
+CASE(heike_composition_reuses_nir_envelope_and_keeps_missing_results_unknown); {
+    Fixture f("heike_shared_composition");
+    const app::Response response = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"composition","biz_id":"DECL-1","customs_code":"4401",
+        "message_id":"123e4567-e89b-12d3-a456-426614174000",
+        "event_content":{"ID":1,"BELT_CODE":"B01","CUSTOMS_DECLA_NO":"DECL-1",
+          "COLLECT_TIME":"2026-10-03 12:00:00","COMPO_TFE":60.5,"COMPO_S":0}}})");
+    CHECK(response.ok);
+    if (response.ok) {
+        CHECK_EQ(response.payload["payload"]["eventCode"].as_string(), std::string("PISYS001"));
+        CHECK(response.payload["payload"]["eventContent"].is_string());
+        CHECK(!response.payload["sent"].as_bool(true));
+        CHECK(!response.payload["composition_complete"].as_bool(true));
+        CHECK(!response.payload["data_source_mapped"].as_bool(true));
+        CHECK_EQ(response.payload["missing_components"].as_array().size(), std::size_t(8));
+        json::Value content;
+        CHECK(json::parse(response.payload["payload"]["eventContent"].as_string(), content).ok);
+        CHECK_EQ(content.as_object().size(), std::size_t(19));
+        CHECK(content["COMPO_P2O5"].is_null());
+        CHECK(content["DATA_SOURCE"].is_null());
+        CHECK_EQ(content["COMPO_S"].as_number(-1), 0.0);
+        CHECK_EQ(content["COMPO_TFE"].as_number(), 60.5);
+        CHECK(!content.has("SPECTRUM_SOURCE"));
+        CHECK(!content.has("RAW_SPECTRUM"));
+        CHECK(!response.payload["payload"].has("measurement_method"));
+    }
+}
+
+CASE(heike_composition_requires_identity_and_never_accepts_raw_as_result); {
+    Fixture f("heike_shared_bad");
+    for (const char* content : {R"({"COMPO_TFE":60.5})", R"({"ID":1,"COMPO_TFE":[123,456]})"}) {
+        const std::string request = std::string(R"({"command":"heike_report_preview","args":{
+          "kind":"composition","biz_id":"DECL-1","customs_code":"4401",
+          "message_id":"123e4567-e89b-12d3-a456-426614174000","event_content":)") +
+          content + "}}";
+        const auto response = f.facade.dispatch(request);
+        CHECK(!response.ok);
+        CHECK_EQ(response.error.kind, ErrorKind::invalid_argument);
+    }
+}
+
+CASE(heike_model_accepts_libs_derived_result_on_shared_route); {
+    Fixture f("heike_libs_derived");
+    const auto response = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"model","biz_id":"DECL-1","customs_code":"4401",
+        "event_code":"MODEL003","event_source":"IP",
+        "message_id":"123e4567-e89b-12d3-a456-426614174000",
+        "event_content":{"BELT_CODE":1,"CUSTOMS_DECLA_NO":"DECL-1",
+          "COLLECT_TIME":"2026-10-03 12:00:00","SEQ_NO":1,"SPECTRUM_SOURCE":"LIBS",
+          "nirSimlarityRESULT":{"similarity":70,"wastesCode":"TEST","judge_result":"正常"}}}})");
+    CHECK(response.ok);
+    if (response.ok) {
+        CHECK_EQ(response.payload["event_name"].as_string(), std::string("SpectrumIdentify"));
+        CHECK_EQ(response.payload["payload"]["eventCode"].as_string(), std::string("MODEL003"));
+        CHECK(!response.payload["payload"]["eventContent"].has("SPECTRUM_SOURCE"));
+        CHECK_EQ(response.payload["payload"]["eventContent"]["nirSimlarityRESULT"]["similarity"]
+                     .as_number(), 70.0);
+    }
 }
 
 CASE(status_reports_gate_and_stage_without_claiming_sync); {

@@ -3,6 +3,7 @@
 // 这些用例全部不碰串口、不加载 DLL——它们验的是**纪律**，不是设备行为。
 // 任务书 §7 的每一条红线在这里都有一个对应的可执行断言。
 #include <filesystem>
+#include <limits>
 #include <string>
 
 #include "check.hpp"
@@ -250,11 +251,13 @@ CASE(heike_device_reports_are_separate_from_model_envelopes); {
     input.message_id = "123e4567-e89b-12d3-a456-426614174000";
     input.event_content = json::object();
     input.event_content.set("nirSimlarityRESULT", json::object());
+    input.event_content.set("SPECTRUM_SOURCE", json::Value("LIBS"));
     const auto model = integration::heike::make_model_event(input);
     CHECK(model.ok());
     if (model.ok()) {
         CHECK(model.value()["eventCode"].as_string() == "MODEL003");
         CHECK(model.value()["eventContent"].is_object());
+        CHECK(!model.value()["eventContent"].has("SPECTRUM_SOURCE"));
         CHECK_EQ(integration::heike::model_event_name("MODEL003"),
                  std::string("SpectrumIdentify"));
     }
@@ -266,6 +269,97 @@ CASE(heike_device_reports_are_separate_from_model_envelopes); {
     if (model_string.ok()) CHECK(model_string.value()["eventContent"].is_string());
 }
 
+CASE(heike_composition_reuses_pisys001_schema_without_nir_defaults); {
+    integration::heike::EnvelopeInput input;
+    input.biz_id = "DECL-1";
+    input.customs_code = "4401";
+    input.event_code = "PISYS001";
+    input.event_source.clear();
+    input.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    json::Value content = json::object();
+    content.set("BELT_CODE", json::Value("B01"));
+    content.set("COLLECT_TIME", json::Value("2026-10-03 12:00:00"));
+    content.set("COMPO_AL2O3", json::Value(1.1));
+    content.set("COMPO_CAO", json::Value(2.2));
+    content.set("COMPO_FEO", json::Value(3.3));
+    content.set("COMPO_MGO", json::Value(4.4));
+    content.set("COMPO_MNO", json::Value(5.5));
+    content.set("COMPO_P2O5", json::Value(0.6));
+    content.set("COMPO_S", json::Value(7.7));
+    content.set("COMPO_SIO2", json::Value(8.8));
+    content.set("COMPO_TFE", json::Value(9.9));
+    content.set("COMPO_TIO2", json::Value(10.1));
+    content.set("CUSTOMS_DECLA_NO", json::Value("DECL-1"));
+    content.set("DATA_SOURCE", json::Value());
+    content.set("EDGE_CODE", json::Value("ZG"));
+    content.set("ID", json::Value(42));
+    content.set("SEQ_NO", json::Value());
+    content.set("FILE_NAME", json::Value("spectrum.png"));
+    content.set("IMG_DATA", json::Value());
+    content.set("P", json::Value(99.0));  // must not be remapped to P2O5
+    input.event_content = content;
+
+    const auto result = integration::heike::make_composition_event(input);
+    CHECK(result.ok());
+    if (result.ok()) {
+        CHECK(result.value()["eventContent"].is_string());
+        CHECK(!result.value().has("eventSource"));
+        json::Value wire;
+        CHECK(json::parse(result.value()["eventContent"].as_string(), wire).ok);
+        if (wire.is_object()) {
+            CHECK_EQ(wire.as_object().size(), static_cast<std::size_t>(19));
+            CHECK(wire["DATA_SOURCE"].is_null());
+            CHECK(wire["SEQ_NO"].is_null());
+            CHECK(wire["COMPO_P2O5"].as_number() == 0.6);
+            CHECK(!wire.has("P"));
+        }
+    }
+
+    input.event_content = json::Value(json::stringify(content));
+    const auto string_input = integration::heike::make_composition_event(input);
+    CHECK(string_input.ok());
+    if (string_input.ok()) CHECK(string_input.value()["eventContent"].is_string());
+}
+
+CASE(heike_composition_validates_types_ranges_and_identity); {
+    integration::heike::EnvelopeInput input;
+    input.biz_id = "DECL-1";
+    input.customs_code = "4401";
+    input.event_code = "PISYS001";
+    input.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    input.event_content = json::object();
+    input.event_content.set("ID", json::Value(7));
+
+    CHECK(integration::heike::make_composition_event(input).ok());
+    json::Value bad_id = json::object();
+    bad_id.set("ID", json::Value("7"));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+
+    bad_id.set("ID", json::Value(1.5));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+
+    bad_id.set("ID", json::Value(7));
+    bad_id.set("COMPO_FEO", json::Value(-1.0));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+
+    bad_id.set("COMPO_FEO", json::Value(std::numeric_limits<double>::infinity()));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+
+    bad_id.set("COMPO_FEO", json::Value(1.0));
+    bad_id.set("BELT_CODE", json::Value(std::string(21, 'B')));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+
+    bad_id.set("BELT_CODE", json::Value("B01"));
+    bad_id.set("CUSTOMS_DECLA_NO", json::Value("OTHER"));
+    input.event_content = bad_id;
+    CHECK(!integration::heike::make_composition_event(input).ok());
+}
+
 CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
     integration::heike::LibsCaptureContext context;
     context.biz_id = "DECL-1";
@@ -275,7 +369,7 @@ CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
     context.collect_time = "2026-10-03 12:00:00";
     context.seq_no = 1;
     context.message_id = "123e4567-e89b-12d3-a456-426614174000";
-    context.event_code = "LIBS_RAW_V1";
+    context.event_code = "LOCAL_DIAGNOSTIC";
     json::Value raw = json::object();
     raw.set("scan_groups", json::array());
     const auto result = integration::heike::make_libs_raw_event(context, raw, true);
@@ -283,7 +377,7 @@ CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
     if (result.ok()) {
         CHECK(result.value()["eventContent"].is_string());
         CHECK(!result.value()["contentSize"].as_string().empty());
-        CHECK(result.value()["eventCode"].as_string() == "LIBS_RAW_V1");
+        CHECK(result.value()["eventCode"].as_string() == "LOCAL_DIAGNOSTIC");
     }
 }
 
@@ -312,7 +406,9 @@ CASE(heike_model_rejects_libs_raw_content); {
     input.event_source = "LIBS-device";
     input.message_id = "123e4567-e89b-12d3-a456-426614174000";
     input.event_content = json::object();
-    input.event_content.set("SPECTRUM_SOURCE", json::Value("LIBS"));
+    json::Value raw = json::object();
+    raw.set("scan_groups", json::array());
+    input.event_content.set("RAW_SPECTRUM", std::move(raw));
     const auto result = integration::heike::make_model_event(input);
     CHECK(!result.ok());
 }
