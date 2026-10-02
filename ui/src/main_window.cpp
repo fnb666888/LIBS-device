@@ -850,9 +850,13 @@ void MainWindow::on_start_detection() {
     if (r != QMessageBox::Yes) return;
 
     try {
+        const bool follow = follow_trigger_ != nullptr && follow_trigger_->isChecked();
         client_.command(QStringLiteral("spectrum_stream"),
-                        QJsonObject{{QStringLiteral("action"), QStringLiteral("start")}});
+                        QJsonObject{{QStringLiteral("action"), QStringLiteral("start")},
+                                    {QStringLiteral("follow_site_trigger_mode"), follow},
+                                    {QStringLiteral("min_period_ms"), 1000}});
         poller_->open();
+        set_banner(preview_provenance_text(), 1);
     } catch (const QString& e) {
         log_line(Level::Danger, QStringLiteral("启动预览失败：%1").arg(e));
     }
