@@ -258,6 +258,12 @@ CASE(heike_device_reports_are_separate_from_model_envelopes); {
         CHECK_EQ(integration::heike::model_event_name("MODEL003"),
                  std::string("SpectrumIdentify"));
     }
+
+    input.event_content = json::Value(R"({"nirSimlarityRESULT":{"similarity":0.9}})");
+    input.event_content_as_string = true;
+    const auto model_string = integration::heike::make_model_event(input);
+    CHECK(model_string.ok());
+    if (model_string.ok()) CHECK(model_string.value()["eventContent"].is_string());
 }
 
 CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
@@ -279,6 +285,36 @@ CASE(heike_libs_raw_spectrum_is_explicitly_not_nir); {
         CHECK(!result.value()["contentSize"].as_string().empty());
         CHECK(result.value()["eventCode"].as_string() == "LIBS_RAW_V1");
     }
+}
+
+CASE(heike_libs_raw_rejects_reserved_nir_and_model_routes); {
+    integration::heike::LibsCaptureContext context;
+    context.biz_id = "DECL-1";
+    context.customs_code = "4401";
+    context.belt_code = "B01";
+    context.edge_code = "ZG";
+    context.collect_time = "2026-10-03 12:00:00";
+    context.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    json::Value raw = json::object();
+    raw.set("scan_groups", json::array());
+    for (const char* code : {"PISYS001", "MODEL003"}) {
+        context.event_code = code;
+        const auto result = integration::heike::make_libs_raw_event(context, raw);
+        CHECK(!result.ok());
+    }
+}
+
+CASE(heike_model_rejects_libs_raw_content); {
+    integration::heike::EnvelopeInput input;
+    input.biz_id = "DECL-1";
+    input.customs_code = "4401";
+    input.event_code = "MODEL003";
+    input.event_source = "LIBS-device";
+    input.message_id = "123e4567-e89b-12d3-a456-426614174000";
+    input.event_content = json::object();
+    input.event_content.set("SPECTRUM_SOURCE", json::Value("LIBS"));
+    const auto result = integration::heike::make_model_event(input);
+    CHECK(!result.ok());
 }
 
 CASE(config_conveyor_not_software_controlled_by_default); {

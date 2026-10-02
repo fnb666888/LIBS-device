@@ -171,6 +171,11 @@ libs::Result<json::Value> make_libs_raw_event(const LibsCaptureContext& context,
                        "collect_time/event_code/message_id");
     if (!raw_capture.is_object() && !raw_capture.is_array())
         return invalid("LIBS raw capture must be a JSON object or array");
+    // PISYS001..008 are the inbound NIR inspection payloads and MODEL001..004
+    // are model-result events.  Neither namespace is a valid route for raw
+    // LIBS data; reject accidental cross-channel labelling at the builder.
+    if (context.event_code.rfind("LIBS_", 0) != 0)
+        return invalid("LIBS raw event_code must use the LIBS_ namespace");
 
     json::Value content = json::object();
     content.set("SPECTRUM_SOURCE", json::Value("LIBS"));
@@ -199,9 +204,15 @@ libs::Result<json::Value> make_model_event(const EnvelopeInput& input) {
     if (input.event_code != "MODEL001" && input.event_code != "MODEL002" &&
         input.event_code != "MODEL003" && input.event_code != "MODEL004")
         return invalid("model event_code must be MODEL001..MODEL004");
-    if (!input.event_content.is_object())
-        return invalid("model eventContent must be an object supplied by the model");
-    return make_envelope(input);
+    const Result<json::Value> content = normalized_content(input.event_content);
+    if (!content || !content.value().is_object())
+        return invalid("model eventContent must be an object or JSON object string supplied by the model");
+    if (content.value().has("SPECTRUM_SOURCE") &&
+        content.value()["SPECTRUM_SOURCE"].as_string() == "LIBS")
+        return invalid("LIBS raw spectrum cannot be sent as a MODEL event");
+    EnvelopeInput normalized = input;
+    normalized.event_content = content.value();
+    return make_envelope(normalized);
 }
 
 std::string model_event_name(const std::string& event_code) {

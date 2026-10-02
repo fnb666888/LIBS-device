@@ -21,7 +21,7 @@
 }
 ```
 
-模型报文带公共外层，`eventContent` 是否为对象或 JSON 字符串需要和目标边端物模型确认。代码支持两种形态，但默认不发送。
+模型报文带公共外层。附件表格把部分 `eventContent` 标成 JSON 字符串，但示例又直接放对象；当前 `model` 预览入口兼容对象或可解析为对象的 JSON 字符串，正式发送前仍需按目标边端版本确认输出形态。
 
 ```json
 {
@@ -72,7 +72,7 @@
 - `MODEL003` 要求的是已经由模型计算出的相似度、固废名称和判定结果。
 - LIBS 原始 `wavelength_nm + counts` 需要甲方确认一个独立的原始谱事件代码，或者先经过模型/算法转换为对方正式定义的结果字段。
 
-后端因此在本地采集载荷中明确写入 `spectrum_source=LIBS`，并提供 `LIBS_RAW_V1` 形式的预览构造器；代码不会把原始谱伪造成红外成分或模型结果。
+后端因此在本地采集载荷中明确写入 `spectrum_source=LIBS`，并提供 `LIBS_RAW_V1` 形式的预览构造器；当前安全边界要求原始谱事件使用 `LIBS_` 命名空间，并拒绝 `PISYS*`/`MODEL*` 事件。正式 LIBS 事件代码仍需甲方确认，若对方使用其他命名空间需在确认后改动该校验。
 
 ## 后端接口
 
@@ -91,7 +91,7 @@
 }
 ```
 
-支持 `heartbeat`、`event`、`openinit`、`alarm`、`libs_raw`、`model`。响应含 `transport=dry_run` 和 `sent=false`。模型报文必须由调用方传入真实 `eventContent`；缺字段、错误 UUID、错误状态值会直接返回 `invalid_argument`。
+支持 `heartbeat`、`event`、`openinit`、`alarm`、`libs_raw`、`model`。响应含 `transport=dry_run` 和 `sent=false`。模型报文必须由调用方传入真实的对象型 `eventContent`（也兼容可解析为对象的 JSON 字符串）；当前构造器校验事件名、UUID、对象形态并拒绝 LIBS 原始谱，但各 MODEL001～004 的业务字段完整性仍需按最终版本 schema 补充。
 
 站点配置新增 `gateway` 字段：
 
@@ -115,7 +115,7 @@
 
 1. LIBS 原始谱的正式事件代码、URL 路由和 `eventContent` 结构。
 2. `eventContent` 在目标物模型中到底是 object 还是 JSON 字符串。
-3. `BELT_CODE` 的类型、`OPENINIT.onlinePeriod` 的类型，以及 `PISYS002` 缺失字段的最终 schema。
+3. `BELT_CODE` 的类型、`OPENINIT.onlinePeriod` 的类型、`ALARM.data` 是单个 Map 还是数组，以及 `PISYS002` 缺失字段的最终 schema。
 4. 设备监管事件与 `/properties/report` 属性上报是否属于同一版物模型。
 5. 报关单号、皮带号、边端代码、设备编号等业务上下文的真实来源。
 

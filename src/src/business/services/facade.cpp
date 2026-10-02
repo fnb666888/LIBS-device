@@ -3,6 +3,7 @@
 #include "libs/business/services/laser_fire.hpp"
 
 #include <cmath>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -985,6 +986,26 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
         libs::ErrorKind::invalid_argument, "heike_report_not_built", "未构造报文");
     std::string event_name;
 
+    // JSON numbers are stored as double in the project JSON layer.  Do not
+    // cast an unchecked value to int64_t: NaN/Inf, fractions, or values above
+    // the exact-integer range can otherwise produce undefined conversions.
+    const auto read_json_i64 = [&](const json::Value& value, const char* field,
+                                   bool non_negative, std::int64_t& out) -> bool {
+        constexpr double kMaxExactJsonInteger = 9007199254740991.0;  // 2^53 - 1
+        const double number = value.as_number(std::numeric_limits<double>::quiet_NaN());
+        if (!value.is_number() || !std::isfinite(number) || number != std::floor(number) ||
+            number < (non_negative ? 0.0 : -kMaxExactJsonInteger) ||
+            number > kMaxExactJsonInteger) {
+            payload = libs::Error::make(
+                libs::ErrorKind::invalid_argument, "heike_integer_bad",
+                std::string(field) + " must be a finite " +
+                    (non_negative ? "non-negative " : "") + "integer");
+            return false;
+        }
+        out = static_cast<std::int64_t>(number);
+        return true;
+    };
+
     if (kind == "heartbeat" || kind == "event" || kind == "openinit" || kind == "alarm") {
         integration::heike::DeviceIdentity identity;
         identity.equipment_id = args["equipment_id"].as_string();
@@ -1007,21 +1028,36 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
                                              "openinit 需要 stats 数组");
             } else {
                 std::vector<integration::heike::DailyStat> stats;
+                bool stats_valid = true;
                 for (const json::Value& item : args["stats"].as_array()) {
                     if (!item.is_object()) {
                         payload = libs::Error::make(libs::ErrorKind::invalid_argument,
                                                     "heike_stat_bad_item",
                                                     "stats 每项必须是对象");
+                        stats_valid = false;
                         break;
                     }
                     integration::heike::DailyStat stat;
                     stat.date = item["date"].as_string();
-                    stat.count = static_cast<std::int64_t>(item["count"].as_number(-1));
-                    stat.online_period_s = static_cast<std::int64_t>(
-                        item["online_period_s"].as_number(-1));
+                    if (!read_json_i64(item["count"], "stats.count", true, stat.count)) {
+                        stats_valid = false;
+                        break;
+                    }
+                    // The reference protocol calls this field onlinePeriod. Keep
+                    // the old snake_case spelling as a compatibility alias for
+                    // existing UI callers, but emit the protocol spelling.
+                    const json::Value& period = item.has("onlinePeriod")
+                                                    ? item["onlinePeriod"]
+                                                    : item["online_period_s"];
+                    if (!read_json_i64(period, "stats.onlinePeriod", true,
+                                       stat.online_period_s)) {
+                        stats_valid = false;
+                        break;
+                    }
                     stats.push_back(std::move(stat));
-                    payload = integration::heike::make_openinit(identity, stats);
                 }
+                if (stats_valid)
+                    payload = integration::heike::make_openinit(identity, stats);
             }
         } else {
             event_name = "ALARM";
@@ -1031,11 +1067,13 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
                                              "alarm 需要 alarms 数组");
             } else {
                 std::vector<integration::heike::Alarm> alarms;
+                bool alarms_valid = true;
                 for (const json::Value& item : args["alarms"].as_array()) {
                     if (!item.is_object()) {
                         payload = libs::Error::make(libs::ErrorKind::invalid_argument,
                                                     "heike_alarm_bad_item",
                                                     "alarms 每项必须是对象");
+                        alarms_valid = false;
                         break;
                     }
                     integration::heike::Alarm alarm;
@@ -1047,8 +1085,9 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
                     alarm.value = item["value"].as_string();
                     alarm.remake = item["remake"].as_string();
                     alarms.push_back(std::move(alarm));
-                    payload = integration::heike::make_alarm(identity, alarms);
                 }
+                if (alarms_valid)
+                    payload = integration::heike::make_alarm(identity, alarms);
             }
         }
     } else if (kind == "libs_raw") {
@@ -1059,14 +1098,18 @@ Response BusinessFacade::cmd_heike_report_preview(const json::Value& args) {
         context.belt_code = args["belt_code"].as_string();
         context.edge_code = args["edge_code"].as_string();
         context.collect_time = args["collect_time"].as_string();
-        context.seq_no = static_cast<std::int64_t>(args["seq_no"].as_number(0));
+        bool seq_valid = true;
+        if (args.has("seq_no") &&
+            !read_json_i64(args["seq_no"], "seq_no", true, context.seq_no))
+            seq_valid = false;
         context.event_source = args.has("event_source")
                                    ? args["event_source"].as_string()
                                    : "LIBS-device";
         context.message_id = args["message_id"].as_string();
         context.event_code = args["event_code"].as_string();
-        payload = integration::heike::make_libs_raw_event(
-            context, args["raw_capture"], args["event_content_as_string"].as_bool(false));
+        if (seq_valid)
+            payload = integration::heike::make_libs_raw_event(
+                context, args["raw_capture"], args["event_content_as_string"].as_bool(false));
     } else if (kind == "model") {
         integration::heike::EnvelopeInput input;
         input.biz_id = args["biz_id"].as_string();

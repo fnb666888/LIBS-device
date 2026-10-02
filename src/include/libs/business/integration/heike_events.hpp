@@ -91,7 +91,8 @@ libs::Result<json::Value> make_libs_raw_event(const LibsCaptureContext& context,
                                               const json::Value& raw_capture,
                                               bool event_content_as_string = false);
 
-// MODEL001..004 只允许透传调用方已经得到的模型结果；这里不生成任何预测字段。
+// MODEL001..004 只允许透传调用方已经得到的模型结果（对象或 JSON 对象字符串）；
+// 这里不生成任何预测字段。
 libs::Result<json::Value> make_model_event(const EnvelopeInput& input);
 
 // 用于构造 URL 路由，不包含具体网络发送。

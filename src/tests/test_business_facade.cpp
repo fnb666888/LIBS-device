@@ -132,6 +132,35 @@ CASE(heike_report_preview_rejects_invalid_model_without_fabricating_result); {
     CHECK_EQ(response.error.kind, ErrorKind::invalid_argument);
 }
 
+CASE(heike_report_preview_accepts_protocol_online_period_and_rejects_bad_numbers); {
+    Fixture f("heike_openinit_shape");
+    const app::Response good = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"openinit","equipment_id":"DEV-001","equipment_type":"LIBS",
+        "timeseries":"2026-10-03 12:00:00","stats":[
+          {"date":"2026-10-02","count":2,"onlinePeriod":3600}]}})");
+    CHECK(good.ok);
+    if (good.ok)
+        CHECK(good.payload["payload"]["startupInitCount"].as_array()[0]["onlinePeriod"]
+                  .as_number() == 3600.0);
+
+    const app::Response bad = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"openinit","equipment_id":"DEV-001","equipment_type":"LIBS",
+        "timeseries":"2026-10-03 12:00:00","stats":[
+          {"date":"2026-10-02","count":1.5,"onlinePeriod":3600}]}})");
+    CHECK(!bad.ok);
+    CHECK_EQ(bad.error.code, std::string("heike_integer_bad"));
+}
+
+CASE(heike_report_preview_rejects_reserved_libs_route); {
+    Fixture f("heike_libs_reserved");
+    const app::Response response = f.facade.dispatch(R"({"command":"heike_report_preview","args":{
+        "kind":"libs_raw","biz_id":"DECL-1","customs_code":"4401",
+        "belt_code":"B01","edge_code":"ZG","collect_time":"2026-10-03 12:00:00",
+        "seq_no":1,"message_id":"123e4567-e89b-12d3-a456-426614174000",
+        "event_code":"MODEL003","raw_capture":{"scan_groups":[]}}})");
+    CHECK(!response.ok);
+}
+
 CASE(status_reports_gate_and_stage_without_claiming_sync); {
     Fixture f("status");
     const app::Response response = f.facade.dispatch(R"({"command":"status","args":{}})");
