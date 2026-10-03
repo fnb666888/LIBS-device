@@ -364,8 +364,8 @@ QWidget* MainWindow::build_left_column() {
                                  QStringLiteral("spectrometer_to_laser"));
     trigger_direction_->setCurrentIndex(0);
     trigger_direction_->setToolTip(QStringLiteral(
-        "当前接线：激光器同步输出 → Avantes 主通道 Pin 6。\n"
-        "反向接线：Avantes 主通道 Pin 23 LASER OUT → 激光器外部触发输入；"
+        "当前接线：激光器 Q OUT → Avantes 主通道 Pin 6。\n"
+        "反向接线：Avantes 主通道 Pin 23 LASER OUT → 激光器 CLK IN；"
         "RS-232/COM10 仍只负责参数与状态通信。\n"
         "切换后要重新预检，不能在连续出光期间切换。"));
     trigger_row->addWidget(trigger_label);
@@ -1848,9 +1848,9 @@ void MainWindow::on_trigger_direction_changed(int index) {
 
     if (trigger_path_label_) {
         trigger_path_label_->setText(reverse
-            ? QStringLiteral("预期触发路径：Avantes 主通道 Pin 23 LASER OUT → 激光器外部触发输入。"
+            ? QStringLiteral("预期触发路径：Avantes 主通道 Pin 23 LASER OUT → 激光器 CLK IN。"
                              "请确认现场电平、极性和接地后再预检。")
-            : QStringLiteral("预期触发路径：激光器同步输出 → Avantes 主通道 Pin 6；"
+            : QStringLiteral("预期触发路径：激光器 Q OUT → Avantes 主通道 Pin 6；"
                              "四通道由主通道内部 SYNC 同步。"));
     }
     if (!firing_ && fire_state_label_) {

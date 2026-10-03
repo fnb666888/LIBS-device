@@ -691,8 +691,8 @@ Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
                                                 : "laser_to_spectrometer"));
         v.set("trigger_path", json::Value(
             params.spectrometer_triggers_laser
-                ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
-                : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
+                ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser CLK IN"
+                : "laser Q OUT -> Avantes Master HD-26 Pin 6 Trig In"));
         v.set("trigger_output_programmed", json::Value(false));
         v.set("note", json::Value("预检通过，门禁允许出光；本次未发出任何写指令"));
         return Response::success(std::move(v));
@@ -721,8 +721,8 @@ Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
         params.spectrometer_triggers_laser ? "spectrometer_to_laser" : "laser_to_spectrometer"));
     plan.set("trigger_path", json::Value(
         params.spectrometer_triggers_laser
-            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
-            : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
+            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser CLK IN"
+            : "laser Q OUT -> Avantes Master HD-26 Pin 6 Trig In"));
     plan.set("laser_clock_mode", json::Value(static_cast<double>(params.laser_clock_mode)));
     plan.set("cleanup", json::Value("0x24=0 与 0x21=0 无条件执行，出光失败也会收光停机"));
     plan.set("eeprom", json::Value(
@@ -766,8 +766,8 @@ Response BusinessFacade::cmd_laser_fire(const json::Value& args) {
     v.set("trigger_output_programmed", json::Value(r.trigger_output_programmed));
     v.set("trigger_path", json::Value(
         r.trigger_direction == "spectrometer_to_laser"
-            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser external clock/trigger input"
-            : "laser TTL OUT -> Avantes Master HD-26 Pin 6 Trig In"));
+            ? "Avantes Master HD-26 Pin 23 LASER OUT -> laser CLK IN"
+            : "laser Q OUT -> Avantes Master HD-26 Pin 6 Trig In"));
     v.set("parameters_saved", json::Value(false));
 
     // ── 交付出口（能力 6.3.1）───────────────────────────────────────────────
