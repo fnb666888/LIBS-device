@@ -21,6 +21,7 @@
 #include <QHash>
 #include <QJsonObject>
 #include <QMainWindow>
+#include <QPointer>
 #include <QString>
 #include <QVector>
 
@@ -46,6 +47,7 @@ class QValueAxis;
 
 namespace libs::ui {
 
+class DebugWindow;
 
 
 class MainWindow : public QMainWindow {
@@ -139,6 +141,7 @@ private:
     QString fmt_bool_zh(bool b) const { return b ? QStringLiteral("是") : QStringLiteral("否"); }
 
     PipeClient client_;
+    QPointer<DebugWindow> debug_window_;
     StreamPoller* poller_ = nullptr;
     StatusPoller* state_poller_ = nullptr;
 

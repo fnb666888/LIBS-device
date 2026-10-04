@@ -1,4 +1,5 @@
 #include "main_window.hpp"
+#include "debug_window.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -271,6 +272,16 @@ void MainWindow::build_header(QWidget* host) {
     gate_pill_->setObjectName(QStringLiteral("gatePill"));
     gate_pill_->setAlignment(Qt::AlignCenter);
     row->addWidget(gate_pill_);
+
+    auto* debug_button = new QPushButton(QStringLiteral("调试台"), bar);
+    debug_button->setToolTip(QStringLiteral("打开手动设备与接口调试台；不会启动自动联动编排"));
+    connect(debug_button, &QPushButton::clicked, this, [this] {
+        if (!debug_window_) debug_window_ = new DebugWindow(this);
+        debug_window_->show();
+        debug_window_->raise();
+        debug_window_->activateWindow();
+    });
+    row->addWidget(debug_button);
 
     clock_ = new QLabel(bar);
     clock_->setObjectName(QStringLiteral("appClock"));

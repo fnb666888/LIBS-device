@@ -63,10 +63,12 @@ $layers = [ordered]@{
         "src/business/policy/gate.cpp",
         "src/business/logging/run_log.cpp",
         "src/business/services/ac_interlock.cpp",
+        "src/business/services/algorithm_contract.cpp",
         "src/business/services/business_event.cpp",
         "src/business/services/capture.cpp",
         "src/business/services/composition.cpp",
         "src/business/services/data_delivery.cpp",
+        "src/business/services/device_debug.cpp",
         "src/business/services/environment.cpp",
         "src/business/services/laser_fire.cpp",
         "src/business/services/facade.cpp",
@@ -145,6 +147,8 @@ $tests = [ordered]@{
     "test_business_ipc"      = @("tests/test_business_ipc.cpp", $ipcOrder)
     "test_laser_fire"        = @("tests/test_laser_fire.cpp",       $businessOrder)
     "test_spectrum_stream"   = @("tests/test_spectrum_stream.cpp",  $businessOrder)
+    "test_algorithm_contract" = @("tests/test_algorithm_contract.cpp", $businessOrder)
+    "test_device_debug"       = @("tests/test_device_debug.cpp", $businessOrder)
 }
 foreach ($name in $tests.Keys) {
     $source = $tests[$name][0]

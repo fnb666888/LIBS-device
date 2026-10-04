@@ -45,6 +45,7 @@ add_executable(libs-spectrum-ui WIN32
     src/stream_poller.cpp
     src/frame_model.cpp
     src/pipe_client.cpp
+    src/debug_window.cpp
 )
 
 target_link_libraries(libs-spectrum-ui PRIVATE

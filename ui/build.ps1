@@ -50,8 +50,7 @@ if (-not $QtPrefix) {
     }
 }
 if (-not $QtPrefix -or -not (Test-Path (Join-Path $QtPrefix "include\QtCharts\QChart"))) {
-    throw "找不到 Qt6（mingw_64，含 Widgets + Charts）。用 -QtPrefix <路径> 指定，" +
-          "例如 -QtPrefix D:\Qt6\6.11.2\mingw_64"
+    throw "找不到 Qt6（mingw_64，含 Widgets + Charts）。用 -QtPrefix <路径> 指定，例如 -QtPrefix D:\Qt6\6.11.2\mingw_64"
 }
 Write-Host "Qt6 前缀: $QtPrefix"
 
@@ -73,7 +72,8 @@ $sources = @(
     "src/status_poller.cpp",
     "src/stream_poller.cpp",
     "src/frame_model.cpp",
-    "src/pipe_client.cpp"
+    "src/pipe_client.cpp",
+    "src/debug_window.cpp"
 )
 
 # moc 由 CMake 的 AUTOMOC 自动跑；这里手搓等价物——直接调 moc.exe 预生成 moc_*.cpp，

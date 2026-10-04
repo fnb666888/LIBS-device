@@ -129,10 +129,12 @@ add_library(libs_business STATIC
   src/business/policy/gate.cpp
   src/business/logging/run_log.cpp
   src/business/services/ac_interlock.cpp
+  src/business/services/algorithm_contract.cpp
   src/business/services/business_event.cpp
   src/business/services/capture.cpp
   src/business/services/composition.cpp
   src/business/services/data_delivery.cpp
+  src/business/services/device_debug.cpp
   src/business/services/environment.cpp
   src/business/services/laser_fire.cpp
   src/business/services/facade.cpp
@@ -182,3 +184,11 @@ add_test(NAME laser_fire COMMAND test_laser_fire)
 add_executable(test_spectrum_stream tests/test_spectrum_stream.cpp)
 target_link_libraries(test_spectrum_stream PRIVATE libs_test_support libs_business libs_warnings)
 add_test(NAME spectrum_stream COMMAND test_spectrum_stream)
+
+add_executable(test_algorithm_contract tests/test_algorithm_contract.cpp)
+target_link_libraries(test_algorithm_contract PRIVATE libs_test_support libs_business libs_warnings)
+add_test(NAME algorithm_contract COMMAND test_algorithm_contract)
+
+add_executable(test_device_debug tests/test_device_debug.cpp)
+target_link_libraries(test_device_debug PRIVATE libs_test_support libs_business libs_warnings)
+add_test(NAME device_debug COMMAND test_device_debug)

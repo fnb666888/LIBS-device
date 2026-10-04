@@ -16,6 +16,7 @@
 #include "libs/business/services/motion.hpp"
 #include "libs/business/services/ore_presence.hpp"
 #include "libs/business/services/spectrum_stream.hpp"
+#include "libs/business/services/algorithm_contract.hpp"
 #include "libs/business/time_util.hpp"
 
 namespace business::app {
@@ -297,6 +298,10 @@ std::vector<std::string> BusinessFacade::commands() {
         "spectrum_stream",
         // 海关报文只提供离线构造/校验；未配置正式边端时绝不联网。
         "heike_report_preview",
+        "device_debug",
+        "algorithm",
+        "debug_context",
+        "debug_contract",
     };
 }
 
@@ -355,6 +360,10 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "recovery_write")  return cmd_recovery_write(args);
     if (command == "health")          return cmd_health(args);
     if (command == "heike_report_preview") return cmd_heike_report_preview(args);
+    if (command == "device_debug")    return cmd_device_debug(args);
+    if (command == "algorithm")       return cmd_algorithm(args);
+    if (command == "debug_context")   return cmd_debug_context(args);
+    if (command == "debug_contract")  return cmd_debug_contract(args);
     return Response::failure(libs::Error::make(
         libs::ErrorKind::unsupported, "unknown_command",
         "未知命令: " + command + "；可用命令见 commands 字段"));
@@ -1483,6 +1492,128 @@ Response BusinessFacade::cmd_health(const json::Value& args) {
     (void)args;
     std::lock_guard<std::mutex> lock(runtime_.device_mutex());
     return Response::success(runtime_.health_json());
+}
+
+Response BusinessFacade::cmd_algorithm(const json::Value& args) {
+    if (!args.is_object() || !args.has("action") || !args["action"].is_string()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "algorithm_action_required",
+            "algorithm 需要 action=contract|validate|analyze"));
+    }
+    const std::string action = args["action"].as_string();
+    if (action == "contract") {
+        return Response::success(services::algorithm::contract());
+    }
+    if (action != "validate" && action != "analyze") {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "algorithm_bad_action",
+            "algorithm.action 只能是 contract、validate 或 analyze"));
+    }
+    if (!args.has("input")) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "algorithm_input_required",
+            "algorithm.validate/analyze 需要 input 对象"));
+    }
+    if (action == "validate") {
+        const auto result = services::algorithm::validate_input(args["input"]);
+        if (!result) return Response::failure(result.error());
+        return Response::success(result.value());
+    }
+    const auto result = services::algorithm::analyze_placeholder(args["input"]);
+    if (!result) return Response::failure(result.error());
+    return Response::success(result.value());
+}
+
+Response BusinessFacade::cmd_debug_context(const json::Value& args) {
+    if (!args.is_object() || !args.has("action") || !args["action"].is_string()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "debug_context_action_required",
+            "debug_context 需要 action=get|set"));
+    }
+    const std::string action = args["action"].as_string();
+    if (action == "set") {
+        if (args.has("target_belt")) {
+            if (!args["target_belt"].is_string()) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "debug_context_target_belt_bad",
+                    "target_belt 必须是字符串"));
+            }
+            runtime_.set_target_belt(args["target_belt"].as_string());
+        }
+        if (args.has("belt_sequence")) {
+            if (!args["belt_sequence"].is_number() ||
+                !std::isfinite(args["belt_sequence"].as_number()) ||
+                std::floor(args["belt_sequence"].as_number()) != args["belt_sequence"].as_number() ||
+                args["belt_sequence"].as_number() < -9223372036854775808.0 ||
+                args["belt_sequence"].as_number() >= 9223372036854775808.0) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "debug_context_sequence_bad",
+                    "belt_sequence 必须是整数"));
+            }
+            runtime_.set_belt_sequence(static_cast<std::int64_t>(args["belt_sequence"].as_number()));
+        }
+        if (args.has("frequency_hz") || args.has("unit_confirmed") || args.has("calibrated")) {
+            services::WorkFrequency frequency = runtime_.work_frequency();
+            if (args.has("frequency_hz")) {
+                if (args["frequency_hz"].is_null()) frequency.frequency_hz.reset();
+                else if (!args["frequency_hz"].is_number() ||
+                         !std::isfinite(args["frequency_hz"].as_number()) ||
+                         args["frequency_hz"].as_number() <= 0.0) {
+                    return Response::failure(libs::Error::make(
+                        libs::ErrorKind::invalid_argument, "debug_context_frequency_bad",
+                        "frequency_hz 必须是正数或 null"));
+                } else frequency.frequency_hz = args["frequency_hz"].as_number();
+            }
+            if (args.has("unit_confirmed")) {
+                if (!args["unit_confirmed"].is_bool()) return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "debug_context_unit_bad",
+                    "unit_confirmed 必须是布尔值"));
+                frequency.unit_confirmed = args["unit_confirmed"].as_bool();
+            }
+            if (args.has("calibrated")) {
+                if (!args["calibrated"].is_bool()) return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "debug_context_calibrated_bad",
+                    "calibrated 必须是布尔值"));
+                frequency.calibrated = args["calibrated"].as_bool();
+            }
+            runtime_.set_work_frequency(std::move(frequency));
+        }
+    } else if (action != "get") {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "debug_context_bad_action",
+            "debug_context.action 只能是 get 或 set"));
+    }
+    json::Value out = json::object();
+    out.set("action", json::Value(action));
+    out.set("target_belt", json::Value(runtime_.target_belt()));
+    out.set("belt_sequence", json::Value(static_cast<double>(runtime_.belt_sequence())));
+    out.set("stage", json::Value(events::to_string(runtime_.stage())));
+    json::Value frequency = json::object();
+    if (runtime_.work_frequency().frequency_hz.has_value())
+        frequency.set("frequency_hz", json::Value(*runtime_.work_frequency().frequency_hz));
+    else frequency.set("frequency_hz", json::Value());
+    frequency.set("unit_confirmed", json::Value(runtime_.work_frequency().unit_confirmed));
+    frequency.set("calibrated", json::Value(runtime_.work_frequency().calibrated));
+    out.set("work_frequency", std::move(frequency));
+    out.set("manual_only", json::Value(true));
+    out.set("orchestration_started", json::Value(false));
+    return Response::success(std::move(out));
+}
+
+Response BusinessFacade::cmd_debug_contract(const json::Value& args) {
+    (void)args;
+    json::Value out = json::object();
+    out.set("schema_version", json::Value("libs.debug.v1"));
+    out.set("manual_only", json::Value(true));
+    out.set("orchestration", json::Value("disabled"));
+    json::Value commands = json::array();
+    for (const char* name : {"ping", "status", "health", "config_show", "laser_fire",
+                             "capture", "motor", "device_debug", "param_get", "param_set",
+                             "algorithm", "debug_context", "heike_report_preview", "recovery_list",
+                             "recovery_write"}) commands.push_back(json::Value(name));
+    out.set("commands", std::move(commands));
+    out.set("note", json::Value("调试台只发送单步命令；不会把检测启动、出光、采集、分析和上报串成自动流程"));
+    return Response::success(std::move(out));
 }
 
 }  // namespace business::app

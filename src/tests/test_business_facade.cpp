@@ -494,4 +494,28 @@ CASE(param_get_after_restart_keeps_the_gate_in_sync); {
     }
     CHECK(!incomplete);
 }
+
+CASE(facade_algorithm_contract_route_is_available_without_model); {
+    Fixture f("algorithm_route");
+    const app::Response response = f.facade.dispatch(
+        R"({"command":"algorithm","args":{"action":"contract"}})");
+    CHECK(response.ok);
+    CHECK_EQ(response.payload["schema_version"].as_string(), std::string("libs.algorithm.v1"));
+    CHECK_EQ(response.payload["availability"].as_string(), std::string("algorithm_missing"));
+}
+
+CASE(facade_debug_context_is_manual_only); {
+    Fixture f("debug_context");
+    const app::Response set = f.facade.dispatch(
+        R"({"command":"debug_context","args":{"action":"set","target_belt":"B-01","belt_sequence":2,"frequency_hz":10.0,"unit_confirmed":true,"calibrated":true}})");
+    CHECK(set.ok);
+    CHECK(set.payload["manual_only"].as_bool());
+    CHECK(!set.payload["orchestration_started"].as_bool());
+    CHECK_EQ(set.payload["target_belt"].as_string(), std::string("B-01"));
+    const app::Response get = f.facade.dispatch(
+        R"({"command":"debug_context","args":{"action":"get"}})");
+    CHECK(get.ok);
+    CHECK_EQ(get.payload["belt_sequence"].as_number(), 2.0);
+    CHECK_EQ(get.payload["work_frequency"]["frequency_hz"].as_number(), 10.0);
+}
 TEST_MAIN_RETURN()
