@@ -64,6 +64,7 @@ void DeviceSession::reset() {
     rangefinder_.reset();
     indicator_.reset();
     air_conditioner_.reset();
+    motor_.reset();
     spectrometer_.reset();
     links_.clear();
     spectrometer_serials_.clear();
@@ -112,6 +113,14 @@ VoidResult DeviceSession::open(const config::SiteConfig& config) {
                        },
                        air_conditioner_state_, warnings_);
 
+    open_serial_device(config_.motor, "SU300电机控制器", links_,
+                       [&](libs::transport::Link* link) {
+                           motor_ = std::make_unique<libs::devices::Su300>(
+                               *link, config_.motor_address, config_.motor.timeout_ms,
+                               config_.motor.idle_ms);
+                       },
+                       motor_state_, warnings_);
+
     // 光谱仪走厂商 DLL，不走串口。命名互斥体由驱动自己管。
     if (!config_.spectrometer.enabled) {
         spectrometer_state_ = DeviceState{false, false, "", "", "配置未启用（enabled=false）"};
@@ -152,7 +161,16 @@ VoidResult DeviceSession::open(const config::SiteConfig& config) {
 VoidResult DeviceSession::close() {
     std::string first_error;
 
-    // 光谱仪必须最先关：SDK 需要显式停止测量并清空脉冲配置。
+    // 电机先停：即使后面的 SDK 清理耗时或失败，也不能让运动控制器继续运行。
+    // SU300 关闭会话前必须尽力下发 2000H=0001（停机）。即使停机回包
+    // 失败，也继续释放句柄并通过 shutdown_incomplete 把错误交给调用方。
+    if (motor_) {
+        const auto r = motor_->stop();
+        if (!r && first_error.empty()) first_error = describe(r.error());
+    }
+    motor_.reset();
+
+    // 光谱仪随后关闭：SDK 需要显式停止测量并清空脉冲配置。
     if (spectrometer_) {
         const VoidResult r = spectrometer_->close();
         if (!r && first_error.empty()) first_error = describe(r.error());
@@ -181,6 +199,7 @@ HealthReport DeviceSession::health() const {
     report.rangefinder = rangefinder_state_;
     report.indicator = indicator_state_;
     report.air_conditioner = air_conditioner_state_;
+    report.motor = motor_state_;
     report.spectrometer = spectrometer_state_;
 
     std::ostringstream os;
@@ -207,6 +226,7 @@ HealthReport DeviceSession::health() const {
     account("测距仪", rangefinder_state_, true);
     account("状态灯", indicator_state_, true);
     account("空调", air_conditioner_state_, true);
+    account("SU300电机控制器", motor_state_, true);
     account("光谱仪", spectrometer_state_, true);
 
     report.all_required_open = all;

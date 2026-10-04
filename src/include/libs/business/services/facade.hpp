@@ -66,6 +66,7 @@ private:
     Response cmd_laser_fire(const json::Value& args);
     Response cmd_laser_run(const json::Value& args);
     Response cmd_laser_stop(const json::Value& args);
+    Response cmd_motor(const json::Value& args);
     Response cmd_composition(const json::Value& args);
     Response cmd_recovery_list(const json::Value& args);
     Response cmd_recovery_write(const json::Value& args);

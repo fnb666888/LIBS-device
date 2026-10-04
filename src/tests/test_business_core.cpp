@@ -3,6 +3,7 @@
 // 这些用例全部不碰串口、不加载 DLL——它们验的是**纪律**，不是设备行为。
 // 任务书 §7 的每一条红线在这里都有一个对应的可执行断言。
 #include <filesystem>
+#include <cstdint>
 #include <limits>
 #include <string>
 
@@ -537,6 +538,120 @@ CASE(config_roundtrip); {
             CHECK(!back.value().spectrometer.enabled);
         }
     }
+}
+
+CASE(config_motor_defaults_to_disabled_and_motion_is_safe); {
+    const config::SiteConfig fresh;
+    CHECK(!fresh.motor.enabled);
+    CHECK_EQ(fresh.motor_address, static_cast<std::uint8_t>(1));
+    CHECK(!fresh.motor_motion.commissioned);
+    CHECK_EQ(fresh.motor_motion.max_frequency_percent, 0u);
+    CHECK_EQ(fresh.motor_motion.max_duration_ms, 0u);
+    CHECK_EQ(fresh.motor_motion.stop_timeout_ms, 5000u);
+    CHECK_EQ(fresh.motor_motion.poll_interval_ms, 100u);
+    CHECK(!fresh.motor_motion.communication_watchdog_confirmed);
+}
+
+CASE(config_motor_old_documents_remain_compatible); {
+    // 旧配置没有 motor/motor_motion 节点时，升级后仍保持电机关闭且未标定。
+    bool ok = false;
+    const Value old = parsed(R"({
+        "station_id":"legacy",
+        "laser":{"enabled":false}, "rangefinder":{"enabled":false},
+        "indicator":{"enabled":false}, "air_conditioner":{"enabled":false},
+        "spectrometer":{"enabled":false}
+    })", ok);
+    CHECK(ok);
+    const auto loaded = config::from_json(old);
+    CHECK(loaded.ok());
+    if (loaded.ok()) {
+        CHECK(!loaded.value().motor.enabled);
+        CHECK_EQ(loaded.value().motor_address, static_cast<std::uint8_t>(1));
+        CHECK(!loaded.value().motor_motion.commissioned);
+        CHECK(!loaded.value().motor_motion.communication_watchdog_confirmed);
+    }
+}
+
+CASE(config_motor_and_motion_roundtrip); {
+    config::SiteConfig c;
+    c.station_id = "motor";
+    c.laser.enabled = false;
+    c.rangefinder.enabled = false;
+    c.indicator.enabled = false;
+    c.air_conditioner.enabled = false;
+    c.spectrometer.enabled = false;
+    c.motor.enabled = true;
+    c.motor.port = "COM7";
+    c.motor.baud = 19200;
+    c.motor.parity = libs::transport::Parity::even;
+    c.motor.data_bits = 8;
+    c.motor.timeout_ms = 1000;
+    c.motor_address = 7;
+    c.motor_motion.commissioned = true;
+    c.motor_motion.max_frequency_percent = 80;
+    c.motor_motion.max_duration_ms = 60000;
+    c.motor_motion.stop_timeout_ms = 5000;
+    c.motor_motion.poll_interval_ms = 100;
+    c.motor_motion.communication_watchdog_confirmed = true;
+
+    const auto text = config::save_string(c);
+    CHECK(text.ok());
+    if (text.ok()) {
+        bool ok = false;
+        const Value v = parsed(text.value(), ok);
+        CHECK(ok);
+        const auto back = config::from_json(v);
+        CHECK(back.ok());
+        if (back.ok()) {
+            CHECK(back.value().motor.enabled);
+            CHECK_EQ(back.value().motor.baud, 19200u);
+            CHECK(back.value().motor.parity == libs::transport::Parity::even);
+            CHECK_EQ(back.value().motor_address, static_cast<std::uint8_t>(7));
+            CHECK(back.value().motor_motion.commissioned);
+            CHECK_EQ(back.value().motor_motion.max_frequency_percent, 80u);
+            CHECK_EQ(back.value().motor_motion.max_duration_ms, 60000u);
+            CHECK(back.value().motor_motion.communication_watchdog_confirmed);
+        }
+    }
+}
+
+CASE(config_motor_rejects_unsafe_serial_and_motion_values); {
+    config::SiteConfig c;
+    c.station_id = "motor-invalid";
+    c.laser.enabled = false;
+    c.rangefinder.enabled = false;
+    c.indicator.enabled = false;
+    c.air_conditioner.enabled = false;
+    c.spectrometer.enabled = false;
+    c.motor.enabled = true;
+    c.motor.port = "COM7";
+
+    c.motor.baud = 115200;
+    CHECK(!config::validate(c).ok());
+    c.motor.baud = 9600;
+    c.motor.data_bits = 7;
+    CHECK(!config::validate(c).ok());
+    c.motor.data_bits = 8;
+    c.motor.timeout_ms = 0;
+    CHECK(!config::validate(c).ok());
+    c.motor.timeout_ms = 650;
+
+    c.motor_address = 248;
+    CHECK(!config::validate(c).ok());
+    c.motor_address = 1;
+
+    c.motor_motion.max_frequency_percent = 101;
+    CHECK(!config::validate(c).ok());
+    c.motor_motion.max_frequency_percent = 0;
+    c.motor_motion.max_duration_ms = 60001;
+    CHECK(!config::validate(c).ok());
+    c.motor_motion.max_duration_ms = 1;
+    c.motor_motion.commissioned = true;
+    CHECK(!config::validate(c).ok());
+    c.motor_motion.max_frequency_percent = 1;
+    CHECK(!config::validate(c).ok());  // watchdog 未确认
+    c.motor_motion.communication_watchdog_confirmed = true;
+    CHECK(config::validate(c).ok());
 }
 
 // ── 门禁（能力 4）─────────────────────────────────────────────────────────

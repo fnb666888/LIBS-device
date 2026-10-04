@@ -14,6 +14,7 @@
 // **安全边界**：管道 ACL 限定当前用户。设备是独占的，管道也应如此。
 
 #include <atomic>
+#include <memory>
 #include <string>
 #include <mutex>
 #include <thread>
@@ -52,18 +53,36 @@ public:
 
 private:
     // 参数是 Win32 HANDLE（就是 void*），避免在头文件里拉 windows.h。
-    void serve_client_with(void* pipe_handle);
+    // ClientState 由 clients_ 持有；工作线程结束前会关闭自己的管道句柄。
+    struct ClientState {
+        explicit ClientState(void* handle) : pipe_handle(handle) {}
 
-    // join 所有还在服务的连接线程。只在 run() 退出前调用一次。
+        void* pipe_handle = nullptr;
+        std::atomic<bool> done{false};
+        std::thread worker;
+    };
+
+    void serve_client_with(ClientState* client);
+
+    // 回收已经结束的连接线程，避免短连接把 clients_ 无限堆大。
+    void reap_clients();
+
+    // 断开所有活动客户端，使阻塞的 ReadFile 返回。
+    void disconnect_clients();
+
+    // join 所有还在服务的连接线程。只在 run() 退出前调用。
     void join_clients();
 
     Runtime& runtime_;
     DaemonOptions options_;
     std::atomic<bool> stopping_{false};
-    // 每个连接一个线程。**只有 accept 循环这一个线程会 push_back**，
-    // 所以不需要额外加锁；join_clients() 在 run() 退出路径上跑，
-    // 那时 accept 循环已经不再 push。
-    std::vector<std::thread> clients_;
+    // 手动复用 void*，避免头文件依赖 windows.h。实际值是手动复位事件 HANDLE。
+    void* stop_event_ = nullptr;
+
+    // accept 线程负责增加/回收客户端；stop() 会从其它线程断开活动句柄。
+    // 工作线程结束时也需要拿这把锁完成句柄关闭，避免 stop() 与 CloseHandle 竞态。
+    std::mutex clients_mutex_;
+    std::vector<std::unique_ptr<ClientState>> clients_;
 };
 
 }  // namespace business::businessd

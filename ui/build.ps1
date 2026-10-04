@@ -83,6 +83,11 @@ if (-not (Test-Path $moc)) { throw "找不到 moc.exe（$moc）" }
 
 $generated = Join-Path $outDir "moc"
 New-Item -ItemType Directory -Force -Path $generated | Out-Null
+# Qt 6.8 的 moc 在 Windows 上对包含中文字符的绝对输出路径不稳定（会
+# 报“Cannot create ... No such file or directory”，即使目录实际存在）。
+# 脚本已经 Set-Location 到 ui 根目录，因此给 moc 相对路径，生成的文件
+# 后面再由编译循环解析成绝对路径；这样现场把仓库放在中文目录也能构建。
+$generatedRelative = "build\moc"
 
 $generatedSources = @()
 foreach ($src in $sources) {
@@ -91,13 +96,14 @@ foreach ($src in $sources) {
     # 接上 .hpp 就是 "src/xxx..hpp"，永远 Test-Path 不到，于是 moc 一个都不生成，
     # 链接时才炸出一堆 staticMetaObject / vtable 未定义。踩过一次，写在这里。
     $stem = [IO.Path]::GetFileNameWithoutExtension($src)
-    $header = Join-Path $PSScriptRoot (Join-Path "src" ($stem + ".hpp"))
+    $headerRelative = Join-Path "src" ($stem + ".hpp")
+    $header = Join-Path $PSScriptRoot $headerRelative
     if (-not (Test-Path $header)) { continue }   # 例如 main.cpp 没有对应头文件
     $text = [IO.File]::ReadAllText($header)
     if ($text -notmatch "Q_OBJECT") { continue }
-    $out = Join-Path $generated ($stem + ".moc.cpp")
+    $out = Join-Path $generatedRelative ($stem + ".moc.cpp")
     Write-Host "MOC  $stem"
-    & $moc $header -o $out
+    & $moc $headerRelative -o $out
     if ($LASTEXITCODE -ne 0) { throw "moc 失败: $header" }
     $generatedSources += $out
 }

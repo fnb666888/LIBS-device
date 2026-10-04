@@ -46,12 +46,12 @@ $layers = [ordered]@{
         "src/error.cpp", "src/hex.cpp",
         "src/protocols/modbus_rtu.cpp", "src/protocols/laser.cpp",
         "src/protocols/rangefinder.cpp", "src/protocols/indicator.cpp",
-    "src/protocols/air_conditioner.cpp")
+        "src/protocols/air_conditioner.cpp", "src/protocols/su300.cpp")
     "libs_transport" = @("src/transport/serial.cpp")
     "libs_devices"   = @(
         "src/devices/laser.cpp", "src/devices/rangefinder.cpp",
         "src/devices/indicator.cpp", "src/devices/spectrometer.cpp",
-    "src/devices/air_conditioner.cpp")
+        "src/devices/air_conditioner.cpp", "src/devices/su300.cpp")
     # 第 4 层：业务层。只在 devices 之上组装语义，不反向改驱动。
     "libs_business"  = @(
         "src/business/time_util.cpp",
@@ -135,11 +135,13 @@ $tests = [ordered]@{
     "test_devices"      = @("tests/test_devices.cpp",      $linkOrder)
     "test_air_conditioner_protocol" = @("tests/test_air_conditioner_protocol.cpp", $linkOrder)
     "test_air_conditioner_device"   = @("tests/test_air_conditioner_device.cpp",   $linkOrder)
+    "test_su300"          = @("tests/test_su300.cpp",          $linkOrder)
     "test_spectrometer" = @("tests/test_spectrometer.cpp", $linkOrder)
     "test_business_core"     = @("tests/test_business_core.cpp",     $businessOrder)
     "test_business_services" = @("tests/test_business_services.cpp", $businessOrder)
     "test_business_facade"   = @("tests/test_business_facade.cpp",   $businessOrder)
-    # IPC 测试直接调用 handle_line，不真的建管道，所以不拖 main.cpp。
+    # IPC 测试覆盖 handle_line()，并在测试进程内启动真实命名管道；
+    # 不拖 main.cpp，避免另起一个 businessd 入口。
     "test_business_ipc"      = @("tests/test_business_ipc.cpp", $ipcOrder)
     "test_laser_fire"        = @("tests/test_laser_fire.cpp",       $businessOrder)
     "test_spectrum_stream"   = @("tests/test_spectrum_stream.cpp",  $businessOrder)

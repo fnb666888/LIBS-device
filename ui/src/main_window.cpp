@@ -20,6 +20,7 @@
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QStackedLayout>
@@ -881,22 +882,39 @@ void MainWindow::on_start_detection() {
         QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
     if (r != QMessageBox::Yes) return;
 
+    bool preview_started = false;
     try {
         const bool follow = follow_trigger_ != nullptr && follow_trigger_->isChecked();
         client_.command(QStringLiteral("spectrum_stream"),
                         QJsonObject{{QStringLiteral("action"), QStringLiteral("start")},
                                     {QStringLiteral("follow_site_trigger_mode"), follow},
                                     {QStringLiteral("min_period_ms"), 1000}});
-        poller_->open();
+        preview_started = poller_->open();
+        if (!preview_started) {
+            // 后端流已启动但订阅失败时，不能留下无人消费的生产者。
+            try {
+                client_.command(QStringLiteral("spectrum_stream"),
+                                QJsonObject{{QStringLiteral("action"), QStringLiteral("stop")}});
+            } catch (const QString&) {
+            }
+            set_banner(QStringLiteral("订阅预览流失败，已回滚流服务。"), 2);
+            log_line(Level::Danger, QStringLiteral("启动检测失败：预览流订阅未建立。"));
+            return;
+        }
         set_banner(preview_provenance_text(), 1);
     } catch (const QString& e) {
         log_line(Level::Danger, QStringLiteral("启动预览失败：%1").arg(e));
+        set_banner(QStringLiteral("启动预览失败：%1").arg(e), 2);
+        return;
     }
     try {
         client_.command(QStringLiteral("detection_start"),
                         QJsonObject{{QStringLiteral("requested_by"), QStringLiteral("ui")}});
         log_line(Level::Ok, QStringLiteral("已发送 detection_start 业务信号（尚非物理触发）。"));
     } catch (const QString& e) {
+        // 预览已经启动但业务信号失败时必须回滚订阅；否则按钮看似没启动，
+        // 后端却一直保留一个无人消费的 spectrum_stream 订阅。
+        stop_stream();
         set_banner(QStringLiteral("启动检测失败：%1").arg(e), 2);
         QMessageBox::warning(this, QStringLiteral("启动检测失败"), e);
         return;
@@ -1017,18 +1035,23 @@ void MainWindow::on_fire_measure() {
     // 在 UI 线程同步调用会把这 20 秒窗口整个冻住，工控触摸屏上不可接受。
     // 工作线程里另起一个 PipeClient，不 cross-thread 用 UI 线程那个。
     const QString pipe = PipeClient::default_pipe_name();
-    QThread* worker = QThread::create([this, pipe, fire_args]() {
+    const QPointer<MainWindow> guard(this);
+    QThread* worker = QThread::create([guard, pipe, fire_args]() {
         PipeClient client(pipe);
         try {
             // command() 返回整个响应；结果在 payload 里。
             const QJsonObject response = client.command(
                 QStringLiteral("laser_fire"), fire_args, 120000);
             const QJsonObject payload = response.value(QStringLiteral("payload")).toObject();
-            QMetaObject::invokeMethod(this, [this, payload]() { on_fire_result(payload); },
-                                      Qt::QueuedConnection);
+            if (!guard) return;
+            QMetaObject::invokeMethod(guard.data(), [guard, payload]() {
+                if (guard) guard->on_fire_result(payload);
+            }, Qt::QueuedConnection);
         } catch (const QString& e) {
-            QMetaObject::invokeMethod(this, [this, e]() { on_fire_failed(e); },
-                                      Qt::QueuedConnection);
+            if (!guard) return;
+            QMetaObject::invokeMethod(guard.data(), [guard, e]() {
+                if (guard) guard->on_fire_failed(e);
+            }, Qt::QueuedConnection);
         }
     });
     connect(worker, &QThread::finished, worker, &QObject::deleteLater);
@@ -1212,7 +1235,8 @@ void MainWindow::on_run_continuous() {
 
     // 5~7 秒的同步往返，仍在工作线程做，别冻住界面。
     const QString pipe = PipeClient::default_pipe_name();
-    QThread* worker = QThread::create([this, pipe, args]() {
+    const QPointer<MainWindow> guard(this);
+    QThread* worker = QThread::create([guard, pipe, args]() {
         PipeClient client(pipe);
         QString error;
         QJsonObject payload;
@@ -1222,28 +1246,30 @@ void MainWindow::on_run_continuous() {
         } catch (const QString& e) {
             error = e;
         }
-        QMetaObject::invokeMethod(this, [this, payload, error]() {
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard.data(), [guard, payload, error]() {
+            if (!guard) return;
             if (!error.isEmpty()) {
-                fire_state_label_->setText(QStringLiteral("状态：连续出光启动失败"));
-                fire_detail_label_->setText(error);
-                log_line(Level::Danger, QStringLiteral("连续出光启动失败：%1").arg(error));
-                set_banner(QStringLiteral("连续出光启动失败：%1").arg(error), 2);
-                run_btn_->setEnabled(fire_allowed_);
-                if (trigger_direction_) trigger_direction_->setEnabled(true);
-                if (state_poller_) state_poller_->request_refresh();
+                guard->fire_state_label_->setText(QStringLiteral("状态：连续出光启动失败"));
+                guard->fire_detail_label_->setText(error);
+                guard->log_line(Level::Danger, QStringLiteral("连续出光启动失败：%1").arg(error));
+                guard->set_banner(QStringLiteral("连续出光启动失败：%1").arg(error), 2);
+                guard->run_btn_->setEnabled(guard->fire_allowed_);
+                if (guard->trigger_direction_) guard->trigger_direction_->setEnabled(true);
+                if (guard->state_poller_) guard->state_poller_->request_refresh();
                 return;
             }
             const int settle = payload.value(QStringLiteral("settle_ms")).toInt();
-            fire_state_label_->setText(QStringLiteral("状态：★ 正在连续出光"));
-            fire_detail_label_->setText(
+            guard->fire_state_label_->setText(QStringLiteral("状态：★ 正在连续出光"));
+            guard->fire_detail_label_->setText(
                 QStringLiteral("自适应 %1 ms 后已开光闸。激光在持续出光 —— 点「停止出光」收光。")
                     .arg(settle));
-            log_line(Level::Warn, QStringLiteral(
+            guard->log_line(Level::Warn, QStringLiteral(
                 "连续出光已开始（自适应 %1 ms）。**离开前必须点停止出光。**").arg(settle));
-            set_banner(QStringLiteral("⚠ 激光正在**持续出光** —— 点「停止出光」收光。"), 1);
-            run_btn_->setEnabled(false);
-            stop_run_btn_->setEnabled(true);
-            if (state_poller_) state_poller_->request_refresh();
+            guard->set_banner(QStringLiteral("⚠ 激光正在**持续出光** —— 点「停止出光」收光。"), 1);
+            guard->run_btn_->setEnabled(false);
+            guard->stop_run_btn_->setEnabled(true);
+            if (guard->state_poller_) guard->state_poller_->request_refresh();
         }, Qt::QueuedConnection);
     });
     connect(worker, &QThread::finished, worker, &QObject::deleteLater);
@@ -1253,26 +1279,54 @@ void MainWindow::on_run_continuous() {
 void MainWindow::on_stop_continuous() {
     // 停止**不看门禁**：门禁管的是"能不能开始出光"，停止永远该能停。
     stop_run_btn_->setEnabled(false);
-    try {
-        client_.command(QStringLiteral("laser_stop"), QJsonObject(), 30000);
-        fire_state_label_->setText(QStringLiteral("状态：连续出光已停止"));
-        fire_detail_label_->setText(QStringLiteral("光闸已关、已停机，读回确认通过。"));
-        log_line(Level::Ok, QStringLiteral("连续出光已停止：收光 + 停机 + 读回确认。"));
-        set_banner(QStringLiteral("连续出光已停止，光闸已关闭。"), 0);
-    } catch (const QString& e) {
-        // 停止没确认通过是最严重的一种失败 —— 必须把话说到人脸上。
-        fire_state_label_->setText(QStringLiteral("状态：⚠ 停止未确认"));
-        fire_detail_label_->setText(e);
-        log_line(Level::Danger, QStringLiteral("连续出光停止未确认：%1").arg(e));
-        set_banner(QStringLiteral("⚠ 停止出光未确认：%1 —— 请现场人工确认光闸已关闭").arg(e), 2);
-        QMessageBox::critical(this, QStringLiteral("停止出光未确认"),
-                              QStringLiteral("已下发收光与停机，但读回确认没通过：\n\n%1\n\n"
-                                             "**请到设备前人工确认光闸确实已关闭。**").arg(e));
-    }
-    // 无论成败都把按钮放回去：失败时操作员更需要能再按一次。
-    stop_run_btn_->setEnabled(true);
-    if (trigger_direction_) trigger_direction_->setEnabled(true);
-    if (state_poller_) state_poller_->request_refresh();
+    run_btn_->setEnabled(false);
+    if (trigger_direction_) trigger_direction_->setEnabled(false);
+    fire_state_label_->setText(QStringLiteral("状态：正在停止连续出光…"));
+    fire_detail_label_->setText(QStringLiteral("正在收光、停机并读回确认；界面仍可操作。"));
+    // laser_stop 可能等待串口确认，不能在 UI 线程同步调用，否则点击停止后
+    // 触摸屏会冻结最多 30 秒。与 laser_fire/laser_run 使用同一异步模式。
+    const QString pipe = PipeClient::default_pipe_name();
+    const QPointer<MainWindow> guard(this);
+    QThread* worker = QThread::create([guard, pipe]() {
+        PipeClient client(pipe);
+        QString error;
+        try {
+            client.command(QStringLiteral("laser_stop"), QJsonObject(), 30000);
+        } catch (const QString& e) {
+            error = e;
+        }
+        if (!guard) return;
+        QMetaObject::invokeMethod(guard.data(), [guard, error]() {
+            if (!guard) return;
+            if (error.isEmpty()) {
+                guard->fire_state_label_->setText(QStringLiteral("状态：连续出光已停止"));
+                guard->fire_detail_label_->setText(QStringLiteral("光闸已关、已停机，读回确认通过。"));
+                guard->log_line(Level::Ok, QStringLiteral("连续出光已停止：收光 + 停机 + 读回确认。"));
+                guard->set_banner(QStringLiteral("连续出光已停止，光闸已关闭。"), 0);
+            } else {
+                // 停止没确认通过是最严重的一种失败 —— 必须把话说到人脸上。
+                guard->fire_state_label_->setText(QStringLiteral("状态：⚠ 停止未确认"));
+                guard->fire_detail_label_->setText(error);
+                guard->log_line(Level::Danger, QStringLiteral("连续出光停止未确认：%1").arg(error));
+                guard->set_banner(QStringLiteral("⚠ 停止出光未确认：%1 —— 请现场人工确认光闸已关闭").arg(error), 2);
+                QMessageBox::critical(guard.data(), QStringLiteral("停止出光未确认"),
+                                      QStringLiteral("已下发收光与停机，但读回确认没通过：\n\n%1\n\n"
+                                                      "请到设备前人工确认光闸确实已关闭。").arg(error));
+            }
+            // 无论成败都把按钮放回去：失败时操作员更需要能再按一次。
+            guard->stop_run_btn_->setEnabled(true);
+            if (error.isEmpty()) {
+                const bool reverse = guard->trigger_direction_ &&
+                    guard->trigger_direction_->currentData().toString() ==
+                        QLatin1String("spectrometer_to_laser");
+                guard->run_btn_->setEnabled(guard->fire_allowed_ && !reverse);
+            }
+            if (guard->trigger_direction_) guard->trigger_direction_->setEnabled(true);
+            if (guard->state_poller_) guard->state_poller_->request_refresh();
+        }, Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
 }
 
 // ── 参数提交 ──────────────────────────────────────────────────────────
@@ -1351,6 +1405,10 @@ void MainWindow::sync_params_from_snapshot(const MachineSnapshot& s) {
         for (auto it = g.fields->begin(); it != g.fields->end(); ++it) {
             const QJsonValue v = vals.value(it.key());
             if (!v.isDouble() || !it.value()) continue;
+            // 状态轮询每 800 ms 一次。用户正在编辑时不能被后台真值抢写，
+            // 否则输入框会跳回旧值，现场看起来像“键盘坏了”。失焦后下一轮
+            // 再同步设备真值。
+            if (it.value()->hasFocus()) continue;
             it.value()->setValue(v.toDouble());
             it.value()->setEnabled(true);
             any = true;
@@ -1469,8 +1527,12 @@ void MainWindow::render_detection(const MachineSnapshot& s) {
                             .arg(s.belt_sequence < 0 ? QStringLiteral("—")
                                                       : QString::number(s.belt_sequence)));
     count_label_->setText(QStringLiteral("日志条数：%1").arg(s.log_records));
-    start_btn_->setEnabled(!running);
-    stop_btn_->setEnabled(running || poller_->is_open());
+    // detection_start 与 spectrum_stream 是两条独立协议。即使后端的
+    // running 尚未切换，预览订阅已经打开时也不能再次点“启动检测”，
+    // 否则会不断重订阅、界面状态与后端状态不一致。
+    const bool active = running || (poller_ && poller_->is_open());
+    start_btn_->setEnabled(!active);
+    stop_btn_->setEnabled(active);
 }
 
 QString MainWindow::detect_stage_text(const QString& stage) const {

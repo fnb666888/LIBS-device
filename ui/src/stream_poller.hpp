@@ -9,7 +9,7 @@
 // 都是**短请求、立即返回**，不占连接。见 spectrum_stream 设计说明。
 
 #include <QObject>
-#include <QTimer>
+#include <QThread>
 
 #include "frame_model.hpp"
 #include "pipe_client.hpp"
@@ -20,8 +20,10 @@ class StreamPoller : public QObject {
     Q_OBJECT
 public:
     explicit StreamPoller(PipeClient client, QObject* parent = nullptr);
+    ~StreamPoller() override;
 
-    // 订阅并立刻尝试取第一帧。返回 false 表示连不上守护进程（调用方弹错）。
+    // 订阅并启动后台取帧线程。订阅本身失败返回 false；第一帧通过
+    // frame_ready 异步送回，避免大 JSON 往返阻塞界面。
     bool open();
     // 退订并停表。幂等。
     void close();
@@ -39,15 +41,23 @@ signals:
     void stats_changed(int pending, qint64 dropped);
 
 private slots:
-    void poll();
+    // Worker 线程只做管道往返；这些槽在 UI 线程执行，负责丢弃旧会话的
+    // 延迟结果并转发已有信号。
+    void deliver_frame(qint64 session, const libs::ui::FrameData& frame);
+    void deliver_error(qint64 session, const QString& message);
+    void deliver_stats(qint64 session, int pending, qint64 dropped);
 
 private:
+    class Worker;
+
     PipeClient client_;
-    QTimer timer_;
     bool open_ = false;
     qint64 subscriber_ = -1;   // 守护进程分配的订阅号；-1 = 未订阅
     qint64 last_frame_index_ = -1;
     qint64 dropped_ = 0;
+    qint64 session_ = 0;
+    QString last_stream_error_;
+    Worker* worker_ = nullptr;
 };
 
 }  // namespace libs::ui

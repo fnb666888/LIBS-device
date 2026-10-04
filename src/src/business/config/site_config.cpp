@@ -268,6 +268,43 @@ Result<AirConditionerInterlockConfig> parse_interlock(const json::Value& parent)
     return cfg;
 }
 
+Result<MotorMotionConfig> parse_motor_motion(const json::Value& parent) {
+    MotorMotionConfig cfg;
+    const json::Value& node = parent["motor_motion"];
+    if (node.is_null()) return cfg;  // 旧配置兼容：未出现即未标定
+    if (!node.is_object()) return invalid("motor_motion must be an object");
+
+    const Result<bool> commissioned = optional_bool(node, "commissioned", cfg.commissioned);
+    if (!commissioned) return commissioned.error();
+    cfg.commissioned = commissioned.value();
+
+    const Result<unsigned> max_frequency =
+        optional_uint(node, "max_frequency_percent", "motor_motion", cfg.max_frequency_percent);
+    if (!max_frequency) return max_frequency.error();
+    cfg.max_frequency_percent = max_frequency.value();
+
+    const Result<unsigned> max_duration =
+        optional_uint(node, "max_duration_ms", "motor_motion", cfg.max_duration_ms);
+    if (!max_duration) return max_duration.error();
+    cfg.max_duration_ms = max_duration.value();
+
+    const Result<unsigned> stop_timeout =
+        optional_uint(node, "stop_timeout_ms", "motor_motion", cfg.stop_timeout_ms);
+    if (!stop_timeout) return stop_timeout.error();
+    cfg.stop_timeout_ms = stop_timeout.value();
+
+    const Result<unsigned> poll_interval =
+        optional_uint(node, "poll_interval_ms", "motor_motion", cfg.poll_interval_ms);
+    if (!poll_interval) return poll_interval.error();
+    cfg.poll_interval_ms = poll_interval.value();
+
+    const Result<bool> watchdog = optional_bool(
+        node, "communication_watchdog_confirmed", cfg.communication_watchdog_confirmed);
+    if (!watchdog) return watchdog.error();
+    cfg.communication_watchdog_confirmed = watchdog.value();
+    return cfg;
+}
+
 // 出光标定参数。**所有字段都必须显式写出**，不给任何"聪明"的默认值：
 // 这里每个数的默认值都意味着"能出光"，回落就等于替现场做了一次未标定的决定。
 Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
@@ -353,6 +390,18 @@ Result<SiteConfig> from_json(const json::Value& value) {
     if (!ac) return ac.error();
     cfg.air_conditioner = ac.value();
 
+    // SU300 是新增的可选设备；旧配置没有 motor 节点时保持关闭，避免升级后
+    // 因缺少串口字段而阻断原有站点启动。
+    SerialPortConfig motor_defaults;
+    motor_defaults.enabled = false;
+    if (value["motor"].is_null()) {
+        cfg.motor = motor_defaults;
+    } else {
+        const Result<SerialPortConfig> motor = parse_serial(value, "motor", motor_defaults);
+        if (!motor) return motor.error();
+        cfg.motor = motor.value();
+    }
+
     const Result<SpectrometerConfig> spec = parse_spectrometer(value);
     if (!spec) return spec.error();
     cfg.spectrometer = spec.value();
@@ -372,6 +421,10 @@ Result<SiteConfig> from_json(const json::Value& value) {
     const Result<AirConditionerInterlockConfig> il = parse_interlock(value);
     if (!il) return il.error();
     cfg.ac_interlock = il.value();
+
+    const Result<MotorMotionConfig> mm = parse_motor_motion(value);
+    if (!mm) return mm.error();
+    cfg.motor_motion = mm.value();
 
     const json::Value& model = value["indicator_model"];
     if (!model.is_null()) {
@@ -395,6 +448,10 @@ Result<SiteConfig> from_json(const json::Value& value) {
     if (!aca) return aca.error();
     cfg.air_conditioner_address = aca.value();
 
+    const Result<std::uint8_t> ma = optional_u8(value, "motor_address", 1);
+    if (!ma) return ma.error();
+    cfg.motor_address = ma.value();
+
     const Result<unsigned> ct = optional_uint(value, "capture_timeout_ms", "", 3000);
     if (!ct) return ct.error();
     cfg.capture_timeout_ms = ct.value();
@@ -415,6 +472,7 @@ json::Value to_json(const SiteConfig& config) {
     v.set("rangefinder", to_json_serial(config.rangefinder));
     v.set("indicator", to_json_serial(config.indicator));
     v.set("air_conditioner", to_json_serial(config.air_conditioner));
+    v.set("motor", to_json_serial(config.motor));
 
     json::Value spec = json::object();
     spec.set("sdk_dll", json::Value(config.spectrometer.sdk_dll));
@@ -469,11 +527,23 @@ json::Value to_json(const SiteConfig& config) {
     il.set("calibrated", json::Value(config.ac_interlock.calibrated));
     v.set("ac_interlock", std::move(il));
 
+    json::Value mm = json::object();
+    mm.set("commissioned", json::Value(config.motor_motion.commissioned));
+    mm.set("max_frequency_percent",
+           json::Value(static_cast<double>(config.motor_motion.max_frequency_percent)));
+    mm.set("max_duration_ms", json::Value(static_cast<double>(config.motor_motion.max_duration_ms)));
+    mm.set("stop_timeout_ms", json::Value(static_cast<double>(config.motor_motion.stop_timeout_ms)));
+    mm.set("poll_interval_ms", json::Value(static_cast<double>(config.motor_motion.poll_interval_ms)));
+    mm.set("communication_watchdog_confirmed",
+           json::Value(config.motor_motion.communication_watchdog_confirmed));
+    v.set("motor_motion", std::move(mm));
+
     v.set("indicator_model", json::Value(config.indicator_model));
     v.set("indicator_address", json::Value(static_cast<double>(config.indicator_address)));
     v.set("laser_address", json::Value(static_cast<double>(config.laser_address)));
     v.set("rangefinder_address", json::Value(static_cast<double>(config.rangefinder_address)));
     v.set("air_conditioner_address", json::Value(static_cast<double>(config.air_conditioner_address)));
+    v.set("motor_address", json::Value(static_cast<double>(config.motor_address)));
     v.set("capture_timeout_ms", json::Value(static_cast<double>(config.capture_timeout_ms)));
     v.set("integration_ms", json::Value(config.integration_ms));
     return v;
@@ -514,6 +584,7 @@ Result<SiteConfig> default_template() {
     c.rangefinder.enabled = false;
     c.indicator.enabled = false;
     c.air_conditioner.enabled = false;
+    c.motor.enabled = false;
     c.spectrometer.enabled = false;
     // 触发方向：**激光器触发光谱仪**（AvaSoft 手册 §4.9 接法二）。
     // 默认模板就按这个方向给，接法一（光谱仪 TTL 点火激光器）不在本项目范围内。
@@ -560,6 +631,8 @@ VoidResult validate(const SiteConfig& config) {
     if (!i) return i;
     const VoidResult a = check_serial("air_conditioner", config.air_conditioner);
     if (!a) return a;
+    const VoidResult m = check_serial("motor", config.motor);
+    if (!m) return m;
 
     if (config.spectrometer.enabled) {
         if (config.spectrometer.sdk_dll.empty())
@@ -585,6 +658,38 @@ VoidResult validate(const SiteConfig& config) {
     if (config.rangefinder_address == 0) return invalid("rangefinder_address must be 1..255");
     if (config.air_conditioner_address == 0) return invalid("air_conditioner_address must be 1..255");
     if (config.indicator_address == 0) return invalid("indicator_address must be 1..255");
+    if (config.motor_address == 0 || config.motor_address > 247)
+        return invalid("motor_address must be 1..247");
+
+    if (config.motor.enabled) {
+        if (config.motor.baud != 9600 && config.motor.baud != 19200 && config.motor.baud != 38400)
+            return invalid("motor.baud must be one of 9600/19200/38400");
+        if (config.motor.data_bits != 8)
+            return invalid("motor serial format must be 8N1, 8E1, or 8O1");
+        if (config.motor.timeout_ms == 0 || config.motor.timeout_ms > 10000)
+            return invalid("motor.timeout_ms must be 1..10000 ms");
+        if (config.motor.idle_ms > config.motor.timeout_ms)
+            return invalid("motor.idle_ms must not exceed motor.timeout_ms");
+    }
+
+    if (config.motor_motion.max_frequency_percent > 100)
+        return invalid("motor_motion.max_frequency_percent must be 0..100 percent");
+    if (config.motor_motion.max_duration_ms > 60000)
+        return invalid("motor_motion.max_duration_ms must be 0 or 1..60000 ms");
+    if (config.motor_motion.stop_timeout_ms == 0)
+        return invalid("motor_motion.stop_timeout_ms must be positive");
+    if (config.motor_motion.poll_interval_ms == 0)
+        return invalid("motor_motion.poll_interval_ms must be positive");
+    if (config.motor_motion.commissioned) {
+        if (!config.motor.enabled)
+            return invalid("motor must be enabled when motor_motion.commissioned=true");
+        if (config.motor_motion.max_frequency_percent == 0)
+            return invalid("motor_motion.max_frequency_percent is required when commissioned=true");
+        if (config.motor_motion.max_duration_ms == 0)
+            return invalid("motor_motion.max_duration_ms is required when commissioned=true");
+        if (!config.motor_motion.communication_watchdog_confirmed)
+            return invalid("motor_motion.communication_watchdog_confirmed must be true when commissioned=true");
+    }
 
     // 联锁纪律：未标定不得启用（范围报告 §3.9.2）。
     if (config.ac_interlock.enabled && !config.ac_interlock.calibrated)

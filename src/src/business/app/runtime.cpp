@@ -21,6 +21,7 @@ json::Value to_json(const session::HealthReport& report) {
     v.set("rangefinder", device(report.rangefinder));
     v.set("indicator", device(report.indicator));
     v.set("air_conditioner", device(report.air_conditioner));
+    v.set("motor", device(report.motor));
     v.set("spectrometer", device(report.spectrometer));
     return v;
 }
@@ -136,7 +137,11 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
 }
 
 libs::VoidResult Runtime::stop() {
+    // 先通知可能正在等待 duration_ms 的电机动作，再等待 device_mutex，
+    // 确保该动作完成最后一次停机回写后才释放 SU300 串口。
+    motor_stop_requested_.store(true);
     if (!running_) {
+        std::lock_guard<std::mutex> lock(device_mutex_);
         devices_.close();   // start 中途打开过也要关
         return libs::VoidResult();
     }
@@ -158,7 +163,10 @@ libs::VoidResult Runtime::stop() {
     // 设备句柄采集，或去 lock 一把已经没了的 mutex。
     // stop() 内部会 join 采集线程，返回后不会再有新帧。
     spectrum_stream_.stop();
-    const libs::VoidResult closed = devices_.close();
+    const libs::VoidResult closed = [&] {
+        std::lock_guard<std::mutex> lock(device_mutex_);
+        return devices_.close();
+    }();
     log_->write(logging::RecordKind::general,
                 closed ? "设备已关闭" : ("设备关闭报错: " + closed.error().message));
     return closed;

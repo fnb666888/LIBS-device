@@ -21,6 +21,17 @@ public:
           owner_(owner),
           interval_ms_(interval_ms > 0 ? interval_ms : 800) {}
 
+    // QThread 可以在一次 run() 完成后再次 start()，但本对象的停止标志
+    // 必须显式清零。出光测量期间 StatusPoller 会 stop()，测量结束再
+    // start()；不重置的话新线程第一轮采样后就直接退出，界面状态永远停在
+    // 测量前的快照。
+    void prepare_start(int interval_ms) {
+        stopping_.storeRelease(0);
+        if (interval_ms > 0) interval_ms_ = interval_ms;
+        QMutexLocker lock(&wake_mutex_);
+        poked_ = false;
+    }
+
     // 线程启动后调用（run 里的第一件事）：立刻采一次，别让界面空一秒。
     void poke() {
         QMutexLocker lock(&wake_mutex_);
@@ -117,10 +128,10 @@ StatusPoller::~StatusPoller() { stop(); }
 void StatusPoller::start(int interval_ms) {
     if (running_) return;
     running_ = true;
-    // 间隔只能在构造时定（QThread::run 已进入循环），所以这里只处理
-    // 第一次启动；后续 start() 是 no-op，由 request_refresh() 承担刷新。
-    Q_UNUSED(interval_ms)
-    if (worker_ && !worker_->isRunning()) worker_->start();
+    if (worker_ && !worker_->isRunning()) {
+        worker_->prepare_start(interval_ms);
+        worker_->start();
+    }
 }
 
 void StatusPoller::stop() {

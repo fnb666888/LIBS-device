@@ -21,6 +21,7 @@
 #include "libs/devices/indicator.hpp"
 #include "libs/devices/laser.hpp"
 #include "libs/devices/rangefinder.hpp"
+#include "libs/devices/su300.hpp"
 #include "libs/devices/spectrometer.hpp"
 #include "libs/error.hpp"
 #include "libs/transport/serial.hpp"
@@ -45,6 +46,7 @@ struct HealthReport {
     DeviceState rangefinder;
     DeviceState indicator;
     DeviceState air_conditioner;
+    DeviceState motor;
     DeviceState spectrometer;
 };
 
@@ -64,8 +66,9 @@ public:
     // 绝不做的事：静默回落、换端口重试、把失败吞掉。
     libs::VoidResult open(const config::SiteConfig& config);
 
-    // 优雅关闭。顺序与打开相反：先关光谱仪（SDK 需要显式清理），
-    // 再关串口。可重复调用。
+    // 优雅关闭：先尽力让 SU300 停机（2000H=0001），再关光谱仪
+    // （SDK 需要显式清理），最后释放串口。即使停机或 SDK 回包失败，
+    // 仍继续清理并以 shutdown_incomplete 回报首个错误。可重复调用。
     libs::VoidResult close();
 
     bool is_open() const noexcept { return open_; }
@@ -78,6 +81,7 @@ public:
     libs::devices::Rangefinder* rangefinder() noexcept { return rangefinder_.get(); }
     libs::devices::Indicator* indicator() noexcept { return indicator_.get(); }
     libs::devices::AirConditioner* air_conditioner() noexcept { return air_conditioner_.get(); }
+    libs::devices::Su300* motor() noexcept { return motor_.get(); }
     libs::devices::Spectrometer* spectrometer() noexcept { return spectrometer_.get(); }
 
     const config::SiteConfig& config() const noexcept { return config_; }
@@ -98,12 +102,14 @@ private:
     std::unique_ptr<libs::devices::Rangefinder> rangefinder_;
     std::unique_ptr<libs::devices::Indicator> indicator_;
     std::unique_ptr<libs::devices::AirConditioner> air_conditioner_;
+    std::unique_ptr<libs::devices::Su300> motor_;
     std::unique_ptr<libs::devices::Spectrometer> spectrometer_;
 
     DeviceState laser_state_;
     DeviceState rangefinder_state_;
     DeviceState indicator_state_;
     DeviceState air_conditioner_state_;
+    DeviceState motor_state_;
     DeviceState spectrometer_state_;
     std::vector<std::string> spectrometer_serials_;
     std::vector<std::string> warnings_;

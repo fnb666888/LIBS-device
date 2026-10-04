@@ -3,8 +3,10 @@
 #include "libs/business/services/laser_fire.hpp"
 
 #include <cmath>
+#include <chrono>
 #include <limits>
 #include <sstream>
+#include <thread>
 #include <utility>
 
 #include "libs/business/integration/heike_events.hpp"
@@ -49,6 +51,35 @@ json::Value delivery_to_json(const data_delivery::DeliveryStatus& s) {
     d.set("gateway_delivered", json::Value(s.gateway_delivered));
     d.set("gateway_error", json::Value(s.gateway_error));
     return d;
+}
+
+json::Value su300_status_to_json(const libs::su300::Status& s) {
+    json::Value v = json::object();
+    v.set("address", json::Value(static_cast<double>(s.address)));
+    v.set("fault", json::Value(static_cast<double>(s.fault)));
+    v.set("faulted", json::Value(s.faulted()));
+    v.set("operation", json::Value(static_cast<double>(s.operation)));
+    v.set("running", json::Value(s.running()));
+    v.set("stopped", json::Value(s.stopped()));
+    v.set("set_frequency_hz", json::Value(s.set_frequency_hz()));
+    v.set("output_frequency_hz", json::Value(s.output_frequency_hz()));
+    v.set("output_current_raw", json::Value(static_cast<double>(s.output_current)));
+    v.set("bus_voltage_raw", json::Value(static_cast<double>(s.bus_voltage)));
+    v.set("output_voltage_raw", json::Value(static_cast<double>(s.output_voltage)));
+    v.set("analog_input_raw", json::Value(static_cast<double>(s.analog_input)));
+    v.set("current_count", json::Value(static_cast<double>(s.current_count)));
+    v.set("motor_speed_raw", json::Value(static_cast<double>(s.motor_speed)));
+    v.set("temperature_raw", json::Value(static_cast<double>(s.temperature)));
+    v.set("pid_feedback_raw", json::Value(static_cast<double>(s.pid_feedback)));
+    v.set("pid_setting_raw", json::Value(static_cast<double>(s.pid_setting)));
+    v.set("pulse_input", json::Value(static_cast<double>(s.pulse_input)));
+    v.set("current_fault", json::Value(static_cast<double>(s.current_fault)));
+    v.set("timing_value", json::Value(static_cast<double>(s.timing_value)));
+    v.set("input_terminal", json::Value(static_cast<double>(s.input_terminal)));
+    v.set("output_terminal", json::Value(static_cast<double>(s.output_terminal)));
+    v.set("status_bits", json::Value(static_cast<double>(s.status)));
+    v.set("direction", json::Value(static_cast<double>(s.direction)));
+    return v;
 }
 
 }  // namespace
@@ -258,6 +289,7 @@ std::vector<std::string> BusinessFacade::commands() {
         // 出光几秒后自动收光，这个一直打，直到 laser_stop。
         "laser_run",
         "laser_stop",
+        "motor",
         "composition",
         "recovery_list",
         "recovery_write",
@@ -316,6 +348,7 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "laser_fire")      return cmd_laser_fire(args);
     if (command == "laser_run")       return cmd_laser_run(args);
     if (command == "laser_stop")      return cmd_laser_stop(args);
+    if (command == "motor")           return cmd_motor(args);
     if (command == "spectrum_stream") return cmd_spectrum_stream(args);
     if (command == "composition")     return cmd_composition(args);
     if (command == "recovery_list")   return cmd_recovery_list(args);
@@ -1003,6 +1036,194 @@ Response BusinessFacade::cmd_laser_stop(const json::Value& args) {
         f.set("was_running", json::Value(was_running));
         return f;
     }());
+    return Response::success(std::move(v));
+}
+
+Response BusinessFacade::cmd_motor(const json::Value& args) {
+    std::unique_lock<std::mutex> lock(runtime_.device_mutex());
+    libs::devices::Su300* motor = runtime_.devices().motor();
+    if (motor == nullptr) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::unsupported, "motor_not_open",
+            "SU300 电机控制器未打开；请在配置 motor.enabled=true 并核对 RS485 A+/B- 接线"));
+    }
+
+    const std::string action = args.has("action") && args["action"].is_string()
+                                   ? args["action"].as_string()
+                                   : "status";
+    if (action == "status") {
+        const auto status = motor->read_status();
+        if (!status) return Response::failure(status.error());
+        json::Value v = su300_status_to_json(status.value());
+        v.set("protocol", json::Value("Modbus RTU FC03/FC06; SU300 F6-05 must match the commissioned unit (0=Delta M, 1=MD380)"));
+        v.set("position_feedback", json::Value("not provided by SU300 registers"));
+        return Response::success(std::move(v));
+    }
+
+    if (action == "reset_fault") {
+        const auto reset = motor->reset_fault();
+        if (!reset) return Response::failure(reset.error());
+        const auto status = motor->read_status();
+        if (!status) return Response::failure(status.error());
+        json::Value v = su300_status_to_json(status.value());
+        v.set("reset_fault", json::Value(true));
+        return Response::success(std::move(v));
+    }
+
+    if (action == "stop") {
+        runtime_.request_motor_stop();
+        const auto stopped = motor->stop();
+        if (!stopped) return Response::failure(stopped.error());
+        auto status = motor->read_status();
+        if (!status) return Response::failure(status.error());
+        const auto stop_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::milliseconds(runtime_.config().motor_motion.stop_timeout_ms);
+        while (!status.value().stopped() && std::chrono::steady_clock::now() < stop_deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::max(1u, runtime_.config().motor_motion.poll_interval_ms)));
+            status = motor->read_status();
+            if (!status) return Response::failure(status.error());
+        }
+        json::Value v = su300_status_to_json(status.value());
+        v.set("command", json::Value("halt"));
+        v.set("stop_confirmed", json::Value(status.value().stopped()));
+        if (!status.value().stopped()) {
+            return Response::failure(libs::Error::make(
+                libs::ErrorKind::device, "motor_stop_not_confirmed",
+                "SU300 已回写停机命令，但 2117H/2101H 回读仍显示运行；请现场执行急停"));
+        }
+        return Response::success(std::move(v));
+    }
+
+    libs::su300::RunCommand command;
+    if (action == "forward") command = libs::su300::RunCommand::forward;
+    else if (action == "reverse") command = libs::su300::RunCommand::reverse;
+    else if (action == "jog_forward") command = libs::su300::RunCommand::forward_jog;
+    else if (action == "jog_reverse") command = libs::su300::RunCommand::reverse_jog;
+    else {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_bad_action",
+            "motor.action 只能是 status / forward / reverse / jog_forward / jog_reverse / stop / reset_fault"));
+    }
+
+    const auto baseline = motor->read_status();
+    if (!baseline) return Response::failure(baseline.error());
+    if (baseline.value().faulted()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::device, "motor_faulted",
+            "SU300 当前故障码为 " + std::to_string(baseline.value().fault) +
+            "（2112H当前故障 " + std::to_string(baseline.value().current_fault) + "）" +
+            "；先执行 motor action=reset_fault 并确认故障消失"));
+    }
+    if (!args.has("frequency_percent") || !args["frequency_percent"].is_number()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_frequency_required",
+            "运动命令必须显式提供 frequency_percent（-100.00..100.00，单位百分比）"));
+    }
+    const config::MotorMotionConfig& motion = runtime_.config().motor_motion;
+    if (!motion.commissioned || !motion.communication_watchdog_confirmed) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::unsupported, "motor_motion_not_commissioned",
+            "电机运动未启用：需要 motor_motion.commissioned=true 且确认通信看门狗/停机回读"));
+    }
+    const double requested = args["frequency_percent"].as_number();
+    if (!std::isfinite(requested) || requested < -100.0 || requested > 100.0 ||
+        std::floor(requested * 100.0) != requested * 100.0) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_frequency_bad",
+            "frequency_percent 必须是 -100.00..100.00 范围内、最多两位小数的数值"));
+    }
+    const auto frequency = static_cast<std::int16_t>(std::llround(requested * 100.0));
+    if (motion.max_frequency_percent == 0 ||
+        std::fabs(requested) > static_cast<double>(motion.max_frequency_percent)) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_frequency_over_limit",
+            "请求频率超过 motor_motion.max_frequency_percent 标定上限"));
+    }
+    // 在任何写入 2001H/2000H 之前完成时长校验。否则一个缺少 duration_ms
+    // 的请求会先让电机短暂运行，再发停机，属于不可接受的参数副作用。
+    if (!args.has("duration_ms") || !args["duration_ms"].is_number()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_duration_required",
+            "运动命令必须显式提供 duration_ms，避免控制器无限运行"));
+    }
+    const double duration_value = args["duration_ms"].as_number();
+    if (!std::isfinite(duration_value) || duration_value <= 0.0 ||
+        std::floor(duration_value) != duration_value || motion.max_duration_ms == 0 ||
+        duration_value > static_cast<double>(motion.max_duration_ms)) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "motor_duration_bad",
+            "duration_ms 必须是正整数且不超过 motor_motion.max_duration_ms"));
+    }
+
+    // 清除上一动作的取消标志，再开始任何写入。runtime.stop() 可以在
+    // 设备锁外置位该标志；若在启动过程中到达，解锁后的等待循环会立即停机。
+    runtime_.begin_motor_motion();
+    const auto set = motor->set_frequency_percent(frequency);
+    if (!set) return Response::failure(set.error());
+    const auto started = motor->run(command);
+    if (!started) {
+        // 启动命令失败时尽力停机，避免控制器保持旧的运行状态。
+        (void)motor->stop();
+        return Response::failure(started.error());
+    }
+    // FC06 回显只证明命令已被 SU300 接收；在业务状态进入“运动中”前，
+    // 必须用 2101H/2117H 回读确认实际运行和方向。方向来自 2000H 命令，
+    // 与 2001H 的通信频率正负号无关。
+    const auto started_status = motor->read_status();
+    if (!started_status) {
+        (void)motor->stop();
+        return Response::failure(started_status.error());
+    }
+    const bool expected_forward = action == "forward" || action == "jog_forward";
+    const std::uint16_t expected_direction = expected_forward ? 0u : 1u;
+    if (!started_status.value().running() ||
+        started_status.value().direction != expected_direction ||
+        started_status.value().faulted()) {
+        (void)motor->stop();
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::device, "motor_start_not_confirmed",
+            "SU300 已回写运行命令，但 2101H/2117H 回读未确认运行、方向或故障状态"));
+    }
+    // 启动已由 FC06 回显和状态回读确认；等待阶段释放设备锁，另一个 IPC
+    // 请求可以执行 motor/stop。
+    // 等待期间释放设备锁，使另一个 IPC 请求可以执行 motor/stop。
+    // stop 请求只需置位原子标志并抢到锁下发 2000H=0001，本动作会在下一轮
+    // 检查时提前结束；不会把急停排在完整 duration_ms 之后。
+    lock.unlock();
+    const unsigned poll_ms = std::max(1u, runtime_.config().motor_motion.poll_interval_ms);
+    unsigned elapsed_ms = 0;
+    while (elapsed_ms < static_cast<unsigned>(duration_value) && !runtime_.motor_stop_requested()) {
+        const unsigned slice = std::min(poll_ms, static_cast<unsigned>(duration_value) - elapsed_ms);
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+        elapsed_ms += slice;
+    }
+    lock.lock();
+    // 无论是时长到期还是外部 stop，都再发一次停机并回读确认。
+    const auto stopped = motor->stop();
+    if (!stopped) return Response::failure(stopped.error());
+    auto status = motor->read_status();
+    if (!status) return Response::failure(status.error());
+    const auto stop_deadline = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(runtime_.config().motor_motion.stop_timeout_ms);
+    while (!status.value().stopped() && std::chrono::steady_clock::now() < stop_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            std::max(1u, runtime_.config().motor_motion.poll_interval_ms)));
+        status = motor->read_status();
+        if (!status) return Response::failure(status.error());
+    }
+    json::Value v = su300_status_to_json(status.value());
+    v.set("command", json::Value(action));
+    v.set("frequency_percent", json::Value(requested));
+    v.set("duration_ms", json::Value(duration_value));
+    v.set("command_ack", json::Value(true));
+    v.set("stop_confirmed", json::Value(status.value().stopped()));
+    v.set("position_feedback", json::Value("not provided by SU300; external limit switches remain required"));
+    if (!status.value().stopped()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::device, "motor_stop_not_confirmed",
+            "运动时长到期后 SU300 停机回读仍显示运行；请现场执行急停"));
+    }
     return Response::success(std::move(v));
 }
 

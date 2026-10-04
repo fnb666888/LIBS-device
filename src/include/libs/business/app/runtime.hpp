@@ -14,6 +14,7 @@
 #include <memory>
 #include <optional>
 #include <mutex>
+#include <atomic>
 #include <string>
 
 #include "libs/business/config/site_config.hpp"
@@ -125,6 +126,12 @@ public:
     const services::WorkFrequency& work_frequency() const noexcept { return work_frequency_; }
     void set_work_frequency(services::WorkFrequency f) { work_frequency_ = std::move(f); }
 
+    // 有界电机动作的可中断标志。运动命令释放 device_mutex 等待时，
+    // 另一个 IPC 请求可以先置位该标志并下发停机，不必等完整时长结束。
+    void begin_motor_motion() noexcept { motor_stop_requested_.store(false); }
+    void request_motor_stop() noexcept { motor_stop_requested_.store(true); }
+    bool motor_stop_requested() const noexcept { return motor_stop_requested_.load(); }
+
     // 当前检测阶段（业务进度，不与设备状态绑定）。
     events::DetectionStage stage() const noexcept { return stage_; }
     void set_stage(events::DetectionStage stage);
@@ -175,6 +182,7 @@ private:
     std::int64_t belt_sequence_ = -1;
     std::string target_belt_;
     std::optional<data_delivery::DeliveryStatus> last_delivery_;
+    std::atomic<bool> motor_stop_requested_{false};
 };
 
 }  // namespace business::app

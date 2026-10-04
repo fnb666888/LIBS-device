@@ -94,6 +94,17 @@ struct AirConditionerInterlockConfig {
     bool calibrated = false;
 };
 
+// SU300 运动控制安全参数。它们只描述允许运动的边界，不代表当前已经在运动。
+// 默认保持未标定；没有完成通信看门狗确认时，业务层不得启用运动控制。
+struct MotorMotionConfig {
+    bool commissioned = false;
+    unsigned max_frequency_percent = 0;  // 0..100%，下发到 2001H 时换算为 ×100
+    unsigned max_duration_ms = 0;        // 1..60000 ms（commissioned 时必填）
+    unsigned stop_timeout_ms = 5000;     // 停止确认超时
+    unsigned poll_interval_ms = 100;     // 状态轮询周期
+    bool communication_watchdog_confirmed = false;
+};
+
 // ── 激光出光的标定参数（能力 10 的执行侧）────────────────────────────────────
 //
 // 为什么必须来自配置、且必须带 commissioned 门闩：
@@ -143,11 +154,17 @@ struct SiteConfig {
     SerialPortConfig rangefinder;           // 端口表：COM7
     SerialPortConfig indicator;             // 端口表：COM8
     SerialPortConfig air_conditioner;       // 端口表：COM12
+    // SU300 变频器：RS485 A+/B-，Modbus RTU（说明书第 4 章）。
+    // 默认关闭；F6-05 有 0=Delta M、1=MD380 两种选项，需按现场机参数确认。
+    // transport 固定 1 个停止位，因此 motor 仅接受 8N1/8E1/8O1；
+    // timeout_ms 必须为正，且仍受串口传输层的超时上限约束。
+    SerialPortConfig motor{"", 9600, libs::transport::Parity::none, 8, 650, 80, false};
     SpectrometerConfig spectrometer;        // 4×光谱 USB
     LaserFireConfig laser_fire;             // 出光标定参数（含 commissioned 门闩）
     GatewayConfig gateway;
     ConveyorConfig conveyor;
     AirConditionerInterlockConfig ac_interlock;
+    MotorMotionConfig motor_motion;
 
     // 状态灯型号：写命令需要型号才能构造（科隆威 K50 等）。留空则不可写。
     std::string indicator_model;
@@ -157,6 +174,7 @@ struct SiteConfig {
     std::uint8_t laser_address = 1;
     std::uint8_t rangefinder_address = 1;
     std::uint8_t air_conditioner_address = 1;
+    std::uint8_t motor_address = 1;
 
     // 采集与联动的默认超时
     unsigned capture_timeout_ms = 3000;

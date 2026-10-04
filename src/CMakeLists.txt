@@ -35,6 +35,7 @@ add_library(libs_protocols STATIC
   src/protocols/rangefinder.cpp
   src/protocols/indicator.cpp
   src/protocols/air_conditioner.cpp
+  src/protocols/su300.cpp
 )
 target_include_directories(libs_protocols PUBLIC include)
 target_link_libraries(libs_protocols PRIVATE libs_warnings)
@@ -56,6 +57,7 @@ add_library(libs_devices STATIC
   src/devices/indicator.cpp
   src/devices/spectrometer.cpp
   src/devices/air_conditioner.cpp
+  src/devices/su300.cpp
 )
 target_link_libraries(libs_devices PUBLIC libs_transport)
 target_link_libraries(libs_devices PRIVATE libs_warnings)
@@ -88,6 +90,11 @@ add_test(NAME air_conditioner_protocol COMMAND test_air_conditioner_protocol)
 add_executable(test_air_conditioner_device tests/test_air_conditioner_device.cpp)
 target_link_libraries(test_air_conditioner_device PRIVATE libs_test_support libs_transport libs_devices libs_warnings)
 add_test(NAME air_conditioner_device COMMAND test_air_conditioner_device)
+
+# SU300 矢量变频器：Modbus-RTU 寄存器/命令编解码与同步设备事务。
+add_executable(test_su300 tests/test_su300.cpp)
+target_link_libraries(test_su300 PRIVATE libs_test_support libs_transport libs_devices libs_warnings)
+add_test(NAME su300 COMMAND test_su300)
 
 # 光谱仪测试需要一个替身 DLL。驱动自己按绝对 UTF-8 路径加载它，
 # 而 Windows 的 argv 是 ANSI 字节，中文工程目录下会直接被拒；
@@ -159,10 +166,12 @@ add_executable(test_business_facade tests/test_business_facade.cpp)
 target_link_libraries(test_business_facade PRIVATE libs_test_support libs_business libs_warnings)
 add_test(NAME business_facade COMMAND test_business_facade)
 
-# IPC 测试直接调 handle_line，不真的建管道，所以不拖 main.cpp。
+# IPC 测试既覆盖 handle_line() 协议面，也在测试进程内启动真实命名管道；
+# 仍不拖 main.cpp（测试自己控制 NamedPipeServer 的生命周期）。
 add_executable(test_business_ipc tests/test_business_ipc.cpp src/businessd/named_pipe_server.cpp)
 target_link_libraries(test_business_ipc PRIVATE libs_test_support libs_business advapi32 libs_warnings)
 add_test(NAME business_ipc COMMAND test_business_ipc)
+set_tests_properties(business_ipc PROPERTIES TIMEOUT 30)
 
 # 出光流程测试：门禁拦截、协议极性、指令序列、失败收光。
 add_executable(test_laser_fire tests/test_laser_fire.cpp)
