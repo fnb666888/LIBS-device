@@ -63,9 +63,12 @@ bool overlapped_transfer(HANDLE handle, bool writing, void* data, DWORD size,
         const DWORD wait_result = ::WaitForSingleObject(event, timeout_ms);
         if (wait_result == WAIT_TIMEOUT) {
             ::CancelIoEx(handle, &overlapped);
-            // Do not wait indefinitely here. Closing the pipe handle below
-            // also tears down a pending pipe operation.
-            ::WaitForSingleObject(event, 100);
+            // OVERLAPPED lives on this stack frame. It must not be released
+            // until the cancelled request has completed; otherwise a slow
+            // cancellation can make the next stack user look like a pipe
+            // protocol failure. CancelIoEx is followed by an unconditional
+            // completion wait for that reason.
+            ::WaitForSingleObject(event, INFINITE);
             ::CloseHandle(event);
             if (error) *error = WAIT_TIMEOUT;
             return false;
@@ -73,7 +76,7 @@ bool overlapped_transfer(HANDLE handle, bool writing, void* data, DWORD size,
         if (wait_result != WAIT_OBJECT_0) {
             const DWORD wait_error = ::GetLastError();
             ::CancelIoEx(handle, &overlapped);
-            ::WaitForSingleObject(event, 100);
+            ::WaitForSingleObject(event, INFINITE);
             ::CloseHandle(event);
             if (error) *error = wait_error ? wait_error : ERROR_OPERATION_ABORTED;
             return false;
