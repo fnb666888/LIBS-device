@@ -40,13 +40,20 @@ public:
     void set_pulsing(bool pulsing);
     Level level() const { return level_; }
 
+    // 顶栏空间有限（现场屏 1536px 宽），长错误详情会把右侧按钮挤出可视区。
+    // 设上限后详情按宽度省略号截断，完整原文放进 tooltip —— 截断只是让人
+    // 看得见，不让人丢掉信息。px <= 0 表示不限宽。
+    void set_max_width(int px);
+
 private:
     void apply_pulse_phase();
+    void refresh_detail_text();
 
     Level level_ = Level::Idle;
     class DotWidget* dot_ = nullptr;
     QLabel* text_ = nullptr;
     QLabel* detail_ = nullptr;
+    QString detail_full_;   // 未截断的详情原文，截断只发生在显示层
     QTimer* pulse_timer_ = nullptr;
     int pulse_phase_ = 0;
 };

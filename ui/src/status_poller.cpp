@@ -1,5 +1,7 @@
 #include "status_poller.hpp"
 
+#include "machine_state.hpp"
+
 #include <QMutexLocker>
 #include <QWaitCondition>
 
@@ -72,6 +74,15 @@ private:
                 // 参数拿不到 ≠ 整机拿不到。保留 status 已有事实，
                 // 只把 readiness 标成"未知"，不让一个子命令拖垮整屏。
                 next.readiness_known = false;
+            }
+
+            // measurement_status：采集/落盘的计数。拿不到不是故障 —— 它只是补充信息，
+            // 不能因为没有这个信息就把整屏标成"数据已过期"。
+            try {
+                const QJsonObject ms = client_.command(QStringLiteral("measurement_status"));
+                merge_measurement(next, ms.value("payload").toObject());
+            } catch (const QString&) {
+                next.measurement_known = false;
             }
         } catch (const QString& e) {
             // 守护进程没起 / 管道断开：valid=false + error，

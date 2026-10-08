@@ -1,4 +1,3 @@
-// 业务层离线测试（三）：门面（能力 9、10、12 的对外形态）。
 //
 // 门面是守护进程与 CLI 之间**唯一**的协议面，所以这里逐条钉住它的失败形状：
 // 坏 JSON、缺字段、未知命令都必须返回 JSON 错误，而不是抛异常、也不是静默成功。
@@ -7,11 +6,11 @@
 
 #include "check.hpp"
 #include "libs/business/app/runtime.hpp"
-#include "libs/business/services/facade.hpp"
+#include "libs/business/app/facade.hpp"
 
 using namespace business;
 using libs::ErrorKind;
-using business::policy::ApplyState;
+using business::config::ApplyState;
 
 namespace {
 
@@ -27,12 +26,16 @@ struct Fixture {
     app::BusinessFacade facade;
     std::string data_dir;
 
-    explicit Fixture(const std::string& tag) : facade(runtime) {
-        data_dir = std::string("build/tmp_facade_") + tag;
+    explicit Fixture(const std::string& tag) : Fixture(tag, template_config()) {}
+
+    // 需要自定义配置的用例走这里。laser.enabled 尤其重要：
+    // 布防第一步就查它，模板里是 false，所以默认夹具永远走不到判定那一步。
+    Fixture(const std::string& tag, const config::SiteConfig& config) : facade(runtime) {
+        data_dir = ::testing::scratch(std::string("build/tmp_facade_") + tag);
         app::Runtime::Options options;
         options.open_devices = false;
         options.data_dir = data_dir;
-        const libs::VoidResult started = runtime.start(template_config(), options);
+        const libs::VoidResult started = runtime.start(config, options);
         // 离线测试必须能起来；起不来就没法测后面的失败路径。
         (void)started;
     }
@@ -105,18 +108,16 @@ CASE(config_show_echoes_the_running_config); {
     CHECK(!response.payload["laser"]["enabled"].as_bool(true));
 }
 
-CASE(status_reports_gate_and_stage_without_claiming_sync); {
+CASE(status_reports_gate_and_indicator_without_claiming_sync); {
     Fixture f("status");
     const app::Response response = f.facade.dispatch(R"({"command":"status","args":{}})");
     CHECK(response.ok);
     CHECK(response.payload.has("gate"));
-    CHECK(response.payload.has("stage"));
+    CHECK(response.payload.has("indicator"));
     // 没配置频率就必须说"未配置"，不能猜一个 Hz 出来。
     // 频率未配置 -> 如实说未配置，不能猜 Hz。
-    CHECK(!response.payload["ac_interlock_participates"].as_bool(true));
     CHECK(response.payload.has("unavailable_capabilities"));
     CHECK(!response.payload["unavailable_capabilities"].as_array().empty());
-    CHECK(response.payload["ore"]["present"].is_null());
 }
 
 CASE(health_never_throws_even_with_no_devices_open); {
@@ -129,8 +130,7 @@ CASE(health_never_throws_even_with_no_devices_open); {
     // 模板里全禁用：逐个如实报告 configured=false / opened=false。
     // all_required_open 在"一个都没要求接"时为真是对的——它问的是
     // "你让我接的我接上了吗"，不是"我是不是全接上了"。
-    const char* devices[] = {"laser", "rangefinder", "indicator", "air_conditioner",
-                             "spectrometer"};
+    const char* devices[] = {"laser", "indicator", "spectrometer"};
     for (const char* name : devices) {
         CHECK(response.payload[name].has("configured"));
         CHECK(!response.payload[name]["configured"].as_bool(true));
@@ -146,44 +146,77 @@ CASE(param_get_of_unknown_parameter_is_reported); {
     CHECK(response.error.kind != ErrorKind::internal);
 }
 
-CASE(param_set_reports_incomplete_rather_than_pretending_applied); {
-    // 两态语义：只给了部分字段就返回 completed=false，不说"已下发"。
+CASE(fresh_store_is_seeded_with_the_real_device_parameters); {
+    // 回归：进程启动后**立即**就能用真机参数检测，界面第一次 param_get
+    // 拿到的也是真机参数。默认值来自 docs/real-device-parameters-20260929.md，
+    // 由 ParameterService::seed_defaults() 在 Runtime::start 里补进参数库。
+    //
+    // 在此之前：激光侧完全不播种（9 个框全是量程下限、门禁卡未标定），
+    // 光谱侧种的是通用占位值 10 ms / 3000 ms / 5000 ns，与真机对不上。
+    Fixture f("realseed");
+    const app::Response get = f.facade.dispatch(R"({"command":"param_get","args":{}})");
+    CHECK(get.ok);
+    CHECK(get.payload["readiness"]["ready"].as_bool(false));
+
+    const json::Value& laser = get.payload["groups"]["laser"]["values"];
+    CHECK_EQ(laser["discharge_current_a"].as_number(), 80.0);     // 0x11
+    CHECK_EQ(laser["pulse_width_us"].as_number(), 200.0);         // 0x12
+    CHECK_EQ(laser["frequency_hz"].as_number(), 1.0);             // 0x13
+    CHECK_EQ(laser["discharge_delay_us"].as_number(), 0.0);       // 0x14
+    CHECK_EQ(laser["q_delay_us"].as_number(), 210.0);             // 0x16
+    CHECK_EQ(laser["q_warmup_s"].as_number(), 0.0);               // 0x19
+    CHECK_EQ(laser["settle_timeout_ms"].as_number(), 20000.0);
+    CHECK_EQ(laser["emission_hold_ms"].as_number(), 3000.0);
+    CHECK_EQ(laser["min_discharges"].as_number(), 1.0);
+
+    const json::Value& spec = get.payload["groups"]["spectrometer"]["values"];
+    CHECK_EQ(spec["integration_ms"].as_number(), 1.05);
+    CHECK_EQ(spec["capture_timeout_ms"].as_number(), 10000.0);
+    CHECK_EQ(spec["integration_delay_ns"].as_number(), 1280.0);
+
+    // 9 个字段齐备且合法 -> 视为已标定：门禁不会因为参数卡住。
+    const app::Response gate = f.facade.dispatch(R"({"command":"gate","args":{}})");
+    CHECK(gate.ok);
+    for (const auto& r : gate.payload["blocked_by"].as_array()) {
+        CHECK(r.as_string() != std::string("parameters_incomplete"));
+        CHECK(r.as_string() != std::string("laser_not_commissioned"));
+    }
+}
+
+CASE(param_set_of_an_unused_group_does_not_affect_measurement_readiness); {
+    // 往一个既非出光用、也非光谱侧用的分组写值：能写进去（参数库是通用容器），
+    // 但**不影响"能不能测"**。这里断言齐备状态不因为它而改变，
+    // 是为了钉住"齐备只看必填组"这条规则，防止有人把 belt 又加回必填清单。
     Fixture f("paramset");
+    const app::Response seed = f.facade.dispatch(R"({"command":"param_set","args":{"group":"laser","values":{"discharge_current_a":80,"pulse_width_us":200,"frequency_hz":1,"discharge_delay_us":0,"q_delay_us":210,"q_warmup_s":0,"settle_timeout_ms":20000,"emission_hold_ms":3000,"min_discharges":1}}})");
+    CHECK(seed.ok);
+    CHECK(seed.payload["readiness"]["ready"].as_bool(false));
+
     const app::Response response =
         f.facade.dispatch(R"({"command":"param_set","args":{"group":"belt","values":{"speed":0.2}}})");
     CHECK(response.ok);
-    // 默认 at_next_idle：只是暂存，**没有生效**。所以不能报 completed。
-    CHECK(!response.payload["completed"].as_bool(true));
-    CHECK_EQ(response.payload["state"].as_string(), std::string("staged"));
-    // 齐备性独立于"完成"语义：belt 组不在必填清单里，所以仍然不齐备。
-    CHECK(!response.payload["readiness"]["ready"].as_bool(true));
+    // 改动**当场生效**，不再有"暂存但不生效"那条路。
+    CHECK(response.payload["completed"].as_bool(false));
+    CHECK_EQ(response.payload["state"].as_string(), std::string("completed"));
+    // 必填组只有 spectrometer + laser（trigger 归装机配置，不是测量参数），
+    // 而 belt 不在其中 —— 齐备状态必须与写入前完全一致。
+    CHECK(response.payload["readiness"]["ready"].as_bool(false));
 }
 
-CASE(composition_reports_algorithm_missing_not_zeroes); {
-    Fixture f("comp");
-    const app::Response response =
-        f.facade.dispatch(R"({"command":"composition","args":{"source":"s"}})");
-    CHECK(response.ok);
-    CHECK_EQ(response.payload["availability"].as_string(), std::string("algorithm_missing"));
-    // 数值位必须一个都不是 0：十项全在，但值全为 null。
-    const json::Value& values = response.payload["values"];
-    CHECK(values.is_object());
-    if (values.is_object()) {
-        CHECK_EQ(values.as_object().size(), static_cast<std::size_t>(10));
-        for (const auto& kv : values.as_object()) {
-            CHECK(kv.second.is_null());
-        }
-    }
-    CHECK(response.payload.has("prerequisites"));
-}
-
-CASE(capture_without_configured_frequency_is_invalid_argument); {
-    // §3.10.2：频率缺失就不推导节奏。必须 invalid_argument，
-    // 不能猜一个默认 Hz 也不能返回"空采集成功"。
+CASE(capture_without_configured_frequency_is_not_an_error); {
+    // 契约变更：工作频率**不再**是采集的前提。
+    //
+    // 以前 capture 因为"频率没配"直接 invalid_argument。现在频率只决定
+    // 帧周期，而周期不是采集能不能做的条件 —— 测量参数一律来自参数库。
+    // 所以缺频率时 capture 照常往下走，只会在设备层如实失败。
+    //
+    // 离线夹具里光谱仪没开，因此最终是 unsupported（设备没开），
+    // 而不是 invalid_argument（频率没配）。这两者的区别正是本用例要点：
+    // 报 unsupported 说明它**没有**停在频率上编造一个理由。
     Fixture f("capture");
     const app::Response response = f.facade.dispatch(R"({"command":"capture","args":{}})");
     CHECK(!response.ok);
-    CHECK_EQ(response.error.kind, ErrorKind::invalid_argument);
+    CHECK_EQ(response.error.kind, ErrorKind::unsupported);
 }
 
 CASE(capture_with_pace_but_no_device_is_unsupported); {
@@ -193,21 +226,6 @@ CASE(capture_with_pace_but_no_device_is_unsupported); {
         f.facade.dispatch(R"({"command":"capture","args":{"from_config":true}})");
     CHECK(!response.ok);
     CHECK_EQ(response.error.kind, ErrorKind::unsupported);
-}
-
-CASE(detection_start_is_a_signal_not_a_physical_trigger); {
-    // 任务书 §2.1：这是**业务信号**，不是物理触发。信号要被接受，
-    // 但响应里绝不能说"已经开始检测"/"已出光"。
-    Fixture f("start");
-    const app::Response response =
-        f.facade.dispatch(R"({"command":"detection_start","args":{"target_belt":"B1"}})");
-    CHECK(response.ok);
-    CHECK(response.payload["accepted"].as_bool());
-    CHECK(response.payload.has("request"));
-    CHECK(response.payload["request"]["target_belt"].as_string() == "B1");
-    // 业务进度推进到了"已选矿带"，但门禁与物理执行都还没发生。
-    CHECK(f.runtime.stage() == events::DetectionStage::selected_belt);
-    CHECK(response.payload.has("note"));
 }
 
 CASE(recovery_write_only_writes_and_never_resumes); {
@@ -234,29 +252,92 @@ CASE(spectrum_stream_status_is_honest_without_devices); {
     const app::Response response =
         f.facade.dispatch(R"({"command":"spectrum_stream","args":{"action":"status"}})");
     CHECK(response.ok);
-    CHECK(!response.payload["running"].as_bool());
-    CHECK(!response.payload["spectrometer_open"].as_bool());
+    // 帧队列**没有 running 概念** —— 它不采集。字段缺失是对的：
+    // 写一个 running=false 反而是在暗示"它能跑"。
+    CHECK(!response.payload.has("running"));
     // 没有设备就写没有，不能写"正常"。
-    CHECK(response.payload.has("last_error_code"));
-    // 免责说明必须在：preview 拍到的不是测量谱。
+    CHECK(response.payload["spectrometer_open"].is_null());
+    // 免责说明必须在：这里只有帧的搬运，测量由 measurement_* 负责。
     CHECK(!response.payload["note"].as_string().empty());
 }
 
-CASE(spectrum_stream_start_and_stop_round_trip); {
+CASE(spectrum_stream_start_and_stop_are_now_refused_with_a_pointer); {
+    // 这是拆分留下的**接口纪律**：采集入口只有一个。
+    //
+    // 旧 spectrum_stream 能 start，UI 于是有两条路开工：一条只显示、
+    // 一条连出光。结果两条都"能跑"，操作员选了预览那条就以为在测量，
+    // 而设备其实在拍背景谱。现在 start/stop 必须**明确报错并指路**，
+    // 而不是静默忽略 —— 静默忽略会让人以为已经开工了。
     Fixture f("stream_start");
-    const app::Response started =
-        f.facade.dispatch(R"({"command":"spectrum_stream","args":{"action":"start"}})");
-    CHECK(started.ok);
-    CHECK(started.payload["started"].as_bool());
-    CHECK(started.payload["running"].as_bool());
-    // 启动必须带上"这不是测量谱"的警告，别让人误读。
-    CHECK(!started.payload["warning"].as_string().empty());
+    for (const char* action : {"start", "stop"}) {
+        // 用自定义分隔符拼 JSON：默认的 )" 会在字符串中间提前结束。
+        const std::string body = std::string(R"json({"command":"spectrum_stream","args":{"action":")json") +
+                                 action + R"json("}})json";
+        const app::Response r = f.facade.dispatch(body);
+        CHECK(!r.ok);
+        CHECK_EQ(std::string(error_kind_of(r)), std::string("unsupported"));
+        CHECK(r.error.code == "stream_no_start_stop");
+        // 错误信息必须指路，否则用户只能猜。
+        CHECK(r.error.message.find("measurement_start") != std::string::npos);
+    }
+}
 
-    const app::Response stopped =
-        f.facade.dispatch(R"({"command":"spectrum_stream","args":{"action":"stop"}})");
-    CHECK(stopped.ok);
-    CHECK(stopped.payload["stopped"].as_bool());
-    CHECK(!stopped.payload["running"].as_bool());
+CASE(measurement_commands_appear_in_commands_list); {
+    // 三条新命令必须能被自省看到，否则 CLI 根本不知道该发什么。
+    Fixture f("measure_cmd");
+    const app::Response response = f.facade.dispatch(R"({"command":"ping","args":{}})");
+    CHECK(response.ok);
+    bool start = false, stop = false, status = false;
+    for (const auto& c : response.payload["commands"].as_array()) {
+        const std::string name = c.as_string();
+        if (name == "measurement_start") start = true;
+        if (name == "measurement_stop") stop = true;
+        if (name == "measurement_status") status = true;
+    }
+    CHECK(start);
+    CHECK(stop);
+    CHECK(status);
+}
+
+CASE(measurement_status_is_honest_before_anything_starts); {
+    // 离线、无设备时也必须答得上来，且**不能**假装在跑。
+    Fixture f("measure_status");
+    const app::Response r =
+        f.facade.dispatch(R"({"command":"measurement_status","args":{}})");
+    CHECK(r.ok);
+    CHECK(!r.payload["running"].as_bool());
+    CHECK_EQ(r.payload["shots_captured"].as_number(), 0.0);
+    CHECK_EQ(r.payload["shots_failed"].as_number(), 0.0);
+    CHECK_EQ(r.payload["disk_writes_ok"].as_number(), 0.0);
+    CHECK_EQ(r.payload["disk_writes_failed"].as_number(), 0.0);
+    CHECK_EQ(r.payload["disk_backlog"].as_number(), 0.0);
+}
+
+CASE(measurement_start_without_a_laser_reports_the_real_reason); {
+    // 离线夹具没开激光器：必须报"激光器没开"，
+    // **不能**报"门禁不放行" —— 那是误导，现场会去查联锁，
+    // 而真实原因是这台机器根本没连上。
+    Fixture f("measure_start");
+    const app::Response r =
+        f.facade.dispatch(R"({"command":"measurement_start","args":{}})");
+    CHECK(!r.ok);
+    // 具体是哪个错取决于设备是否在场；但**绝不能**是 gate_blocked：
+    // 门禁被问的时候还没激光器，报门禁不放行会让人去查联锁。
+    CHECK(r.error.code != "gate_blocked");
+    // 失败的启动不能留下"出光会话"占着锁，否则之后再也开不了工。
+    const app::Response st =
+        f.facade.dispatch(R"({"command":"measurement_status","args":{}})");
+    CHECK(st.ok);
+    CHECK(!st.payload["running"].as_bool());
+}
+
+CASE(measurement_stop_without_a_laser_is_reported_not_crashed); {
+    // 停止必须**无条件可调**：守护进程退出、UI 点停止、作业收尾都会调它。
+    Fixture f("measure_stop");
+    const app::Response r =
+        f.facade.dispatch(R"({"command":"measurement_stop","args":{}})");
+    CHECK(!r.ok);
+    CHECK(r.error.code == "laser_not_open");
 }
 
 CASE(spectrum_stream_subscribe_then_latest_is_not_an_error_when_empty); {
@@ -328,18 +409,39 @@ CASE(spectrum_stream_appears_in_commands_list); {
     CHECK(found);
 }
 
-// 回归：laser_fire 曾经能被 dispatch() 派发，却不在 commands() 里。
-// 后果是核心的物理动作从自省接口和 CLI 上都消失——文档说命令面里有出光，
-// 实际客户端连命令名都不知道。这里钉死它必须出现。
-CASE(laser_fire_appears_in_commands_list); {
+// 回归：laser_fire / laser_run / laser_stop 三条命令已经删除。
+//
+// 旧命名说的是“按一下灯灯就出光”，它绕过了测量作业、
+// 回归到这台星的整个生产链路。现在出光只有 measurement_start
+// 一条路径，而且它必须走门禁。
+// 这里钉死两件事：不得再出现在自省列表里，且 dispatch 必须硬拒绝。
+CASE(legacy_laser_commands_are_gone_from_the_command_surface); {
     Fixture f("fire_cmd");
     const app::Response response = f.facade.dispatch(R"({"command":"ping","args":{}})");
     CHECK(response.ok);
+    for (const auto& c : response.payload["commands"].as_array()) {
+        const std::string name = c.as_string();
+        CHECK(name != "laser_fire");
+        CHECK(name != "laser_run");
+        CHECK(name != "laser_stop");
+    }
+    // 出光必须仍然可以被发起，只是改名了。
     bool found = false;
     for (const auto& c : response.payload["commands"].as_array()) {
-        if (c.as_string() == "laser_fire") found = true;
+        if (c.as_string() == "measurement_start") found = true;
     }
     CHECK(found);
+}
+
+CASE(legacy_laser_commands_are_rejected_as_unknown); {
+    // 只不列在 commands() 里却仍能被 dispatch 派发，等于删了表面下的门守。
+    Fixture f("fire_reject");
+    for (const char* legacy : {"laser_fire", "laser_run", "laser_stop"}) {
+        const app::Response r = f.facade.dispatch(
+            std::string(R"({"command":")") + legacy + R"(","args":{}})");
+        CHECK(!r.ok);
+        if (!r.ok) CHECK_EQ(r.error.code, std::string("unknown_command"));
+    }
 }
 
 // 回归：参数落盘后重启，门禁必须**立刻**知道参数齐备。
@@ -348,12 +450,15 @@ CASE(laser_fire_appears_in_commands_list); {
 // 于是守护进程每次重启后门禁都卡在 parameters_incomplete，要等某个客户端
 // 碰巧调一次 param_get 才恢复。现场表现是"刚开机预检莫名不通过"。
 // 这条直接断言：**重启后什么都不用调，门禁就该是齐备的**。
+// 启动时 seed_defaults() 已把真机参数补进参数库（只补缺失），
+// 所以这里无需先手工填 9 个值；下面的 param_set 只是把磁盘内容写成
+// 与默认值不同的形状，用来验证"重启后从磁盘读回的那份也齐备"。
 CASE(param_get_after_restart_keeps_the_gate_in_sync); {
     const char* tag = "persist_gate";
     {
         Fixture f(tag);
         (void)f.facade.dispatch(R"({"command":"param_set","args":{"group":"spectrometer","values":{"a":1},"timing":"immediately"}})");
-        (void)f.facade.dispatch(R"({"command":"param_set","args":{"group":"laser","values":{"b":1},"timing":"immediately"}})");
+        (void)f.facade.dispatch(R"({"command":"param_set","args":{"group":"laser","values":{"discharge_current_a":80,"pulse_width_us":200,"frequency_hz":1,"discharge_delay_us":0,"q_delay_us":210,"q_warmup_s":0,"settle_timeout_ms":20000,"emission_hold_ms":3000,"min_discharges":1},"timing":"immediately"}})");
         (void)f.facade.dispatch(R"({"command":"param_set","args":{"group":"trigger","values":{"c":1},"timing":"immediately"}})");
     }
     // 同一个 data_dir 再起一次 Runtime：参数从磁盘加载，模拟守护进程重启。
@@ -377,5 +482,107 @@ CASE(param_get_after_restart_keeps_the_gate_in_sync); {
         if (r.as_string() == "parameters_incomplete") incomplete = true;
     }
     CHECK(!incomplete);
+}
+
+
+// ── 设备预检（业务一）的 IPC 出口 ────────────────────────────────────────────────
+//
+// PrecheckService::run() 在 Runtime::start() 里就装配好了，但在这条命令
+// 出现之前**全库没有任何生产调用者**：这台机器能判"能不能出光"，却没有任何
+// 一个客户端能主动让它判一次。下面这组用例钉住补上的这唯一一环。
+CASE(precheck_is_in_the_command_surface); {
+    const std::vector<std::string>& cmds = app::BusinessFacade::commands();
+    bool found = false;
+    for (const std::string& c : cmds) {
+        if (c == "precheck") found = true;
+    }
+    CHECK(found);
+    // 路由表和分派必须对齐：登记了却没接上，等于没有。
+    Fixture f("precheck_cmd");
+    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    // 离线夹具里激光器没开 -> 布防失败。这是**如实失败**，不是崩溃。
+    CHECK(!response.ok);
+    CHECK_EQ(response.error.code, std::string("gate_laser_disabled"));
+}
+
+CASE(precheck_without_a_laser_is_blocked_but_still_reports_why); {
+    // 门禁不放行时，返回体里必须带完整报告 —— 否则操作员只看到
+    // 一句"预检失败"，不知道该去查哪一条。
+    Fixture f("precheck_report");
+    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    CHECK(!response.ok);
+    CHECK(response.payload.has("error"));
+    CHECK(response.payload.has("report"));
+    const json::Value& report = response.payload["report"];
+    CHECK(!report["allowed"].as_bool(true));
+    // 报告必须能说清"是没读到"还是"读到了但不安全"。
+    CHECK(!report["laser_readable"].as_bool(true));
+    CHECK(!report["detail"].as_string().empty());
+    // 灯的字段同样要带回来：预检的产出之一就是刷灯。
+    CHECK(report.has("lamp_intent"));
+    CHECK(report.has("lamp_applied"));
+    // 关键：报告挂在 report 子对象下，**不能覆盖顶层 error**。
+    CHECK(response.payload["error"].has("code"));
+    CHECK_EQ(response.payload["error"]["code"].as_string(), std::string("gate_laser_disabled"));
+}
+
+CASE(precheck_does_not_fire_the_laser); {
+    // 预检必须是只读的：布防 + 判定 + 刷灯，一条激光写指令都不发。
+    // 这里断言的是"出光作业没有被动过"——
+    // 真去数激光指令数需要替身设备，超出这一层的职责；
+    // 但"跑完预检后作业没起来"是能从外部看到的，必须钉住。
+    Fixture f("precheck_no_fire");
+    (void)f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    const app::Response status = f.facade.dispatch(R"({"command":"status","args":{}})");
+    CHECK(status.ok);
+    CHECK(!status.payload["laser_running"].as_bool(true));
+    // 判定执行点只有一个：作业没启动，判定就不该由预检之外的地方产生。
+    const app::Response ms = f.facade.dispatch(R"({"command":"measurement_status","args":{}})");
+    CHECK(ms.ok);
+    CHECK(!ms.payload["running"].as_bool(true));
+}
+
+CASE(precheck_does_not_stand_in_front_of_measurement_start); {
+    // 这条是纪律测试，不是功能测试。
+    // 判定真正的执行点只有 MeasurementJob::start()；预检通了不代表
+    // measurement_start 会通过。界面**绝不能**"先预检拿绿灯再开始检测"，
+    // 否则判定出现第二个执行点，而且两条路径读的事实不是同一时刻。
+    Fixture f("precheck_not_gate");
+    const app::Response pre = f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    CHECK(!pre.ok);
+    const app::Response started =
+        f.facade.dispatch(R"({"command":"measurement_start","args":{}})");
+    // 设备没开，作业自己会失败 —— 无论预检结论如何。
+    CHECK(!started.ok);
+    // 两条路径都必须如实报告自己那一侧的结果，不能有一方"替另一方说话"。
+    CHECK(started.payload.has("error"));
+}
+
+CASE(precheck_reaches_the_verdict_when_the_laser_is_configured_but_closed); {
+    // 布防只看**配置里有没有使能**，不看设备开没开。
+    // 所以把 laser.enabled 打开、设备仍然不开，就能在离线夹具里
+    // 走到 evaluate_now()，从而断言"预检确实触发了判定"而不只是布防。
+    config::SiteConfig cfg = template_config();
+    cfg.laser.enabled = true;
+    Fixture f("precheck_verdict", cfg);
+    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    CHECK(!response.ok);
+    CHECK(response.payload.has("report"));
+    const json::Value& report = response.payload["report"];
+    CHECK(!report["allowed"].as_bool(true));
+    CHECK(!report["laser_readable"].as_bool(true));
+    bool has_reason = false;
+    for (const auto& r : report["blocked_by"].as_array()) {
+        const std::string code = r.as_string();
+        // 设备没开 -> 事实读不到 -> laser_unavailable。
+        if (code == "laser_unavailable") has_reason = true;
+        // 反向断言：布防成功了，报告里**不能**出现"没布防"这条理由。
+        CHECK(code != "gate_disarmed");
+    }
+    CHECK(has_reason);
+    // 布防成功 => armed 为真；否则判定恒假，blocked_by 就只剩 disarm。
+    const app::Response gate = f.facade.dispatch(R"({"command":"gate","args":{}})");
+    CHECK(gate.ok);
+    CHECK(gate.payload["armed"].as_bool(false));
 }
 TEST_MAIN_RETURN()

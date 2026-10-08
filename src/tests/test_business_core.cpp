@@ -6,10 +6,12 @@
 #include <string>
 
 #include "check.hpp"
-#include "libs/business/json/json.hpp"
-#include "libs/business/config/site_config.hpp"
-#include "libs/business/policy/detection_config.hpp"
-#include "libs/business/policy/gate.hpp"
+#include "libs/business/shared/json/json.hpp"
+#include "libs/business/shared/config/site_config.hpp"
+#include "libs/business/shared/config/parameter_store.hpp"
+#include "libs/business/readiness/facts.hpp"
+#include "libs/business/readiness/verdict.hpp"
+#include "libs/business/readiness/lamp.hpp"
 
 using namespace business;
 using json::Value;
@@ -30,8 +32,8 @@ Value parsed(const std::string& text, bool& ok) {
 namespace {
 
 // 全部安全位的"最安全"事实。逐项改坏来测每条拦截路径。
-policy::LaserSafetyFacts safe_facts() {
-    policy::LaserSafetyFacts f;
+readiness::LaserSafetyFacts safe_facts() {
+    readiness::LaserSafetyFacts f;
     f.available = true;
     f.work_state = false;
     f.interlock_1 = true;
@@ -44,8 +46,20 @@ policy::LaserSafetyFacts safe_facts() {
     return f;
 }
 
-bool blocked_by(const policy::GateVerdict& verdict, policy::GateReason reason) {
-    for (policy::GateReason r : verdict.blocked_by) {
+// 一份"全部条件都满足"的判定输入。逐项改坏来测每条拦截路径。
+readiness::ReadinessFacts armed_facts() {
+    readiness::ReadinessFacts f;
+    f.laser = safe_facts();
+    f.devices_opened = true;
+    f.spectrometer_ready = true;
+    f.parameters_complete = true;
+    f.laser_enabled = true;
+    f.laser_commissioned = true;
+    f.armed = true;
+    return f;
+}
+bool blocked_by(const readiness::GateVerdict& verdict, readiness::GateReason reason) {
+    for (readiness::GateReason r : verdict.blocked_by) {
         if (r == reason) return true;
     }
     return false;
@@ -120,20 +134,6 @@ CASE(json_nan_becomes_null_not_a_number); {
 
 // ── 站点配置（能力 1）─────────────────────────────────────────────────────
 
-CASE(config_rejects_enabled_without_calibrated_interlock); {
-    // 3.9.2 是 C 类：启用了联锁却没有标定阈值，是自相矛盾的配置，必须拒绝。
-    const std::string text = R"({
-        "station_id": "s",
-        "ac_interlock": { "enabled": true, "calibrated": false, "trigger_indoor_temp_c": 0 }
-    })";
-    bool ok = false;
-    const Value v = parsed(text, ok);
-    CHECK(ok);
-    const auto loaded = config::from_json(v);
-    CHECK(!loaded.ok());
-    CHECK_EQ(static_cast<int>(loaded.error().kind), static_cast<int>(libs::ErrorKind::invalid_argument));
-}
-
 CASE(config_rejects_non_string_port); {
     // 端口必须是字符串；写成数字说明配置来源不对，宁可报错也不猜。
     const std::string text = R"({"station_id":"s","laser":{"port":10}})";
@@ -148,11 +148,8 @@ CASE(config_accepts_minimal_valid); {
     const std::string text = R"({
         "station_id": "s1",
         "laser":           { "port": "COM10", "enabled": false },
-        "rangefinder":     { "enabled": false },
         "indicator":       { "enabled": false },
-        "air_conditioner": { "enabled": false },
-        "spectrometer":    { "enabled": false },
-        "ac_interlock":    { "enabled": false, "calibrated": false }
+        "spectrometer":    { "enabled": false }
     })";
     bool ok = false;
     const Value v = parsed(text, ok);
@@ -162,8 +159,6 @@ CASE(config_accepts_minimal_valid); {
     if (loaded.ok()) {
         CHECK_EQ(loaded.value().station_id, std::string("s1"));
         CHECK_EQ(loaded.value().laser.port, std::string("COM10"));
-        // 空调联锁默认不参与门禁（C 类纪律）。
-        CHECK(!loaded.value().ac_interlock.enabled);
     }
 }
 
@@ -175,8 +170,6 @@ CASE(config_default_template_passes_validation); {
         CHECK(config::save_string(tpl.value()).ok());
         CHECK(!tpl.value().laser.enabled);
         CHECK(!tpl.value().spectrometer.enabled);
-        CHECK(!tpl.value().gateway.enabled);
-        CHECK(!tpl.value().ac_interlock.enabled);
     }
 }
 
@@ -187,20 +180,6 @@ CASE(config_default_is_rejected_not_silently_accepted); {
     CHECK_EQ(static_cast<int>(v.error().kind), static_cast<int>(libs::ErrorKind::invalid_argument));
 }
 
-CASE(config_gateway_default_is_disabled_and_portless); {
-    // 3.5.2：协议未定，端口不能猜。默认必须是 0 + disabled。
-    const config::SiteConfig fresh;
-    CHECK(!fresh.gateway.enabled);
-    CHECK_EQ(fresh.gateway.port, 0u);
-}
-
-CASE(config_conveyor_not_software_controlled_by_default); {
-    // 传送带是否由本软件控制尚未确认，默认 false。
-    const config::SiteConfig fresh;
-    CHECK(!fresh.conveyor.software_controlled);
-}
-
-// ── 出光参数：未标定不得启用（与 ac_interlock 同一套纪律）──────────────────
 CASE(config_laser_fire_defaults_to_uncommissioned); {
     // 默认未标定。这条很重要：默认值意味着"能出光"就是替现场做了未标定的决定。
     const config::SiteConfig fresh;
@@ -212,9 +191,7 @@ CASE(config_laser_fire_commissioned_without_parameters_is_rejected); {
     auto text = std::string(R"({
         "station_id": "s1",
         "laser":           { "enabled": false },
-        "rangefinder":     { "enabled": false },
         "indicator":       { "enabled": false },
-        "air_conditioner": { "enabled": false },
         "spectrometer":    { "enabled": false },
         "laser_fire":      { "commissioned": true, "frequency_hz": 1 }
     })");
@@ -232,9 +209,7 @@ CASE(config_laser_fire_commissioned_rejects_out_of_range_values); {
     const Value good = parsed(R"({
         "station_id": "s1",
         "laser":           { "enabled": false },
-        "rangefinder":     { "enabled": false },
         "indicator":       { "enabled": false },
-        "air_conditioner": { "enabled": false },
         "spectrometer":    { "enabled": false },
         "laser_fire":      { "commissioned": true, "discharge_current_a": 80,
                              "pulse_width_us": 200, "frequency_hz": 1,
@@ -248,9 +223,7 @@ CASE(config_laser_fire_commissioned_rejects_out_of_range_values); {
     const Value bad = parsed(R"({
         "station_id": "s1",
         "laser":           { "enabled": false },
-        "rangefinder":     { "enabled": false },
         "indicator":       { "enabled": false },
-        "air_conditioner": { "enabled": false },
         "spectrometer":    { "enabled": false },
         "laser_fire":      { "commissioned": true, "discharge_current_a": 0,
                              "pulse_width_us": 200, "frequency_hz": 1,
@@ -267,9 +240,7 @@ CASE(config_laser_fire_roundtrip_keeps_commissioned_parameters); {
     config::SiteConfig c;
     c.station_id = "lf";
     c.laser.enabled = false;
-    c.rangefinder.enabled = false;
     c.indicator.enabled = false;
-    c.air_conditioner.enabled = false;
     c.spectrometer.enabled = false;
     c.laser_fire.commissioned = true;
     c.laser_fire.discharge_current_a = 80;
@@ -300,9 +271,7 @@ CASE(config_roundtrip); {
     config::SiteConfig c;
     c.station_id = "round";
     c.laser.enabled = false;
-    c.rangefinder.enabled = false;
     c.indicator.enabled = false;
-    c.air_conditioner.enabled = false;
     c.spectrometer.enabled = false;
     const auto text = config::save_string(c);
     CHECK(text.ok());
@@ -323,85 +292,89 @@ CASE(config_roundtrip); {
 // ── 门禁（能力 4）─────────────────────────────────────────────────────────
 
 
-CASE(gate_all_safe_and_parameters_ready_allows); {
-    policy::Gate gate;
-    gate.set_parameters_ready(true);
-    gate.set_laser_commissioned(true);   // 出光参数已标定（未标定一律拦截，见下）
-    gate.update_laser_facts(safe_facts());
-    gate.arm();
-    const policy::GateVerdict verdict = gate.evaluate();
+CASE(evaluate_all_safe_and_parameters_ready_allows); {
+    const readiness::GateVerdict verdict = readiness::evaluate(armed_facts());
     CHECK(verdict.allowed);
     CHECK(verdict.blocked_by.empty());
 }
 
-// 未标定 = 不知道该发什么参数 = 必须拦截。这条与 ac_interlock 的
-// "未标定不得启用" 是同一套纪律；区别是这里的默认值就是"未标定"。
-CASE(gate_uncommissioned_laser_blocks_even_when_everything_else_is_safe); {
-    policy::Gate gate;
-    gate.set_parameters_ready(true);
-    gate.set_laser_commissioned(false);
-    gate.update_laser_facts(safe_facts());
-    CHECK(gate.arm().ok());
-    const policy::GateVerdict verdict = gate.evaluate();
+// "未标定不得启用" 是同一套纪律；区别是默认值就是"未标定"。
+CASE(evaluate_uncommissioned_laser_blocks_even_when_everything_else_is_safe); {
+    readiness::ReadinessFacts f = armed_facts();
+    f.laser_commissioned = false;
+    const readiness::GateVerdict verdict = readiness::evaluate(f);
     CHECK(!verdict.allowed);
-    CHECK(blocked_by(verdict, policy::GateReason::laser_not_commissioned));
+    CHECK(blocked_by(verdict, readiness::GateReason::laser_not_commissioned));
 }
 
-CASE(gate_unreadable_laser_is_not_safe); {
+CASE(evaluate_unreadable_laser_is_not_safe); {
     // 读不到 B2 == 不知道 == 拦截。available=false 绝不能被当成"没有故障"。
-    policy::Gate gate;
-    gate.set_parameters_ready(true);
-    policy::LaserSafetyFacts f;      // available 默认 false
-    f.interlock_1 = true;            // 即使位全好也无效
-    f.interlock_2 = true;
-    f.emergency_stop = true;
-    f.q_gate = true;
-    f.over_temperature = true;
-    f.work_enabled = true;
-    gate.update_laser_facts(f);
-    const policy::GateVerdict verdict = gate.evaluate();
+    readiness::ReadinessFacts f = armed_facts();
+    f.laser = readiness::LaserSafetyFacts();   // available 默认 false
+    f.laser.interlock_1 = true;                // 即使位全好也无效
+    f.laser.interlock_2 = true;
+    f.laser.emergency_stop = true;
+    f.laser.q_gate = true;
+    f.laser.over_temperature = true;
+    f.laser.work_enabled = true;
+    const readiness::GateVerdict verdict = readiness::evaluate(f);
     CHECK(!verdict.allowed);
-    CHECK(blocked_by(verdict, policy::GateReason::laser_unavailable));
+    CHECK(blocked_by(verdict, readiness::GateReason::laser_unavailable));
 }
 
-CASE(gate_incomplete_parameters_block); {
-    policy::Gate gate;
-    gate.set_parameters_ready(false);
-    gate.update_laser_facts(safe_facts());
-    const policy::GateVerdict verdict = gate.evaluate();
+CASE(evaluate_incomplete_parameters_block); {
+    readiness::ReadinessFacts f = armed_facts();
+    f.parameters_complete = false;
+    const readiness::GateVerdict verdict = readiness::evaluate(f);
     CHECK(!verdict.allowed);
-    CHECK(blocked_by(verdict, policy::GateReason::parameters_incomplete));
+    CHECK(blocked_by(verdict, readiness::GateReason::parameters_incomplete));
 }
 
-CASE(gate_every_safety_bit_has_its_own_reason); {
+CASE(evaluate_requires_arming); {
+    // 布防是状态机的一步：disarm -> (条件齐备) -> arm -> 可出光。
+    // 条件齐备但没 arm，仍然不放行 —— 否则"自动布防"就成了默认开光。
+    //
+    // 未布防**不是**一个 GateReason：它不是"某条条件不满足"，
+    // 而是"还没按下布防"。blocked_by 为空、allowed=false、detail 说清原因，
+    // 这样 UI 不会把"没布防"错报成"联锁断开"。
+    readiness::ReadinessFacts f = armed_facts();
+    f.armed = false;
+    const readiness::GateVerdict verdict = readiness::evaluate(f);
+    CHECK(!verdict.allowed);
+    CHECK(verdict.blocked_by.empty());
+    CHECK_EQ(verdict.detail, std::string("未布防"));
+}
+
+CASE(evaluate_every_safety_bit_has_its_own_reason); {
     struct Probe {
         const char* name;
-        policy::GateReason expected;
-        void (*mutate)(policy::LaserSafetyFacts&);
+        readiness::GateReason expected;
+        void (*mutate)(readiness::ReadinessFacts&);
     };
     const Probe probes[] = {
-        {"interlock_1", policy::GateReason::interlock_open,
-         [](policy::LaserSafetyFacts& f) { f.interlock_1 = false; }},
-        {"emergency_stop", policy::GateReason::emergency_stopped,
-         [](policy::LaserSafetyFacts& f) { f.emergency_stop = false; }},
-        {"q_gate", policy::GateReason::q_gate_open,
-         [](policy::LaserSafetyFacts& f) { f.q_gate = false; }},
-        {"over_temperature", policy::GateReason::over_temperature,
-         [](policy::LaserSafetyFacts& f) { f.over_temperature = false; }},
-        {"fault_bits", policy::GateReason::laser_fault,
-         [](policy::LaserSafetyFacts& f) { f.fault_bits = 0x0004; }},
-        {"not_enabled", policy::GateReason::not_enabled,
-         [](policy::LaserSafetyFacts&) {}},
+        {"interlock_1", readiness::GateReason::interlock_open,
+         [](readiness::ReadinessFacts& f) { f.laser.interlock_1 = false; }},
+        {"interlock_2", readiness::GateReason::interlock_open,
+         [](readiness::ReadinessFacts& f) { f.laser.interlock_2 = false; }},
+        {"emergency_stop", readiness::GateReason::emergency_stopped,
+         [](readiness::ReadinessFacts& f) { f.laser.emergency_stop = false; }},
+        {"q_gate", readiness::GateReason::q_gate_open,
+         [](readiness::ReadinessFacts& f) { f.laser.q_gate = false; }},
+        {"over_temperature", readiness::GateReason::over_temperature,
+         [](readiness::ReadinessFacts& f) { f.laser.over_temperature = false; }},
+        {"fault_bits", readiness::GateReason::laser_fault,
+         [](readiness::ReadinessFacts& f) { f.laser.fault_bits = 0x0004; }},
+        {"devices_opened", readiness::GateReason::not_enabled,
+         [](readiness::ReadinessFacts& f) { f.devices_opened = false; }},
+        {"laser_enabled", readiness::GateReason::not_enabled,
+         [](readiness::ReadinessFacts& f) { f.laser_enabled = false; }},
+        {"spectrometer_ready", readiness::GateReason::not_enabled,
+         [](readiness::ReadinessFacts& f) { f.spectrometer_ready = false; }},
     };
     for (const Probe& probe : probes) {
-        CASE(gate_bit_probe); { (void)probe; }
-        policy::Gate gate;
-        gate.set_parameters_ready(true);
-        gate.set_laser_enabled(probe.expected != policy::GateReason::not_enabled);
-        policy::LaserSafetyFacts f = safe_facts();
+        readiness::ReadinessFacts f = armed_facts();
         probe.mutate(f);
-        gate.update_laser_facts(f);
-        const policy::GateVerdict verdict = gate.evaluate();
+        const readiness::GateVerdict verdict = readiness::evaluate(f);
         CHECK(!verdict.allowed);
         if (!blocked_by(verdict, probe.expected)) {
             std::printf("      (probe %s missed its reason)\n", probe.name);
@@ -410,80 +383,53 @@ CASE(gate_every_safety_bit_has_its_own_reason); {
     }
 }
 
-CASE(gate_never_returns_empty_blocked_list_when_denied); {
+CASE(evaluate_never_returns_empty_blocked_list_when_denied); {
     // 排障需要"到底哪几条不满足"，不能只给一个 bool。
-    policy::Gate gate;   // 参数未齐备 + 激光读不到 + 设备未使能
-    const policy::GateVerdict verdict = gate.evaluate();
+    const readiness::ReadinessFacts f{};   // 全默认：未布防 + 读不到激光 + 未使能
+    const readiness::GateVerdict verdict = readiness::evaluate(f);
     CHECK(!verdict.allowed);
     CHECK(!verdict.blocked_by.empty());
     CHECK(verdict.primary_reason() != nullptr);
 }
 
-CASE(gate_uncalibrated_ac_interlock_never_blocks); {
-    // 3.9.2 是 C 类。默认 ac_interlock_ok_ = true（不拦截）。
-    // 子项不得互相代偿：3.4.2 出光门禁不得顺手把 3.9.2 的活干了。
-    policy::Gate gate;
-    gate.set_parameters_ready(true);
-    gate.set_laser_commissioned(true);
-    gate.update_laser_facts(safe_facts());
-    CHECK(gate.arm().ok());
-    const policy::GateVerdict verdict = gate.evaluate();
-    CHECK(verdict.allowed);
-    CHECK(!blocked_by(verdict, policy::GateReason::air_conditioner_interlock));
+// 判定是纯函数：同一份 facts 反复算，结论必须一模一样。
+// 这条不是形式主义 —— 现场重判会跑成千上万次，非幂等就意味着"上一帧放行、
+// 这一帧拦下"的抖动，操作员会看到按钮一会儿能点一会儿不能点。
+CASE(evaluate_is_idempotent_on_identical_facts); {
+    const readiness::ReadinessFacts f = armed_facts();
+    const readiness::GateVerdict a = readiness::evaluate(f);
+    const readiness::GateVerdict b = readiness::evaluate(f);
+    CHECK_EQ(a.allowed, b.allowed);
+    CHECK_EQ(a.blocked_by.size(), b.blocked_by.size());
+    CHECK_EQ(a.detail, b.detail);
 }
-
-CASE(gate_indicator_mapping_is_pure_and_does_not_affect_verdict); {
-    policy::Gate gate;
-    gate.set_parameters_ready(true);
-    gate.update_laser_facts(safe_facts());
-    const policy::GateVerdict before = gate.evaluate();
-
-    policy::IndicatorMapping mapping;
-    mapping.table[policy::MachineState::ready][policy::LampChannel::green] =
-        policy::LampState::on;
-    const auto intent = mapping.map_state(policy::MachineState::ready);
-    CHECK_EQ(static_cast<int>(intent.count(policy::LampChannel::green)), 1);
-    CHECK_EQ(static_cast<int>(intent.at(policy::LampChannel::green)),
-             static_cast<int>(policy::LampState::on));
-
-    const policy::GateVerdict after = gate.evaluate();
-    CHECK_EQ(after.allowed, before.allowed);
-}
-
-CASE(gate_unknown_machine_state_maps_to_all_off); {
-    // 指示层的"未知"是全灭，不是沿用上一次的颜色。
-    policy::IndicatorMapping mapping;
-    const auto intent = mapping.map_state(policy::MachineState::offline);
-    CHECK(intent.empty());
-}
-
-CASE(staged_parameters_are_not_reported_as_completed); {
-    // 回归测试：at_next_idle 策略下参数只是暂存。此前它报 completed=true，
-    // 也就是"说已完成但其实没生效"——正是本层要防的那种撒谎。
-    // 落盘路径要自己先建出来：CMake 与 build.ps1 的 CWD 布局不同，
-    // 指望"上一轮跑过、build/ 已经在"是把自己绑在别人的行为上。
+CASE(parameters_apply_takes_effect_immediately); {
+    // 回归测试：曾经有 at_next_idle（暂存到下次空闲）这条路，但全库没有任何
+    // commit 点去应用暂存值 —— 结果是"界面改了参数，这次采集还是旧值"。
+    // 那是本层最典型的撒谎（说暂存却不生效，还报 completed），已连同
+    // staged 状态一起删除。现在 apply 必须当场改、当场可读回。
     std::error_code ec;
     std::filesystem::create_directories("build", ec);
-    policy::FileParameterStore store("build/tmp_core_params_staged.json", {"belt"}, {{"belt", {"speed"}}});
+    const std::string path =
+        ::testing::scratch("build/tmp_core_params_immediate.json", false);
+    config::FileParameterStore store(path, {"laser"}, {{"laser", {"frequency_hz"}}});
     (void)store.load();
-    const policy::ApplyResult staged =
-        store.apply("belt", {{"speed", 0.2}}, policy::ApplyTiming::at_next_idle);
-    CHECK(!staged.completed());
-    CHECK(staged.state == policy::ApplyState::staged);
-    CHECK_EQ(std::string(policy::to_string(staged.state)), std::string("staged"));
-
-    // immediately 才是真的完成。
-    const policy::ApplyResult applied =
-        store.apply("belt", {{"speed", 0.2}}, policy::ApplyTiming::immediately);
+    const config::ApplyResult applied =
+        store.apply("laser", {{"frequency_hz", 2}});
     CHECK(applied.completed());
-    CHECK(applied.state == policy::ApplyState::completed);
+    CHECK(applied.state == config::ApplyState::completed);
+
+    std::map<std::string, double> values;
+    CHECK(store.query("laser", values).state == config::ApplyState::completed);
+    const auto it = values.find("frequency_hz");
+    CHECK(it != values.end());
+    CHECK_EQ(it->second, 2.0);
 }
 
 CASE(apply_state_to_string_covers_every_state); {
-    CHECK_EQ(std::string(policy::to_string(policy::ApplyState::completed)), std::string("completed"));
-    CHECK_EQ(std::string(policy::to_string(policy::ApplyState::staged)), std::string("staged"));
-    CHECK_EQ(std::string(policy::to_string(policy::ApplyState::rejected)), std::string("rejected"));
-    CHECK_EQ(std::string(policy::to_string(policy::ApplyState::failed)), std::string("failed"));
+    CHECK_EQ(std::string(config::to_string(config::ApplyState::completed)), std::string("completed"));
+    CHECK_EQ(std::string(config::to_string(config::ApplyState::rejected)), std::string("rejected"));
+    CHECK_EQ(std::string(config::to_string(config::ApplyState::failed)), std::string("failed"));
 }
 
 TEST_MAIN_RETURN()

@@ -1,5 +1,6 @@
 #include "widgets.hpp"
 
+#include <QFontMetrics>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QPainter>
@@ -95,6 +96,10 @@ StatusDot::StatusDot(QWidget* parent) : QWidget(parent) {
     detail_ = new QLabel(this);
     detail_->setObjectName(QStringLiteral("cardHint"));
     detail_->hide();
+    // 详情默认不换行：顶栏高度固定，换行会把标题行撑高，把下面的页面挤下去。
+    // 要看全文就悬停看 tooltip。
+    detail_->setWordWrap(false);
+    detail_->setToolTip(QString());   // 原文只在真被截断时才填
 
     auto* col = new QVBoxLayout;
     col->setContentsMargins(0, 0, 0, 0);
@@ -138,8 +143,32 @@ void StatusDot::set_level(Level level) {
 void StatusDot::set_text(const QString& text) { text_->setText(text); }
 
 void StatusDot::set_detail(const QString& detail) {
-    detail_->setText(detail);
-    detail_->setVisible(!detail.isEmpty());
+    detail_full_ = detail;
+    refresh_detail_text();
+    detail_->setVisible(!detail_full_.isEmpty());
+}
+
+void StatusDot::set_max_width(int px) {
+    if (px > 0) setMaximumWidth(px);
+    refresh_detail_text();
+}
+
+void StatusDot::refresh_detail_text() {
+    if (detail_full_.isEmpty()) {
+        detail_->setText(QString());
+        detail_->setToolTip(QString());
+        return;
+    }
+    // 上限宽度扣掉圆点(14) + 间距(7)：StatusDot 自身占的固定宽度不算在里面。
+    const int budget = maximumWidth() - 14 - 7;
+    const QFontMetrics fm(detail_->font());
+    if (budget > 0 && fm.horizontalAdvance(detail_full_) > budget) {
+        detail_->setText(fm.elidedText(detail_full_, Qt::ElideRight, budget));
+        detail_->setToolTip(detail_full_);   // 截断了才给 tooltip
+    } else {
+        detail_->setText(detail_full_);
+        detail_->setToolTip(QString());
+    }
 }
 
 void StatusDot::set_pulsing(bool pulsing) {

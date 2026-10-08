@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -145,6 +146,14 @@ public:
     // 有界采集。设备异常帧与超时都通过 Error 返回；已取到的部分结果保留在 error.raw 之外，
     // 调用方若需要部分结果应检查 groups。
     Result<CaptureResult> capture(const CaptureRequest& request);
+
+    Result<std::vector<SpectrometerInfo>> probeChannels() { return enumerate(); }
+    Result<CaptureResult> captureOnce(const CaptureRequest& request) {
+        return capture(request);
+    }
+    Result<CaptureResult> stream(
+        const CaptureRequest& request,
+        const std::function<VoidResult(const ScanGroup&)>& on_group);
 
     // 释放全部句柄并执行清理。重复调用是安全的。
     VoidResult close();

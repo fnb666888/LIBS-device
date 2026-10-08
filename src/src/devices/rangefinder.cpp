@@ -4,7 +4,18 @@
 
 namespace libs::devices {
 
-Result<RangefinderRead> Rangefinder::read(std::uint8_t address, std::uint16_t start, std::uint16_t count) {
+Result<libs::rangefinder::Reading> Rangefinder::readRawRegisters(
+        std::uint16_t start, std::uint16_t count) {
+    return read(address_, start, count);
+}
+
+Result<libs::rangefinder::Reading> Rangefinder::observeOnce() {
+    return readRawRegisters(libs::rangefinder::reg::kDistanceZeroOnOutOfRange, 9);
+}
+
+Result<libs::rangefinder::Reading> Rangefinder::read(std::uint8_t address,
+                                                     std::uint16_t start,
+                                                     std::uint16_t count) {
     Bytes request;
     try {
         request = libs::rangefinder::make_read_request(address, start, count);
@@ -16,13 +27,6 @@ Result<RangefinderRead> Rangefinder::read(std::uint8_t address, std::uint16_t st
     if (!exchanged) return exchanged.error();
     const auto& reply = exchanged.value();
 
-    RangefinderRead result;
-    result.request = request;
-    result.response = reply.bytes;
-    result.elapsed_ms = reply.elapsed_ms;
-    result.receive_errors = reply.receive_errors;
-    result.timed_out = reply.timed_out;
-
     if (reply.receive_errors)
         return Error::with_raw(ErrorKind::transport, "uart_errors",
                                "serial parity/framing/overrun error while reading the rangefinder",
@@ -30,8 +34,7 @@ Result<RangefinderRead> Rangefinder::read(std::uint8_t address, std::uint16_t st
 
     auto decoded = libs::rangefinder::decode_read_response(reply.bytes, address, start, count);
     if (!decoded) return decoded.error();
-    result.reading = std::move(decoded.value());
-    return result;
+    return decoded.value();
 }
 
 }  // namespace libs::devices

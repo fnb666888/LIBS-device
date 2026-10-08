@@ -38,12 +38,14 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Charts)
 add_executable(libs-spectrum-ui WIN32
     src/main.cpp
     src/main_window.cpp
+    src/parameter_page.cpp
     src/theme.cpp
     src/widgets.cpp
     src/machine_state.cpp
     src/status_poller.cpp
     src/stream_poller.cpp
     src/frame_model.cpp
+    src/spectrum_plot.cpp
     src/pipe_client.cpp
 )
 

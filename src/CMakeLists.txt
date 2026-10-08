@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(libs_core LANGUAGES CXX)
 
 # ── 目标平台 ──────────────────────────────────────────────────────────────────
-# 三层库的移植层用的是 Win32 COM 口和 AvaSpec 的 __stdcall 导出，
+# 各层库的移植层用的是 Win32 COM 口和 AvaSpec 的 __stdcall 导出，
 # 所以这个库目前只声明支持 Windows x64。
 if (NOT WIN32)
   message(FATAL_ERROR "libs_core currently targets Windows x64 only")
@@ -25,32 +25,24 @@ else()
   target_compile_options(libs_warnings INTERFACE -Wall -Wextra -Wpedantic)
 endif()
 
-# ── 第 3 层：纯协议 ───────────────────────────────────────────────────────────
-# 只有字节和值语义，不碰串口、不碰 SDK、不含任何设备或安全策略。
-add_library(libs_protocols STATIC
+# ── 第 2 层：传输 ─────────────────────────────────────────────────────────────
+# 把字节送出去并收回来，带超时；不理解任何协议内容。
+add_library(libs_transport STATIC
   src/error.cpp
   src/hex.cpp
+  src/transport/serial.cpp
+)
+target_include_directories(libs_transport PUBLIC include)
+target_link_libraries(libs_transport PRIVATE libs_warnings)
+
+# ── 第 1 层：设备驱动 / SDK ──────────────────────────────────────────────────
+# 设备协议是控制器内部实现，不再作为独立公开目标。
+add_library(libs_devices STATIC
   src/protocols/modbus_rtu.cpp
   src/protocols/laser.cpp
   src/protocols/rangefinder.cpp
   src/protocols/indicator.cpp
   src/protocols/air_conditioner.cpp
-)
-target_include_directories(libs_protocols PUBLIC include)
-target_link_libraries(libs_protocols PRIVATE libs_warnings)
-
-# ── 第 2 层：传输 ─────────────────────────────────────────────────────────────
-# 把字节送出去并收回来，带超时；不理解任何协议内容。
-add_library(libs_transport STATIC
-  src/transport/serial.cpp
-)
-target_link_libraries(libs_transport PUBLIC libs_protocols)
-target_link_libraries(libs_transport PRIVATE libs_warnings)
-
-# ── 第 1 层：设备驱动 / SDK ──────────────────────────────────────────────────
-# 把传输或厂商 SDK 的原始结果翻译成结构化数据。
-# 依赖方向严格是 devices -> transport -> protocols，反向没有任何引用。
-add_library(libs_devices STATIC
   src/devices/laser.cpp
   src/devices/rangefinder.cpp
   src/devices/indicator.cpp
@@ -60,7 +52,7 @@ add_library(libs_devices STATIC
 target_link_libraries(libs_devices PUBLIC libs_transport)
 target_link_libraries(libs_devices PRIVATE libs_warnings)
 
-# 上层业务只应该依赖这一个聚合目标。
+# 上层业务只应该依赖设备控制器聚合目标。
 add_library(libs INTERFACE)
 target_link_libraries(libs INTERFACE libs_devices)
 
@@ -70,10 +62,10 @@ enable_testing()
 
 add_library(libs_test_support STATIC tests/check.cpp)
 target_include_directories(libs_test_support PUBLIC tests)
-target_link_libraries(libs_test_support PUBLIC libs_protocols)
+target_link_libraries(libs_test_support PUBLIC libs_devices)
 
 add_executable(test_protocols tests/test_protocols.cpp)
-target_link_libraries(test_protocols PRIVATE libs_test_support libs_warnings)
+target_link_libraries(test_protocols PRIVATE libs_test_support libs_devices libs_warnings)
 add_test(NAME protocols COMMAND test_protocols)
 
 add_executable(test_devices tests/test_devices.cpp)
@@ -82,12 +74,16 @@ add_test(NAME devices COMMAND test_devices)
 
 # 空调：纯协议层（寄存器映射与功能码编解码）与设备层（收发、超范围拒发）
 add_executable(test_air_conditioner_protocol tests/test_air_conditioner_protocol.cpp)
-target_link_libraries(test_air_conditioner_protocol PRIVATE libs_test_support libs_protocols libs_warnings)
+target_link_libraries(test_air_conditioner_protocol PRIVATE libs_test_support libs_devices libs_warnings)
 add_test(NAME air_conditioner_protocol COMMAND test_air_conditioner_protocol)
 
 add_executable(test_air_conditioner_device tests/test_air_conditioner_device.cpp)
 target_link_libraries(test_air_conditioner_device PRIVATE libs_test_support libs_transport libs_devices libs_warnings)
 add_test(NAME air_conditioner_device COMMAND test_air_conditioner_device)
+
+add_executable(test_device_actions tests/test_device_actions.cpp)
+target_link_libraries(test_device_actions PRIVATE libs_test_support libs_devices libs_warnings)
+add_test(NAME device_actions COMMAND test_device_actions)
 
 # 光谱仪测试需要一个替身 DLL。驱动自己按绝对 UTF-8 路径加载它，
 # 而 Windows 的 argv 是 ANSI 字节，中文工程目录下会直接被拒；
@@ -112,26 +108,36 @@ endif()
 # ── 第 4 层：业务层 ───────────────────────────────────────────────────────────
 # 只在 devices 之上组装业务语义，不反向改驱动，也不直接调 SDK。
 # 与 build.ps1 里的 libs_business 源文件列表保持一致。
+# 与 build.ps1 的 libs_business 列表逐行一致。
+# shared/ 先编（它是底座），再 readiness（业务一），再 measurement（业务二），
+# 最后 app/（进程边界与装配）。顺序即依赖方向。
 add_library(libs_business STATIC
-  src/business/time_util.cpp
-  src/business/json/json.cpp
-  src/business/config/site_config.cpp
-  src/business/session/device_session.cpp
-  src/business/policy/detection_config.cpp
-  src/business/policy/gate.cpp
-  src/business/logging/run_log.cpp
-  src/business/services/ac_interlock.cpp
-  src/business/services/business_event.cpp
-  src/business/services/capture.cpp
-  src/business/services/composition.cpp
-  src/business/services/data_delivery.cpp
-  src/business/services/environment.cpp
-  src/business/services/laser_fire.cpp
-  src/business/services/facade.cpp
-  src/business/services/motion.cpp
-  src/business/services/ore_presence.cpp
-  src/business/services/spectrum_stream.cpp
+  # shared/：共同底座。**不许反向依赖 readiness/ 或 measurement/**
+  # （build.ps1 里有对应静态检查；CMake 侧靠源文件清单本身可见）。
+  src/business/shared/time_util.cpp
+  src/business/shared/json/json.cpp
+  src/business/shared/config/site_config.cpp
+  src/business/shared/config/parameter_store.cpp
+  src/business/shared/session/device_session.cpp
+  src/business/shared/logging/run_log.cpp
+  src/business/shared/data_delivery.cpp
+  # readiness/：业务一，就绪判定。
+  src/business/readiness/facts.cpp
+  src/business/readiness/verdict.cpp
+  src/business/readiness/lamp.cpp
+  src/business/readiness/monitor.cpp
+  src/business/readiness/precheck.cpp
+  # measurement/：业务二，激光触发光谱检测。
+  src/business/measurement/frame.cpp
+  src/business/measurement/frame_bus.cpp
+  src/business/measurement/writer.cpp
+  src/business/measurement/capture_plan.cpp
+  src/business/measurement/job.cpp
+  # app/：进程边界与装配。ParameterService 在这儿而不是 shared/，
+  # 因为它要引用 measurement 的参数类型。
+  src/business/app/parameter_service.cpp
   src/business/app/runtime.cpp
+  src/business/app/facade.cpp
 )
 target_link_libraries(libs_business PUBLIC libs_devices)
 target_link_libraries(libs_business PRIVATE libs_warnings)
@@ -163,12 +169,22 @@ add_executable(test_business_ipc tests/test_business_ipc.cpp src/businessd/named
 target_link_libraries(test_business_ipc PRIVATE libs_test_support libs_business advapi32 libs_warnings)
 add_test(NAME business_ipc COMMAND test_business_ipc)
 
-# 出光流程测试：门禁拦截、协议极性、指令序列、失败收光。
-add_executable(test_laser_fire tests/test_laser_fire.cpp)
-target_link_libraries(test_laser_fire PRIVATE libs_test_support libs_business libs_warnings)
-add_test(NAME laser_fire COMMAND test_laser_fire)
 
-# 实时光谱流：租约互斥、通道三态、背压、订阅生命周期。全部离线。
-add_executable(test_spectrum_stream tests/test_spectrum_stream.cpp)
-target_link_libraries(test_spectrum_stream PRIVATE libs_test_support libs_business libs_warnings)
-add_test(NAME spectrum_stream COMMAND test_spectrum_stream)
+# 帧队列：纯内存，无设备依赖。通道三态、背压丢最旧、订阅生命周期。
+# 它只链 frame/frame_bus 两个纯内存源文件，**不链 libs_devices 也不链
+# libs_business** —— 真往里加设备调用会直接链接失败，这条纪律由 build 强制保证。
+add_executable(test_frame_queue
+  tests/test_frame_queue.cpp
+  src/business/measurement/frame.cpp
+  src/business/measurement/frame_bus.cpp
+  src/business/shared/json/json.cpp
+  src/business/shared/time_util.cpp
+)
+target_link_libraries(test_frame_queue PRIVATE libs_test_support libs_warnings)
+add_test(NAME frame_queue COMMAND test_frame_queue)
+
+# 测量作业：门禁拦截、wait_for_laser_trigger 恒真、逐发采集、
+# 落盘队列有界不反压、停止无条件收光。全部离线，用采集替身。
+add_executable(test_measurement_job tests/test_measurement_job.cpp)
+target_link_libraries(test_measurement_job PRIVATE libs_test_support libs_business libs_warnings)
+add_test(NAME measurement_job COMMAND test_measurement_job)

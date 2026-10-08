@@ -7,7 +7,7 @@
 
 #include "check.hpp"
 #include "libs/business/app/runtime.hpp"
-#include "libs/business/json/json.hpp"
+#include "libs/business/shared/json/json.hpp"
 #include "libs/businessd/named_pipe_server.hpp"
 
 using namespace business;
@@ -21,7 +21,7 @@ struct Fixture {
 
     explicit Fixture(const std::string& tag)
         : server(runtime, businessd::DaemonOptions{"\\\\.\\pipe\\libs-test-" + tag}) {
-        data_dir = std::string("build/tmp_ipc_") + tag;
+        data_dir = ::testing::scratch(std::string("build/tmp_ipc_") + tag);
         app::Runtime::Options options;
         options.open_devices = false;
         options.data_dir = data_dir;

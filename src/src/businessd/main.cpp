@@ -8,8 +8,8 @@
 #include <thread>
 
 #include "libs/business/app/runtime.hpp"
-#include "libs/business/config/site_config.hpp"
-#include "libs/business/json/json.hpp"
+#include "libs/business/shared/config/site_config.hpp"
+#include "libs/business/shared/json/json.hpp"
 #include "libs/businessd/named_pipe_server.hpp"
 
 namespace {

@@ -2,43 +2,52 @@
 
 // 进程生命周期与依赖装配（`business/app/`）。
 //
-// 职责（范围报告 §5.1）：
-//   * 打开设备会话（能力 2，独占打开）
-//   * 构造各服务模块（能力 3-12）
-//   * 串起门禁事实源（激光 B2 轮询 -> Gate::update_laser_facts）
-//   * 退出时优雅关闭设备（先光谱仪，后串口）
+// ── Runtime 只做四件事，**不含任何业务逻辑** ─────────────────────────────
 //
-// **依赖装配方向**：app -> services -> policy/session/config -> libs。
-// 反向没有任何引用。设备对象只由 session 持有，别处拿引用。
+//   1. 按顺序构造/析构 `shared -> readiness -> measurement`
+//   2. 注入依赖
+//   3. 提供生命周期（`start()` / `stop()`）
+//   4. 转发命令（`facade.cpp`）
+//
+// **本文件里不允许出现任何判定或出光决策。**
+//
+// 具体到代码上，这条纪律长这样：
+//
+//   * 判定只有一处：`readiness::ReadinessMonitor::evaluate_now()`。
+//     Runtime 构造它并注入事实源（读激光 B2），但**从不自己解释结论**。
+//   * 出光只有一处：`measurement::MeasurementJob`。
+//     Runtime 不碰激光器写指令，只在 stop() 里调 job->stop() 收光。
+//   * 出光会话记账（`begin_laser_session`）是**进程级资源互斥**，
+//     不是业务逻辑 —— 它拦的只是"重复出光"，不仲裁设备。
+//
+// 依赖方向：`app -> {readiness, measurement} -> {shared, devices} -> libs`。
+// 反向没有任何引用。设备对象只由 session 持有，别处拿指针。
 
 #include <memory>
-#include <optional>
 #include <mutex>
+#include <optional>
 #include <string>
 
-#include "libs/business/config/site_config.hpp"
-#include "libs/business/json/json.hpp"
-#include "libs/business/logging/run_log.hpp"
-#include "libs/business/policy/detection_config.hpp"
-#include "libs/business/policy/gate.hpp"
-#include "libs/business/services/ac_interlock.hpp"
-#include "libs/business/services/business_event.hpp"
-#include "libs/business/services/capture.hpp"
-#include "libs/business/services/composition.hpp"
-#include "libs/business/services/data_delivery.hpp"
-#include "libs/business/services/environment.hpp"
-#include "libs/business/services/laser_fire.hpp"
-#include "libs/business/services/motion.hpp"
-#include "libs/business/services/ore_presence.hpp"
-#include "libs/business/services/spectrum_stream.hpp"
-#include "libs/business/session/device_session.hpp"
+#include "libs/business/app/parameter_service.hpp"
+#include "libs/business/measurement/frame_bus.hpp"
+#include "libs/business/measurement/job.hpp"
+#include "libs/business/measurement/writer.hpp"
+#include "libs/business/readiness/monitor.hpp"
+#include "libs/business/readiness/precheck.hpp"
+#include "libs/business/shared/config/parameter_store.hpp"
+#include "libs/business/shared/config/site_config.hpp"
+#include "libs/business/shared/data_delivery.hpp"
+#include "libs/business/shared/json/json.hpp"
+#include "libs/business/shared/logging/run_log.hpp"
+#include "libs/business/shared/session/device_session.hpp"
+#include "libs/error.hpp"
 
 namespace business::app {
 
 // HealthReport -> JSON。放在 Runtime 里是为了让 IPC 层与日志用同一份表达。
 json::Value to_json(const session::HealthReport& report);
 
-// 一次运行的全部依赖。持有设备会话与所有服务对象。
+// 一次运行的全部依赖。持有设备会话与所有业务对象。
 class Runtime {
 public:
     struct Options {
@@ -65,120 +74,131 @@ public:
 
     bool running() const noexcept { return running_; }
 
-    // 轮询一次激光 B2，把事实喂给门禁。**这是门禁唯一的激光事实来源。**
-    // 读失败时把 available=false 喂进去——门禁据此拦截（读不到 != 安全）。
-    libs::VoidResult poll_laser_facts();
-
-    // 同上，但事实从**指定设备**读。默认等价于 poll_laser_facts()。
-    // 分开是因为出光流程可能操作一个与默认句柄不同的 Laser 实例
-    // （离线测试注入替身时就是如此）。事实必须读将要被写入的**同一个**设备，
-    // 否则会出现“读 A 的安全状态、往 B 发出光指令”这种最危险的错配。
-    libs::VoidResult poll_laser_facts(libs::devices::Laser* laser);
-
     // 每根控制线都要串行化：设备是独占的，且驱动是同步阻塞的。
     // 多客户端并发时靠这把锁避免交错事务。
+    //
+    // **锁留在 Runtime**：串口互斥是**进程级**的，不属于任何一个业务。
     std::mutex& device_mutex() noexcept { return device_mutex_; }
 
     const config::SiteConfig& config() const noexcept { return config_; }
     session::DeviceSession& devices() noexcept { return devices_; }
     session::HealthReport health() const { return devices_.health(); }
     json::Value health_json() const;
-    policy::Gate& gate() noexcept { return gate_; }
-    policy::ParameterStore* parameters() noexcept { return parameters_.get(); }
+    config::ParameterStore* parameters() noexcept { return parameters_.get(); }
+
+    // 业务一：就绪判定。**未构造（start 未跑）时返回 nullptr**，调用方必须判空。
+    //
+    // UI 只读 `monitor()->latest()`，**不自己判**。UI 收到"开始检测"的成功
+    // 就当成"已开光"，失败原因看返回码；它绝不能"先问门禁、拿到绿灯
+    // 再自己决定要不要开始" —— 那会让判定出现第二个执行点。
+    readiness::ReadinessMonitor* monitor() noexcept { return monitor_.get(); }
+    const readiness::ReadinessMonitor* monitor() const noexcept { return monitor_.get(); }
+
+    // 门禁结论 -> 状态灯。**全库唯一的灯下发点**。
+    readiness::PrecheckService* precheck() noexcept { return precheck_.get(); }
+
+    // 业务二：测量作业。**唯一持有激光器 + 光谱仪的业务对象**。
+    //
+    // 用 unique_ptr 且**延迟到 start() 构造**，原因很实在：它的依赖
+    // （激光器句柄、光谱仪句柄、落盘 writer、门禁）全都是 start() 里
+    // 才拿到的东西。在成员初始化列表里构造它，就只能传一堆 nullptr，
+    // 然后在 start() 里补绑 —— 与其那样，不如等齐了再一次性造好。
+    measurement::MeasurementJob* measurement() noexcept { return measurement_.get(); }
+    const measurement::MeasurementJob* measurement() const noexcept { return measurement_.get(); }
+
+    // 落盘子模块。测量作业调用它，Runtime 只是持有。
+    measurement::Writer* writer() noexcept { return writer_.get(); }
+
+    // 帧出口。**纯内存通道，不碰设备、不起线程**，
+    // 所以它可以当普通成员直接构造，不需要延迟到 start()。
+    //
+    // 所有权在 Runtime（不是 MeasurementJob）：UI 必须在 measurement_start
+    // 之前就能订阅，作业起不来的时候 UI 也要能看到"通道是空的"这件事。
+    measurement::FrameQueue& frame_bus() noexcept { return frame_bus_; }
+
+    // 出光参数管理服务：**测量参数的唯一来源**。
+    // 界面改参数走 ParameterStore，出光读参数走 fire_parameters()，
+    // 两条路径共用同一个 store —— 所以不存在"改了不生效"。
+    ParameterService& parameter_service() noexcept { return parameters_service_; }
     logging::RunLog& log() noexcept { return *log_; }
     logging::RecoveryContextStore& recovery() noexcept { return *recovery_; }
-    services::OrePresenceJudge& ore_judge() noexcept { return ore_judge_; }
-    services::AirConditionerMonitor& ac_monitor() noexcept { return ac_monitor_; }
 
-    // 连续出光是否在跑。
+    // ── 出光会话互斥（进程级资源记账）────────────────────────────────────
     //
-    // **必须由 Runtime 记着**：守护进程退出时要负责收光。关串口不会让激光
-    // 停下来 —— 设备自己保持着"工作"状态，软件崩了、窗口关了，光还在打。
-    void set_laser_running(bool running) noexcept { laser_running_ = running; }
-    bool laser_running() const noexcept { return laser_running_; }
+    // **它是什么**：一个布尔 + 一把锁，回答"这台激光器当前有没有出光会话"。
+    // 原先需要它是因为有两条能发出光的路径；现在只剩 `measurement_start`
+    // 一条，但**记账仍然保留** —— 因为"重复出光"是必须拦的，
+    // 而这个拦截点应该独立于具体走哪条命令。
+    //
+    // **它不是什么**：不是设备仲裁。早年那次要仲裁（`AcquisitionLease`）
+    // 是因为同时存在两个采集者；现在物理上只有一个采集者。
+    //
+    // 调用方约定：**无论是哪条路径**，调用方应当原地拒绝，不要覆盖。
+    bool begin_laser_session();
+    void end_laser_session() noexcept;
+    bool laser_session_active() const;
+    // 兼容字段：UI 的 status 面板读 laser_running。语义 = "是否有出光会话在进行"。
+    bool laser_running() const { return laser_session_active(); }
 
-    // 辅助监测（空调 / 测距）上一次**真的去读设备**的时刻（单调钟毫秒）。
+    // 按当前判定结论刷新一次状态灯。
     //
-    // 为什么需要节流：status 每调用一次就去读空调（2 个 Modbus 事务）+ 测距
-    // （1 个），各带串口超时，实测把 status 从 8 ms 拖到 ~2 秒；而 UI 每 800 ms
-    // 就轮询一次 status —— 于是 status 常年占着 device_mutex，把光谱采集和
-    // 取帧一起饿死（现场表现：有帧号、但界面一直空）。
+    // 灯显示的是判定结论，所以顺序是：先 evaluate 得状态 -> 再映射成灯色下发。
+    // 真正刷灯的实现在 PrecheckService —— 全库唯一的灯下发点。
     //
-    // 所以按节奏读：status 多数时候直接回缓存，读数的新鲜度用 aux_read_age_ms
-    // 如实上报，让调用方自己判断"这条读数有多旧"。
-    Milliseconds last_aux_read_ms() const noexcept { return last_aux_read_ms_; }
-    void mark_aux_read(Milliseconds now_ms) noexcept { last_aux_read_ms_ = now_ms; }
-    services::AirConditionerInterlock& ac_interlock() noexcept { return ac_interlock_; }
-    services::CaptureCoordinator& capture() noexcept { return capture_; }
-    // 实时光谱流（展示侧）。与其它服务一样由 Runtime 独占持有。
-    services::SpectrumStream& spectrum_stream() noexcept { return spectrum_stream_; }
-    // 出光服务。它反过来持有 Runtime 的引用，是有意为之：
-    // 出光必须拿到设备句柄、门禁、采集协调三样，绕开它们就会重复实现判定。
-    services::LaserFireService& laser_fire() noexcept { return laser_fire_; }
-    services::CompositionAnalyzer& composition() noexcept { return composition_; }
-    services::MotionTiming& motion_timing() noexcept { return motion_timing_; }
-    services::PositionSwitch& position_switch() noexcept { return *position_switch_; }
+    // 灯写失败**不抛**、不改判定：状态灯是辅助指示，不是判据。
+    libs::VoidResult sync_indicator();
+
     ::business::data_delivery::DeliverySink& local_sink() noexcept { return *local_sink_; }
-    ::business::data_delivery::DeliverySink& gateway_sink() noexcept { return *gateway_sink_; }
-    events::GatewayAdapter& gateway_adapter() noexcept { return gateway_adapter_; }
-    events::FeedSegmentRules& feed_rules() noexcept { return feed_rules_; }
-    const services::WorkFrequency& work_frequency() const noexcept { return work_frequency_; }
-    void set_work_frequency(services::WorkFrequency f) { work_frequency_ = std::move(f); }
-
-    // 当前检测阶段（业务进度，不与设备状态绑定）。
-    events::DetectionStage stage() const noexcept { return stage_; }
-    void set_stage(events::DetectionStage stage);
-    std::int64_t belt_sequence() const noexcept { return belt_sequence_; }
-    void set_belt_sequence(std::int64_t seq);
-    const std::string& target_belt() const noexcept { return target_belt_; }
-    void set_target_belt(std::string belt);
 
     // 最近一次采集的交付状态（能力 6.3.1 双字段）。
     const std::optional<data_delivery::DeliveryStatus>& last_delivery() const noexcept { return last_delivery_; }
     void set_last_delivery(data_delivery::DeliveryStatus status);
 
 private:
-    void log_stage_change(events::DetectionStage from, events::DetectionStage to);
-
     bool running_ = false;
     config::SiteConfig config_;
     Options options_;
     std::mutex device_mutex_;
 
+    // ── shared：共同底座 ────────────────────────────────────────────────
     session::DeviceSession devices_;
-    policy::Gate gate_;
-    std::unique_ptr<policy::ParameterStore> parameters_;
+    std::unique_ptr<config::ParameterStore> parameters_;
     std::unique_ptr<logging::RunLog> log_;
     // 说明：日志/恢复仓库用 unique_ptr 持有，因为它们不可拷贝（内部有互斥量/文件句柄），
     // 而 Runtime 需要在 start() 里按实际路径重新构造。
     std::unique_ptr<logging::RecoveryContextStore> recovery_;
-    services::CaptureCoordinator capture_;
-    // **device_mutex_ 必须声明在 spectrum_stream_ 之前**：C++ 成员按声明
-    // 逆序析构，所以先析构 stream（停掉它的采集线程），再析构互斥量。
-    // 顺序反了 = 采集线程还在跑，它再去 lock 一把已经没了的 mutex。
-    services::SpectrumStream spectrum_stream_{device_mutex_};
-    services::LaserFireService laser_fire_;
-    services::CompositionAnalyzer composition_;
-    services::OrePresenceJudge ore_judge_;
-    services::AirConditionerMonitor ac_monitor_;
-    bool laser_running_ = false;
-    Milliseconds last_aux_read_ms_ = -100000;   // 负值 = 还没读过
-    services::AirConditionerInterlock ac_interlock_;
-    services::MotionTiming motion_timing_;
-    std::unique_ptr<services::PositionSwitch> position_switch_;
-    std::unique_ptr<::business::data_delivery::DeliverySink> local_sink_;
-    std::unique_ptr<::business::data_delivery::DeliverySink> gateway_sink_;
-    events::UnavailableGatewayAdapter gateway_adapter_;
-    events::UnspecifiedFeedSegmentRules feed_rules_;
-    services::WorkFrequency work_frequency_;
-    events::DetectionStage stage_ = events::DetectionStage::idle;
-    std::int64_t belt_sequence_ = -1;
-    std::string target_belt_;
+    std::unique_ptr<data_delivery::DeliverySink> local_sink_;
+
+    // ── app：参数搬运 ───────────────────────────────────────────────────
+    // 测量参数的唯一来源。必须**声明在 measurement_ 之前**：
+    // measurement_ 每帧都要向它要参数，顺序反了拿到的还是一个空壳。
+    ParameterService parameters_service_{*this};
+
+    // ── readiness：业务一 ───────────────────────────────────────────────
+    //
+    // monitor_ 与 precheck_ 延迟构造：它们的事实源要 devices_ 打开之后
+    // 才拿得到激光器句柄。事实源由 start() 装成一个闭包，
+    // **Runtime 不解释事实、也不解释结论** —— 它只负责把设备递进去。
+    std::unique_ptr<readiness::ReadinessMonitor> monitor_;
+    std::unique_ptr<readiness::PrecheckService> precheck_;
+
+    // ── measurement：业务二 ─────────────────────────────────────────────
+    //
+    // 帧出口当普通成员构造（零设备依赖，UI 要能在作业起之前就订阅）。
+    measurement::FrameQueue frame_bus_;
+
+    // **析构顺序**：成员按声明逆序析构，所以 measurement_ 会先于
+    // monitor_ / writer_ / local_sink_ 析构 —— 它停线程时要往 writer 里
+    // 写最后几帧，而 writer 还要往 local_sink_ 写。顺序反了 =
+    // 作业还在 push 帧，下游已经被销毁。
+    std::unique_ptr<measurement::Writer> writer_;
+    std::unique_ptr<measurement::MeasurementJob> measurement_;
+
     std::optional<data_delivery::DeliveryStatus> last_delivery_;
+
+    // 出光会话记账。见上面的 begin_laser_session() 说明。
+    mutable std::mutex laser_session_mutex_;
+    bool laser_session_active_ = false;
 };
 
 }  // namespace business::app
-
-
-
-

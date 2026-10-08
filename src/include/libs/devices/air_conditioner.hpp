@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "libs/error.hpp"
 #include "libs/protocols/air_conditioner.hpp"
@@ -47,11 +50,48 @@ struct ParamWrite {
     unsigned elapsed_ms = 0;
 };
 
+// 一次轮询的两段结果。任一段失败都保留另一段，不使用旧值冒充本次值。
+struct AirConditionerPoll {
+    bool status_ok = false;
+    bool params_ok = false;
+    std::string status_error;
+    std::string params_error;
+    libs::air_conditioner::StatusReading status;
+    libs::air_conditioner::ParameterReading params;
+};
+
 class AirConditioner {
 public:
     // link 必须已打开，驱动不拥有它。timeout_ms 沿用其他设备驱动的默认值。
-    explicit AirConditioner(transport::Link& link, unsigned timeout_ms = 650)
-        : link_(link), timeout_ms_(timeout_ms) {}
+    explicit AirConditioner(transport::Link& link, std::uint8_t address = 1,
+                            unsigned timeout_ms = 650)
+        : link_(link), address_(address), timeout_ms_(timeout_ms) {}
+
+    Result<libs::air_conditioner::StatusReading> readStatus();
+    Result<libs::air_conditioner::StatusReading> readStatus(std::uint16_t start,
+                                                            std::uint16_t count);
+    Result<libs::air_conditioner::ParameterReading> readParams(
+        std::uint16_t start = libs::air_conditioner::reg::kIndoorTemp,
+        std::uint16_t count = 26);
+    Result<libs::air_conditioner::ParamRegister> readParam(std::uint16_t reg);
+    Result<AirConditionerPoll> poll();
+
+    Result<ParamWrite> setMode(libs::air_conditioner::Mode mode);
+    Result<ControlWrite> setPower(bool on);
+    Result<ParamWrite> setSetpoint(std::uint16_t reg, double value);
+    Result<ParamWrite> writeParams(
+        const std::vector<libs::air_conditioner::ParamWrite>& writes);
+    Result<ParamWrite> writeParam(const libs::air_conditioner::ParamWrite& write);
+
+    void holdMode(libs::air_conditioner::Mode mode);
+    Result<bool> keepalive(std::uint64_t now_ms, unsigned keepalive_ms);
+    const std::optional<libs::air_conditioner::Mode>& heldMode() const noexcept {
+        return held_mode_;
+    }
+    std::uint64_t lastModeSentMs() const noexcept { return last_mode_sent_ms_; }
+
+    static std::vector<libs::air_conditioner::StatusBit> activeAlarms(
+        const libs::air_conditioner::StatusReading& status);
 
     // FC01：读运行状态位（开关机、制冷/加热、风机、各类告警）。
     //
@@ -87,7 +127,10 @@ public:
 
 private:
     transport::Link& link_;
+    std::uint8_t address_;
     unsigned timeout_ms_;
+    std::optional<libs::air_conditioner::Mode> held_mode_;
+    std::uint64_t last_mode_sent_ms_ = 0;
 };
 
 }  // namespace libs::devices

@@ -640,6 +640,18 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
     }
 }
 
+Result<CaptureResult> Spectrometer::stream(
+        const CaptureRequest& request,
+        const std::function<VoidResult(const ScanGroup&)>& on_group) {
+    const auto result = capture(request);
+    if (!result) return result.error();
+    for (const auto& group : result.value().groups) {
+        const VoidResult consumed = on_group(group);
+        if (!consumed) return consumed.error();
+    }
+    return result;
+}
+
 #else  // !_WIN32
 
 struct Spectrometer::Impl {};
@@ -655,6 +667,13 @@ Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
 }
 Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
     (void)request;
+    return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
+}
+Result<CaptureResult> Spectrometer::stream(
+        const CaptureRequest& request,
+        const std::function<VoidResult(const ScanGroup&)>& on_group) {
+    (void)request;
+    (void)on_group;
     return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
 }
 VoidResult Spectrometer::close() { return VoidResult::success(std::monostate{}); }

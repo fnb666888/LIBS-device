@@ -10,6 +10,7 @@
 #include "libs/devices/laser.hpp"
 #include "libs/devices/rangefinder.hpp"
 #include "libs/hex.hpp"
+#include "libs/protocols/laser.hpp"
 #include "libs/protocols/modbus_rtu.hpp"
 
 using libs::Bytes;
@@ -40,7 +41,13 @@ public:
             fail_next = false;
             return Error::make(ErrorKind::transport, "cable_unplugged", "fake transport failure");
         }
-        if (!replies.empty()) {
+        const bool is_read =
+            (request.size() >= 5 && request[0] == 0x5A && request[1] == 0xA5 &&
+             (request[4] == laser::command::kLdSettings ||
+              request[4] == laser::command::kLdActual ||
+              request[4] == laser::command::kTec)) ||
+            (request.size() >= 2 && (request[1] == 0x01 || request[1] == 0x03));
+        if (is_read && !replies.empty()) {
             auto r = replies.front();
             replies.pop_front();
             if (!r) return r.error();
@@ -105,12 +112,15 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(concat({laser::make_read_request(0xB2), laser_b2_reply()}));
     devices::Laser laser(link);
-    auto tx = laser.read(0xB2);
+    devices::LaserOperationTrace trace;
+    auto tx = laser.readActual(&trace);
     CHECK(tx.ok());
     CHECK_EQ(link.sent.size(), size_t(1));
-    CHECK_EQ(to_hex(link.sent[0].request), to_hex(laser::make_read_request(0xB2)));
-    CHECK_EQ(tx.value().frame.kind, std::string("ld_actual"));
-    CHECK_EQ(tx.value().elapsed_ms, 2u);
+    CHECK_EQ(trace.sent_frames.size(), size_t(1));
+    if (!trace.sent_frames.empty())
+        CHECK_EQ(trace.sent_frames[0], to_hex(laser::make_read_request(0xB2)));
+    CHECK(tx.value().valid);
+    CHECK_EQ(static_cast<int>(tx.value().work_state), 1);
 }
 
 {
@@ -121,9 +131,10 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(stream);
     devices::Laser laser(link);
-    auto tx = laser.read(0xB2);
+    devices::LaserOperationTrace trace;
+    auto tx = laser.readActual(&trace);
     CHECK(tx.ok());
-    CHECK_EQ(tx.value().frame.kind, std::string("ld_actual"));
+    CHECK(tx.value().valid);
 }
 
 {
@@ -133,41 +144,10 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(stream);
     devices::Laser laser(link);
-    auto tx = laser.read(0xB2);
+    devices::LaserOperationTrace trace;
+    auto tx = laser.readActual(&trace);
     CHECK(!tx.ok());
     CHECK_EQ(tx.error().code, std::string("ambiguous_reply"));
-}
-
-{
-    CASE(laser_read_rejects_non_read_command);
-    FakeLink link;
-    devices::Laser laser(link);
-    auto tx = laser.read(0x11);   // 0x11 是写指令
-    CHECK(!tx.ok());
-    CHECK(tx.error().kind == ErrorKind::invalid_argument);
-    CHECK_EQ(link.sent.size(), size_t(0));   // 非法命令不应该上网
-}
-
-{
-    CASE(laser_write_is_policy_free);
-    // 关键：驱动层不阻止任何写指令，包括"通常需要门禁"的 0x34 单次触发。
-    FakeLink link;
-    devices::Laser laser(link);
-    auto tx = laser.write(0x34, {0x00});
-    CHECK(tx.ok());
-    CHECK_EQ(to_hex(link.sent[0].request), to_hex(laser::make_write_frame(0x34, {0x00})));
-    CHECK_EQ(to_hex(tx.value().request), to_hex(laser::make_write_frame(0x34, {0x00})));
-}
-
-{
-    CASE(laser_send_single_byte_value);
-    FakeLink link;
-    devices::Laser laser(link);
-    auto tx = laser.send(0x21, 0x01);   // 工作状态 = 1
-    CHECK(tx.ok());
-    CHECK_EQ(link.sent[0].request.size(), size_t(8));
-    CHECK_EQ(int(link.sent[0].request[4]), 0x21);
-    CHECK_EQ(int(link.sent[0].request[5]), 0x01);
 }
 
 {
@@ -175,7 +155,8 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(laser_b2_reply(), /*errors=*/3);
     devices::Laser laser(link);
-    auto tx = laser.read(0xB2);
+    devices::LaserOperationTrace trace;
+    auto tx = laser.readActual(&trace);
     CHECK(!tx.ok());
     CHECK(tx.error().kind == ErrorKind::transport);
     CHECK_EQ(tx.error().code, std::string("uart_errors"));
@@ -186,7 +167,8 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.fail_next = true;
     devices::Laser laser(link);
-    auto tx = laser.read(0xB2);
+    devices::LaserOperationTrace trace;
+    auto tx = laser.readActual(&trace);
     CHECK(!tx.ok());
     CHECK(tx.error().kind == ErrorKind::transport);
     CHECK_EQ(tx.error().code, std::string("cable_unplugged"));
@@ -199,15 +181,15 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(modbus_read_reply(1, 0x0200, 3, {10, 0xFFFF, 1234}));
     devices::Rangefinder rf(link);
-    auto read = rf.read(1, 0x0200, 3);
+    auto read = rf.readRawRegisters(0x0200, 3);
     CHECK(read.ok());
     CHECK_EQ(to_hex(link.sent[0].request), to_hex(rangefinder::make_read_request(1, 0x0200, 3)));
-    CHECK_EQ(read.value().reading.registers.size(), size_t(3));
-    CHECK_EQ(int(read.value().reading.registers[0].raw), 10);
-    CHECK(read.value().reading.registers[0].valid);
-    CHECK(!read.value().reading.registers[1].valid);    // 0xFFFF 哨兵
-    CHECK_EQ(int(read.value().reading.registers[2].raw), 1234);
-    CHECK_EQ(read.value().reading.address, 1);
+    CHECK_EQ(read.value().registers.size(), size_t(3));
+    CHECK_EQ(int(read.value().registers[0].raw), 10);
+    CHECK(read.value().registers[0].valid);
+    CHECK(!read.value().registers[1].valid);    // 0xFFFF 哨兵
+    CHECK_EQ(int(read.value().registers[2].raw), 1234);
+    CHECK_EQ(read.value().address, 1);
 }
 
 {
@@ -218,17 +200,17 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(stream);
     devices::Rangefinder rf(link);
-    auto read = rf.read(1, 0x0200, 2);
+    auto read = rf.readRawRegisters(0x0200, 2);
     CHECK(read.ok());
-    CHECK_EQ(read.value().reading.registers.size(), size_t(2));
-    CHECK_EQ(int(read.value().reading.registers[0].raw), 5);
+    CHECK_EQ(read.value().registers.size(), size_t(2));
+    CHECK_EQ(int(read.value().registers[0].raw), 5);
 }
 
 {
     CASE(rangefinder_rejects_bad_range_without_io);
     FakeLink link;
     devices::Rangefinder rf(link);
-    auto read = rf.read(1, 0x0200, 0);   // count=0 非法
+    auto read = rf.readRawRegisters(0x0200, 0);   // count=0 非法
     CHECK(!read.ok());
     CHECK(read.error().kind == ErrorKind::invalid_argument);
     CHECK_EQ(link.sent.size(), size_t(0));
@@ -243,7 +225,7 @@ TEST_MAIN_BEGIN()
     FakeLink link;
     link.queue(exception);
     devices::Rangefinder rf(link);
-    auto read = rf.read(1, 0x0200, 2);
+    auto read = rf.readRawRegisters(0x0200, 2);
     CHECK(!read.ok());
     CHECK(read.error().kind == ErrorKind::device);
     CHECK_EQ(read.error().code, std::string("modbus_exception"));
@@ -251,7 +233,7 @@ TEST_MAIN_BEGIN()
 
 // -- Indicator ---------------------------------------------------------------
 {
-    CASE(indicator_query_decodes_state);
+    CASE(indicator_apply_verifies_state);
     // 科隆威私有 8 字节回包：地址 功能码 00 寄存器号 00 状态 CRC
     const std::uint16_t reg = indicator::query_register(indicator::Channel::red);
     Bytes state{0x01, 0x01, 0x00, static_cast<std::uint8_t>(reg), 0x00, 0x00};
@@ -260,23 +242,17 @@ TEST_MAIN_BEGIN()
     state.push_back(static_cast<std::uint8_t>(crc >> 8));
     FakeLink link;
     link.queue(concat({indicator::make_query_request(1, indicator::Channel::red), state}));
-    devices::Indicator lamp(link);
-    auto q = lamp.query(1, indicator::Channel::red);
+    devices::Indicator lamp(link, 1, "TL50-485", 650, 0);
+    auto q = lamp.apply(indicator::Channel::red, indicator::State::off, true);
     CHECK(q.ok());
-    CHECK_EQ(int(q.value().response.raw_state), 0x00);
-    CHECK(q.value().response.state == indicator::State::off);
-    CHECK_EQ(int(q.value().response.register_address), 1);
+    CHECK(q.value().state == indicator::State::off);
 }
 
 {
     CASE(indicator_write_reports_echo);
-    const indicator::WriteRequest req{"TL50-485", indicator::Channel::green, indicator::State::on};
-    auto frame = indicator::make_write_request(1, req);
-    CHECK(frame.ok());
     FakeLink link;
-    link.queue(frame.value());     // 转换器把写帧原样回送
-    devices::Indicator lamp(link);
-    auto w = lamp.write(1, req);
+    devices::Indicator lamp(link, 1, "TL50-485", 650, 0);
+    auto w = lamp.apply(indicator::Channel::green, indicator::State::on, false);
     CHECK(w.ok());
     CHECK(w.value().write_echo_seen);
     CHECK_EQ(w.value().model, std::string("TL50-485"));
@@ -286,10 +262,9 @@ TEST_MAIN_BEGIN()
 
 {
     CASE(indicator_write_rejects_unknown_model_without_io);
-    const indicator::WriteRequest req{"MYSTERY-LAMP", indicator::Channel::red, indicator::State::on};
     FakeLink link;
-    devices::Indicator lamp(link);
-    auto w = lamp.write(1, req);
+    devices::Indicator lamp(link, 1, "MYSTERY-LAMP", 650, 0);
+    auto w = lamp.apply(indicator::Channel::red, indicator::State::on, false);
     CHECK(!w.ok());
     CHECK(w.error().kind == ErrorKind::unsupported);
     CHECK_EQ(link.sent.size(), size_t(0));

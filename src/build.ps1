@@ -8,7 +8,7 @@
     只用 g++ 和一个 PowerShell 循环，因此不挑生成器、不挑工程路径。
 
     产物都落在 build/ 下：
-      build\libs_protocols.a / libs_transport.a / libs_devices.a   三个静态库
+      build\libs_transport.a / libs_devices.a          两个静态库
       build\test_protocols.exe / test_devices.exe / test_spectrometer.exe
       build\fake_avaspec_test.dll                                  光谱仪测试替身
 
@@ -40,39 +40,44 @@ if (-not (Test-Path $ar)) { $ar = "ar" }
 
 $flags = @("-std=c++17", "-Wall", "-Wextra", "-Iinclude", "-Itests")
 
-# 三层。列表顺序即依赖顺序：protocols <- transport <- devices
+# 列表顺序即依赖顺序：transport <- devices <- business
 $layers = [ordered]@{
-    "libs_protocols" = @(
-        "src/error.cpp", "src/hex.cpp",
+    "libs_transport" = @("src/error.cpp", "src/hex.cpp", "src/transport/serial.cpp")
+    "libs_devices"   = @(
         "src/protocols/modbus_rtu.cpp", "src/protocols/laser.cpp",
         "src/protocols/rangefinder.cpp", "src/protocols/indicator.cpp",
-    "src/protocols/air_conditioner.cpp")
-    "libs_transport" = @("src/transport/serial.cpp")
-    "libs_devices"   = @(
+        "src/protocols/air_conditioner.cpp",
         "src/devices/laser.cpp", "src/devices/rangefinder.cpp",
         "src/devices/indicator.cpp", "src/devices/spectrometer.cpp",
     "src/devices/air_conditioner.cpp")
-    # 第 4 层：业务层。只在 devices 之上组装语义，不反向改驱动。
+    # 业务层。只在 devices 之上组装业务语义，不反向改驱动。
     "libs_business"  = @(
-        "src/business/time_util.cpp",
-        "src/business/json/json.cpp",
-        "src/business/config/site_config.cpp",
-        "src/business/session/device_session.cpp",
-        "src/business/policy/detection_config.cpp",
-        "src/business/policy/gate.cpp",
-        "src/business/logging/run_log.cpp",
-        "src/business/services/ac_interlock.cpp",
-        "src/business/services/business_event.cpp",
-        "src/business/services/capture.cpp",
-        "src/business/services/composition.cpp",
-        "src/business/services/data_delivery.cpp",
-        "src/business/services/environment.cpp",
-        "src/business/services/laser_fire.cpp",
-        "src/business/services/facade.cpp",
-        "src/business/services/motion.cpp",
-        "src/business/services/ore_presence.cpp",
-        "src/business/services/spectrum_stream.cpp",
-        "src/business/app/runtime.cpp")
+        # shared/：共同底座。它不认识任何业务（下面的依赖方向检查守住这条）。
+        "src/business/shared/time_util.cpp",
+        "src/business/shared/json/json.cpp",
+        "src/business/shared/config/site_config.cpp",
+        "src/business/shared/config/parameter_store.cpp",
+        "src/business/shared/session/device_session.cpp",
+        "src/business/shared/logging/run_log.cpp",
+        "src/business/shared/data_delivery.cpp",
+        # readiness/：业务一，就绪判定。
+        "src/business/readiness/facts.cpp",
+        "src/business/readiness/verdict.cpp",
+        "src/business/readiness/lamp.cpp",
+        "src/business/readiness/monitor.cpp",
+        "src/business/readiness/precheck.cpp",
+        # measurement/：业务二，激光触发光谱检测。
+        "src/business/measurement/frame.cpp",
+        "src/business/measurement/frame_bus.cpp",
+        "src/business/measurement/writer.cpp",
+        "src/business/measurement/capture_plan.cpp",
+        "src/business/measurement/job.cpp",
+        # app/：进程边界与装配。ParameterService 放这儿而不是 shared/，
+        # 因为它要引用 measurement::FireParameters / SpectrumMeasurement ——
+        # 放 shared 会直接违反下面的依赖方向检查。
+        "src/business/app/parameter_service.cpp",
+        "src/business/app/runtime.cpp",
+        "src/business/app/facade.cpp")
 }
 
 function Invoke-Checked {
@@ -81,13 +86,39 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) { throw "$What failed with exit code $LASTEXITCODE" }
 }
 
+# ── 依赖方向静态检查（方案 §2 约束 3 / §7 步骤 9）──────────────────────
+#
+# shared/ 是两个业务的**共同底座**，不属于任何一个。反向依赖一旦发生，
+# "ParameterStore 不认识 MeasurementJob" 这句话就失效了，而这种依赖一旦
+# 混进来很难在 review 时看出来 —— 所以让它在编译之前就构建失败。
+#
+# 判据极简：shared/ 下的源文件里不许出现 `business/readiness/` 或
+# `business/measurement/`。方向反了只有这一种写法，所以够用。
+Write-Host "==> checking dependency direction"
+$sharedSources = @($layers["libs_business"] | Where-Object { $_ -like "src/business/shared/*" })
+if ($sharedSources.Count -eq 0) {
+    throw "依赖方向检查没抓到任何 shared/ 源文件，规则本身失效了"
+}
+$violations = @()
+foreach ($source in $sharedSources) {
+    $hits = Select-String -Path $source -Pattern 'business/(readiness|measurement)/'
+    if ($hits) { $violations += "$source : $($hits.Line.Trim())" }
+}
+if ($violations.Count) {
+    throw "shared/ must not depend on business logic:`n$($violations -join "`n")"
+}
+Write-Host "    shared/ 反向依赖检查通过（$($sharedSources.Count) 个文件）"
+
 Write-Host "==> compiling static libraries"
 $archives = @()
 foreach ($name in $layers.Keys) {
     $archive = Join-Path $outDir "$name.a"
     $objects = @()
     foreach ($source in $layers[$name]) {
-        $object = Join-Path $outDir ("{0}.{1}.o" -f $name, [IO.Path]::GetFileNameWithoutExtension($source))
+        # 协议与控制器常有同名源文件（laser.cpp/air_conditioner.cpp），
+        # 对象名必须保留相对路径，否则后编的对象会覆盖前一个。
+        $objectSuffix = ($source -replace '[\\/]', '.') -replace '\.cpp$', ''
+        $object = Join-Path $outDir ("{0}.{1}.o" -f $name, $objectSuffix)
         Invoke-Checked "compiling $source" { & $Compiler @flags -c $source -o $object }
         $objects += $object
     }
@@ -96,12 +127,22 @@ foreach ($name in $layers.Keys) {
     $archives += $archive
     Write-Host "    $name.a"
 }
-# 静态库按依赖顺序给链接器：business -> devices -> transport -> protocols
+# 静态库按依赖顺序给链接器：business -> devices -> transport
 $linkOrder = @(
     (Join-Path $outDir "libs_devices.a"),
-    (Join-Path $outDir "libs_transport.a"),
-    (Join-Path $outDir "libs_protocols.a"))
+    (Join-Path $outDir "libs_transport.a"))
 $businessOrder = @((Join-Path $outDir "libs_business.a")) + $linkOrder
+
+# FrameQueue 是零**设备**依赖，但仍然要 json 与时间工具 —— 这两个纯函数文件
+# 不含任何设备符号。只链它们，就能让链接器本身守住"没有设备依赖"这条纪律：
+# 哪天 FrameQueue 里不小心引了激光器或光谱仪的符号，链接就会失败。
+$jsonObject  = Join-Path $outDir "libs_business.src.business.shared.json.json.o"
+$timeObject  = Join-Path $outDir "libs_business.src.business.shared.time_util.o"
+$frameObject = Join-Path $outDir "libs_business.src.business.measurement.frame_bus.o"
+# frame.o 只含 SpectrumFrame/ChannelFrame 的结构与序列化，零设备依赖 ——
+# 与 frame_bus.o 一起链进来，同样是为了让链接器守住这条纪律。
+$frameStructObject = Join-Path $outDir "libs_business.src.business.measurement.frame.o"
+$frameQueueOrder = @($frameObject, $frameStructObject, $jsonObject, $timeObject) + $linkOrder
 
 Write-Host "==> compiling the AvaSpec stand-in DLL"
 $fakeDll = Join-Path $outDir "fake_avaspec_test.dll"
@@ -134,14 +175,16 @@ $tests = [ordered]@{
     "test_devices"      = @("tests/test_devices.cpp",      $linkOrder)
     "test_air_conditioner_protocol" = @("tests/test_air_conditioner_protocol.cpp", $linkOrder)
     "test_air_conditioner_device"   = @("tests/test_air_conditioner_device.cpp",   $linkOrder)
+    "test_device_actions"           = @("tests/test_device_actions.cpp",           $linkOrder)
     "test_spectrometer" = @("tests/test_spectrometer.cpp", $linkOrder)
     "test_business_core"     = @("tests/test_business_core.cpp",     $businessOrder)
     "test_business_services" = @("tests/test_business_services.cpp", $businessOrder)
     "test_business_facade"   = @("tests/test_business_facade.cpp",   $businessOrder)
     # IPC 测试直接调用 handle_line，不真的建管道，所以不拖 main.cpp。
     "test_business_ipc"      = @("tests/test_business_ipc.cpp", $ipcOrder)
-    "test_laser_fire"        = @("tests/test_laser_fire.cpp",       $businessOrder)
-    "test_spectrum_stream"   = @("tests/test_spectrum_stream.cpp",  $businessOrder)
+    # 帧队列零设备依赖：故意**不链** business 库，让 build 强制保证这一点。
+    "test_frame_queue"       = @("tests/test_frame_queue.cpp",      $frameQueueOrder)
+    "test_measurement_job"   = @("tests/test_measurement_job.cpp",  $businessOrder)
 }
 foreach ($name in $tests.Keys) {
     $source = $tests[$name][0]

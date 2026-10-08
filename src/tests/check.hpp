@@ -4,11 +4,13 @@
 // 每个 CHECK 失败会打印用例名、文件、行号和实际值，进程退出码非 0 表示失败。
 
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 #include <sstream>
 #include <string>
 #include <type_traits>
 #include <typeinfo>
+#include <vector>
 #include "libs/error.hpp"
 
 namespace testing {
@@ -80,6 +82,37 @@ inline bool testable(const T& value) {
 struct Case {
     explicit Case(const char* name) { begin_case(name); }
 };
+
+// ── scratch 登记簿 ──────────────────────────────────────────────────────
+// 测试把 Runtime 的 data_dir 指到 build/tmp_<suite>_<tag>，跑完就该消失。
+// 过去没人回收，于是每 build 一次 build/ 就多几十个目录，几轮之后
+// 光残留就 1.2 MB，而且分不清哪个是当前的产物、哪个是上两轮的垃圾。
+// 这里统一登记：进程退出前（finish）一次性删掉，测试之间的顺序、失败
+// 中途退出都无所谓 —— 失败时目录留着反而有用，所以只在正常收尾时清。
+inline std::vector<std::string>& scratch_paths() {
+    static std::vector<std::string> paths;
+    return paths;
+}
+
+// 返回一个尚未创建的路径，并登记下来等 finish() 删除。
+// 传 want_dir=false 表示这是个待清理的普通文件（如临时 json）。
+inline std::string scratch(const std::string& path, bool want_dir = true) {
+    (void)want_dir;
+    scratch_paths().push_back(path);
+    return path;
+}
+
+inline void purge_scratch() {
+    std::error_code ec;
+    for (const std::string& path : scratch_paths()) {
+        if (std::filesystem::is_directory(path, ec)) {
+            std::filesystem::remove_all(path, ec);
+        } else {
+            std::filesystem::remove(path, ec);
+        }
+    }
+    scratch_paths().clear();
+}
 
 int finish(const char* suite);
 
