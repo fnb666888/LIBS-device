@@ -138,6 +138,10 @@ EXPORT int __stdcall AVS_PrepareMeasure(int h, unsigned char* p) {
 EXPORT int __stdcall AVS_Measure(int h, void*, short n) {
     if (h < 1 || h > 3) return -1;
     if (n != 1) ++counters[6];
+    // mode 7：只让**第一发**真的布防，其余发次不 arm。
+    // 模拟"出光窗口内实际只来得了 1 发触发"——驱动应当在后续发次上等到
+    // deadline，并且**保留已经采到的那张谱**，而不是把整次采集判失败、全丢。
+    if (mode == 7 && counters[1] >= 1) return 0;
     armed[h - 1] = true;
     pending[h - 1] = true;
     ++counters[1];

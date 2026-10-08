@@ -47,7 +47,7 @@ $layers = [ordered]@{
         "src/protocols/modbus_rtu.cpp", "src/protocols/laser.cpp",
         "src/protocols/rangefinder.cpp", "src/protocols/indicator.cpp",
         "src/protocols/air_conditioner.cpp", "src/protocols/su300.cpp")
-    "libs_transport" = @("src/transport/serial.cpp")
+    "libs_transport" = @("src/transport/serial.cpp", "src/transport/serial_timing.cpp")
     "libs_devices"   = @(
         "src/devices/laser.cpp", "src/devices/rangefinder.cpp",
         "src/devices/indicator.cpp", "src/devices/spectrometer.cpp",
@@ -138,6 +138,7 @@ $tests = [ordered]@{
     "test_air_conditioner_protocol" = @("tests/test_air_conditioner_protocol.cpp", $linkOrder)
     "test_air_conditioner_device"   = @("tests/test_air_conditioner_device.cpp",   $linkOrder)
     "test_su300"          = @("tests/test_su300.cpp",          $linkOrder)
+    "test_serial_timing"  = @("tests/test_serial_timing.cpp",  $linkOrder)
     "test_spectrometer" = @("tests/test_spectrometer.cpp", $linkOrder)
     "test_business_core"     = @("tests/test_business_core.cpp",     $businessOrder)
     "test_business_services" = @("tests/test_business_services.cpp", $businessOrder)

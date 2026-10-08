@@ -28,6 +28,7 @@ json::Value to_json(const ChannelFrame& channel) {
         return v;
     }
     v.set("pixels", json::Value(static_cast<double>(channel.pixels)));
+    v.set("decimate", json::Value(static_cast<double>(channel.decimate == 0 ? 1 : channel.decimate)));
 
     // 波长与 counts 是两个等长数组。原样上送，**不做归一化/基线扣除/平均**。
     // UI 要归一化自己算：把显示口径写死在业务层，改口径就得改库。
@@ -90,6 +91,12 @@ void SpectrumStream::set_options(Options options) {
     std::lock_guard<std::mutex> lock(mutex_);
     options_ = std::move(options);
 }
+
+SpectrumStream::Options SpectrumStream::options() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return options_;
+}
+
 
 libs::VoidResult SpectrumStream::start() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -194,6 +201,8 @@ void SpectrumStream::release_lease() {
 
 void SpectrumStream::loop() {
     while (!stopping_.load()) {
+        const auto cycle_start = std::chrono::steady_clock::now();
+
         // 租约被一次性采集（出光/单次 capture）持有时，**跳过这一轮**。
         // 不排队、不等待：见文件头背压说明。流的价值是节奏稳定。
         bool skip = false;
@@ -206,12 +215,23 @@ void SpectrumStream::loop() {
             publish(frame);
         }
 
-        // 睡到下一帧。sleep 期间不持锁：stop() 要能立刻把标志位改掉。
-        double sleep_ms = 200.0;
+        // 睡到下一帧 —— **限流语义，不是固定追加延时**。
+        //
+        // 这里曾经是"取完一帧，再睡满 min_period_ms"。那是加法：
+        // 跟随激光触发时 acquire_frame() 本身就要等一个激光周期（等 pin6 的 TTL），
+        // 再睡一个周期，实际周期就成了两倍 —— 现场表现正是
+        // **"两发激光出一帧"**（1 Hz 激光：等 1 s + 睡 1 s = 2 s 一帧）。
+        //
+        // 现在只睡**差额**：周期从本轮开始计时，已经花在采集/传输上的时间要扣掉。
+        // 这样"min_period_ms = 一个激光周期"才真的等于"一发出一帧"。
+        double target_ms = 200.0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (options_.min_period_ms > 0) sleep_ms = static_cast<double>(options_.min_period_ms);
+            if (options_.min_period_ms > 0) target_ms = static_cast<double>(options_.min_period_ms);
         }
+        const double elapsed_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - cycle_start).count();
+        const double sleep_ms = target_ms > elapsed_ms ? (target_ms - elapsed_ms) : 0.0;
         // 分片睡眠，让 stop() 的响应更快（最坏延迟 = 一个小片段）。
         constexpr int kSlices = 10;
         for (int i = 0; i < kSlices && !stopping_.load(); ++i) {
@@ -318,8 +338,23 @@ SpectrumFrame SpectrumStream::acquire_frame() {
             channel.serial = spectrum.serial;
             channel.pixels = spectrum.pixels;
             channel.device_time_ticks = spectrum.device_time_ticks;
-            channel.wavelength_nm = spectrum.wavelength_nm;
-            channel.counts = spectrum.counts;
+            // 抽稀：每隔 decimate 个点取一个。pixels 仍报**真实像素数**，
+            // 界面用 pixels / counts.size() 就能看出本帧被抽稀了多少。
+            const unsigned step = options_.decimate == 0 ? 1 : options_.decimate;
+            channel.decimate = step;
+            if (step <= 1) {
+                channel.wavelength_nm = spectrum.wavelength_nm;
+                channel.counts = spectrum.counts;
+            } else {
+                channel.wavelength_nm.reserve(spectrum.wavelength_nm.size() / step + 1);
+                channel.counts.reserve(spectrum.counts.size() / step + 1);
+                for (std::size_t k = 0; k < spectrum.counts.size(); k += step) {
+                    channel.counts.push_back(spectrum.counts[k]);
+                    if (k < spectrum.wavelength_nm.size()) {
+                        channel.wavelength_nm.push_back(spectrum.wavelength_nm[k]);
+                    }
+                }
+            }
             if (!spectrum.wavelength_nm.empty() && !spectrum.counts.empty()) {
                 channel.state = ChannelState::present;
             } else {

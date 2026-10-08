@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
+
+#include "ui_log.hpp"
 
 #include <QJsonArray>
 #include <QMutexLocker>
@@ -50,15 +53,13 @@ protected:
                         }, Qt::QueuedConnection);
                 }
             } catch (const QString& e) {
-                const QString message = e;
-                QMetaObject::invokeMethod(
-                    owner_, [owner = owner_, session = session_, message]() {
-                        owner->deliver_error(session, message);
-                    }, Qt::QueuedConnection);
-                // 错误时降低重试频率，避免管道故障时高频重试把单实例
-                // 命名管道占满，进而把状态轮询也误报成 Win32 231。
-                QMutexLocker lock(&wake_mutex_);
-                wake_.wait(&wake_mutex_, 750);
+                publish_error(e);
+            } catch (const std::exception& e) {
+                // 与 StatusPoller 同理：非 QString 异常以前会穿出 run()，
+                // 那是 std::terminate —— 进程当场消失。
+                publish_error(QStringLiteral("取帧线程异常：%1").arg(QString::fromUtf8(e.what())));
+            } catch (...) {
+                publish_error(QStringLiteral("取帧线程未知异常（非 QString / 非 std::exception）"));
             }
 
             // UI 请求的 min_period_ms 是 1000；每 250 ms 检查一次足够把
@@ -73,6 +74,18 @@ protected:
     }
 
 private:
+    // 三种 catch 共用的收尾：把错误送回 UI 线程，并降速重试
+    // （管道故障时高频重试会把单实例命名管道占满，
+    // 进而把状态轮询也误报成 Win32 231）。
+    void publish_error(const QString& message) {
+        QMetaObject::invokeMethod(
+            owner_, [owner = owner_, session = session_, message]() {
+                owner->deliver_error(session, message);
+            }, Qt::QueuedConnection);
+        QMutexLocker lock(&wake_mutex_);
+        wake_.wait(&wake_mutex_, 750);
+    }
+
     PipeClient client_;
     StreamPoller* owner_;
     qint64 session_;
@@ -130,11 +143,22 @@ void StreamPoller::close() {
     subscriber_ = -1;
     if (worker_) {
         worker_->request_stop();
-        if (!worker_->wait(2000)) {
-            worker_->terminate();
-            worker_->wait(200);
+        // **绝不 terminate()**，理由与 StatusPoller::stop() 相同：
+        // TerminateThread 会在线程执行 Win32 调用的中途把它杀掉，
+        // 堆和互斥量都可能就此损坏。这里的线程只调 spectrum_stream
+        // （不取设备锁，通常很快就回），等不到就留着它自己退。
+        constexpr int kJoinWaitMs = 12000;
+        if (worker_->wait(kJoinWaitMs)) {
+            delete worker_;
+        } else {
+            // **不能 delete 一个还在跑的 QThread**：析构会直接崩。
+            // 交给它自己的 finished 信号自删；close() 立刻放手。
+            ui_log("ERROR", QStringLiteral(
+                "取帧线程 %1 ms 内没有退出，交给 finished 自删（没有强杀）。")
+                .arg(kJoinWaitMs));
+            QThread* dying = worker_;
+            connect(dying, &QThread::finished, dying, &QObject::deleteLater);
         }
-        delete worker_;
         worker_ = nullptr;
     }
     if (was_open && old_subscriber >= 0) {

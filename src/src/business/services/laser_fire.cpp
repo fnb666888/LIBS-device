@@ -184,6 +184,20 @@ libs::Result<FireRecord> LaserFireService::fire_and_capture(const FireParameters
     // 打得好好的。这个坑真机上踩过一次。
     libs::devices::Spectrometer* spectrometer = runtime_.devices().spectrometer();
     CapturePace pace = CaptureCoordinator::pace_from_config(runtime_.config());
+    // 出光窗口内激光会连续放电 N 发（N = 频率 x 保持秒数），采集必须**逐发布防**：
+    // 光谱仪每发只布防一次测量，收到一次 pin 6 触发就出图返回。过去 scans 一律取 1，
+    // 于是只有第 1 发的 TTL 找到在等的测量，其余几发被硬件无声丢弃（"N 发出一张谱"）。
+    // 现场要求激光频率与光谱仪采集频率**同步**，这一步就是把它落成硬约束。
+    {
+        const config::LaserFireConfig& lf = runtime_.config().laser_fire;
+        const libs::VoidResult scans_ok = CaptureCoordinator::validate_scans(lf);
+        // 校验发生在**任何设备写之前**，所以拒绝时一条写指令都不会发出去。
+        if (!scans_ok) return scans_ok.error();
+        const libs::VoidResult rate_ok = CaptureCoordinator::validate_rate_match(
+            lf, runtime_.config().integration_ms, runtime_.config().spectrometer.integration_delay_ns);
+        if (!rate_ok) return rate_ok.error();
+        pace.scans = lf.scans > 0 ? lf.scans : CaptureCoordinator::expected_discharges(lf);
+    }
     // **界面上的数字就是本次要用的数字**：积分时间与等触发超时以本次请求为准。
     // 不这么接的话，界面里那两个框就是骗人的（能调、不生效）。
     pace.integration_ms = params.integration_ms;

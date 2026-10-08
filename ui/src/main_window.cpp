@@ -1,5 +1,6 @@
 #include "main_window.hpp"
 #include "debug_window.hpp"
+#include "ui_log.hpp"
 
 #include <QAction>
 #include <QApplication>
@@ -274,12 +275,18 @@ void MainWindow::build_header(QWidget* host) {
     row->addWidget(gate_pill_);
 
     auto* debug_button = new QPushButton(QStringLiteral("调试台"), bar);
-    debug_button->setToolTip(QStringLiteral("打开手动设备与接口调试台；不会启动自动联动编排"));
+    // 开关语义：调试台是独立窗口，关掉之后这个按钮要能把它再打开。
+    // （以前这里只 show 不 hide，且调试台是子控件、关不掉，只能整体退出程序。）
+    debug_button->setToolTip(QStringLiteral("打开/关闭手动设备与接口调试台；不会启动自动联动编排"));
     connect(debug_button, &QPushButton::clicked, this, [this] {
         if (!debug_window_) debug_window_ = new DebugWindow(this);
-        debug_window_->show();
-        debug_window_->raise();
-        debug_window_->activateWindow();
+        if (debug_window_->isVisible()) {
+            debug_window_->close();
+        } else {
+            debug_window_->show();
+            debug_window_->raise();
+            debug_window_->activateWindow();
+        }
     });
     row->addWidget(debug_button);
 
@@ -758,7 +765,8 @@ void MainWindow::start_stream() {
                                     // 一帧四通道 2048 点，序列化 + 过管道实测约 800 ms。
                                     // 按默认 200 ms 产帧客户端永远追不上（队列一路丢帧、
                                     // 界面一直空）。这里按 1 秒一拍，前端稳稳跟得上。
-                                    {QStringLiteral("min_period_ms"), 1000}});
+                                    {QStringLiteral("min_period_ms"), preview_period_ms()},
+                                    {QStringLiteral("decimate"), preview_decimate()}});
     } catch (const QString& e) {
         set_banner(QStringLiteral("启动失败：%1").arg(e), 2);
         QMessageBox::warning(this, QStringLiteral("启动流失败"), e);
@@ -899,7 +907,8 @@ void MainWindow::on_start_detection() {
         client_.command(QStringLiteral("spectrum_stream"),
                         QJsonObject{{QStringLiteral("action"), QStringLiteral("start")},
                                     {QStringLiteral("follow_site_trigger_mode"), follow},
-                                    {QStringLiteral("min_period_ms"), 1000}});
+                                    {QStringLiteral("min_period_ms"), preview_period_ms()},
+                                    {QStringLiteral("decimate"), preview_decimate()}});
         preview_started = poller_->open();
         if (!preview_started) {
             // 后端流已启动但订阅失败时，不能留下无人消费的生产者。
@@ -1169,25 +1178,92 @@ void MainWindow::on_fire_failed(const QString& message) {
     }
 }
 
+// ── 预览流的节奏与抽稀 ──────────────────────────────────────────────────────
+//
+// 预览要跟得上激光，必须解决**吞吐**而不是只调周期：
+// 一帧四通道 2048 点的 JSON 序列化 + 过管道实测约 800 ms（见下方注释），
+// 所以把 min_period_ms 调小只会让队列一路丢帧，波形看着更不连续。
+//
+// 做法：
+//   * 抽稀倍数 decimate —— 单帧体积降 N 倍，传输耗时也降到约 800/N ms；
+//   * 周期 —— 取激光周期（1000/frequency_hz），让"一帧一次放电"具备可能；
+//   * 频率未知时**不猜**：退回保守的 1000 ms + 不抽稀，
+//     宁可慢也不假装跟上（"跟得上"必须是可核验的事实，不是声明）。
+//
+// 抽稀是**取真实点的子集**，不插值、不平滑、不补齐；倍数随帧如实上报
+// （frame.decimate），界面标注"已抽稀"，不让人把抽稀波形当全分辨率数据。
+int MainWindow::preview_decimate() const {
+    const double hz = preview_laser_frequency_hz();
+    if (!(hz > 0.0)) return 1;
+    const double laser_period_ms = 1000.0 / hz;
+    // 目标：单帧传输耗时（约 800/decimate ms）不超过激光周期的四成，
+    // 留出读帧、建帧与管道往返的余量；上限 64 与后端一致。
+    int decimate = 1;
+    while (decimate < 64 && (800.0 / decimate) > laser_period_ms * 0.4) decimate *= 2;
+    return decimate;
+}
+
+int MainWindow::preview_period_ms() const {
+    const double hz = preview_laser_frequency_hz();
+    if (!(hz > 0.0)) return 1000;          // 频率未知：慢但不撒谎
+    const double laser_period_ms = 1000.0 / hz;
+    int period = static_cast<int>(laser_period_ms + 0.5);
+    if (period < 20) period = 20;          // 后端下限保护，避免把设备跑满
+    return period;
+}
+
+double MainWindow::preview_laser_frequency_hz() const {
+    // 与出光用的是**同一个值**：界面上"工作频率"那一项。
+    // 取不到就返回 0 —— 上层据此退回保守设置，不猜一个 Hz。
+    for (std::size_t i = 0; i < sizeof(kLaserFields) / sizeof(FieldSpec); ++i) {
+        const FieldSpec& fs = kLaserFields[i];
+        if (!fs.over[0]) continue;
+        if (std::string(fs.over) != "frequency_hz") continue;
+        const auto it = laser_fields_.constFind(QString::fromUtf8(fs.key));
+        if (it == laser_fields_.constEnd() || !it.value()) return 0.0;
+        const QJsonValue v = it.value()->value();
+        return v.isDouble() ? v.toDouble() : 0.0;
+    }
+    return 0.0;
+}
+
 QJsonObject MainWindow::current_fire_args() const {
     // 本次参数：**界面上显示的就是实际要用的**。
     // 键名映射写在 FieldSpec::over 里，只有那一处需要同步。
-    const auto collect = [](const FieldSpec* specs, std::size_t count, const ParamMap& fields) {
+    // skip_zero：把 0 当作"这一项没填"，不发这个键。
+    //
+    // 为什么激光参数必须跳过 0：后端的契约是"args.laser 的字段必须是**正整数**"，
+    // 0 会被判成未设置并**整体拒绝出光**（laser_overrides_bad）。
+    // 而出光参数没有一个能合法取 0 —— 协议量程下限是 15 A / 50 us / 1 Hz / 2 us，
+    // 界面上没填的输入框读出来恰恰就是 0。于是现场出现的是：
+    // 面板上只填了输出电流，连出光都点不下去（ui.log 里那 4 条
+    // "args.laser 必须字段被设成 0 或负数"）。
+    //
+    // 正确语义是"没填 = 不覆盖，用站点配置"，也就是**不发这个键**。
+    //
+    // 光谱仪的字段**不能**套用这条：那里 0 是合法值
+    // （例如积分延时 0 = 收到触发立刻积分）。
+    const auto collect = [](const FieldSpec* specs, std::size_t count, const ParamMap& fields,
+                            bool skip_zero) {
         QJsonObject out;
         for (std::size_t i = 0; i < count; ++i) {
             const FieldSpec& fs = specs[i];
             if (!fs.over[0]) continue;
             const auto it = fields.constFind(QString::fromUtf8(fs.key));
             if (it == fields.constEnd() || !it.value()) continue;
-            out.insert(QString::fromUtf8(fs.over), it.value()->value());
+            const QJsonValue v = it.value()->value();
+            if (skip_zero && v.isDouble() && v.toDouble() == 0.0) continue;
+            out.insert(QString::fromUtf8(fs.over), v);
         }
         return out;
     };
     QJsonObject args;
     args.insert(QStringLiteral("laser"),
-                collect(kLaserFields, sizeof(kLaserFields) / sizeof(FieldSpec), laser_fields_));
+                collect(kLaserFields, sizeof(kLaserFields) / sizeof(FieldSpec), laser_fields_,
+                        /*skip_zero=*/true));
     args.insert(QStringLiteral("spectrometer"),
-                collect(kSpecFields, sizeof(kSpecFields) / sizeof(FieldSpec), spec_fields_));
+                collect(kSpecFields, sizeof(kSpecFields) / sizeof(FieldSpec), spec_fields_,
+                        /*skip_zero=*/false));
     // 与后端约定的显式触发方向。缺省值保持旧版本行为，避免升级 UI 后
     // 误把既有“激光器 → 光谱仪”接线切到反向。
     args.insert(QStringLiteral("trigger_direction"),
@@ -1229,7 +1305,8 @@ void MainWindow::on_run_continuous() {
                         QJsonObject{{QStringLiteral("action"), QStringLiteral("start")},
                                     {QStringLiteral("follow_site_trigger_mode"),
                                      follow_trigger_ != nullptr && follow_trigger_->isChecked()},
-                                    {QStringLiteral("min_period_ms"), 1000}});
+                                    {QStringLiteral("min_period_ms"), preview_period_ms()},
+                                    {QStringLiteral("decimate"), preview_decimate()}});
         if (!poller_->open()) {
             log_line(Level::Warn, QStringLiteral("连续出光：订阅预览流失败，本次只能出光、看不到谱。"));
         }
@@ -1446,9 +1523,23 @@ void MainWindow::on_snapshot() { render_snapshot(state_poller_->snapshot()); }
 void MainWindow::render_snapshot(const MachineSnapshot& s) {
     // 三态第一层：管道都不通，就明说"数据已过期"，而不是把上一帧当成现在。
     if (!s.valid) {
-        daemon_dot_->set_state(Level::Danger, QStringLiteral("守护进程 未连接"),
-                               s.error.isEmpty() ? client_.pipe_name()
-                                                 : s.error);
+        const QString detail = s.error.isEmpty() ? client_.pipe_name() : s.error;
+        if (s.daemon_busy) {
+            // 忙 ≠ 断。ping 通说明守护进程在服务，只是设备锁被长操作
+            // （出光 / 采集 / 运动）占着，这一帧 status 排不上队。
+            // 报成"未连接"的代价不只是措辞：update_offline_overlay() 会盖上
+            // "设备离线"的阻断遮罩，出光进行中连"停止出光"都点不到。
+            // 所以这里用黄色、并且不遮罩。
+            daemon_dot_->set_state(Level::Warn,
+                                   QStringLiteral("守护进程 忙（设备操作进行中）"), detail);
+            daemon_dot_->set_pulsing(true);
+            set_banner(QStringLiteral("设备操作进行中，状态刷新暂时落后（这不是掉线）：%1")
+                           .arg(detail),
+                       1);
+            update_offline_overlay();
+            return;
+        }
+        daemon_dot_->set_state(Level::Danger, QStringLiteral("守护进程 未连接"), detail);
         daemon_dot_->set_pulsing(false);
         set_banner(QStringLiteral("⚠ 与守护进程通信中断，画面数据可能已过期：%1")
                        .arg(s.error.isEmpty() ? QStringLiteral("(无错误信息)") : s.error),
@@ -1734,6 +1825,13 @@ void MainWindow::log_line(Level level, const QString& text) {
     // 保留最近 1000 条：超出就丢最旧的。QListWidget 不自带这个上限。
     while (log_view_->count() > 1000) delete log_view_->takeItem(0);
     log_view_->scrollToBottom();
+    // 同一行同时落盘。面板只活在内存里，进程一消失就全没了 ——
+    // 而"界面为什么消失"恰恰要靠消失前那几行消息定性。
+    const char* disk_level = level == Level::Danger  ? "ERROR"
+                           : level == Level::Warn    ? "WARN"
+                           : level == Level::Ok      ? "OK"
+                                                     : "INFO";
+    ui_log(disk_level, text);
 }
 
 void MainWindow::on_export_log() {
@@ -1833,7 +1931,11 @@ void MainWindow::update_offline_overlay() {
     const MachineSnapshot s = state_poller_->snapshot();
     QStringList reasons;
     if (!s.valid) {
-        reasons << QStringLiteral("与守护进程通信中断，请确认 businessd 正在运行");
+        // "忙"不遮罩。status 排不上队只说明刷新落后，设备并没有掉线；
+        // 而遮罩是真的挡住按钮 —— 出光进行中点不到"停止出光"是不可接受的。
+        if (!s.daemon_busy) {
+            reasons << QStringLiteral("与守护进程通信中断，请确认 businessd 正在运行");
+        }
     } else {
         for (const char* n : {"激光器", "光谱仪"}) {
             const DeviceHealth* d = s.device(QString::fromUtf8(n));
@@ -1940,6 +2042,10 @@ void MainWindow::on_trigger_direction_changed(int index) {
 
 
 void MainWindow::closeEvent(QCloseEvent* event) {
+    // 记一笔：这一行把"人按了 X / 窗口被关闭"与"进程被别的原因弄死"分开。
+    // 2026-10-07 现场反复出现"界面完全消失"时没有任何日志，
+    // 只能靠计划任务的退出码反推是不是正常退出。
+    ui_log("WARN", QStringLiteral("主窗口收到关闭请求（closeEvent）；这是正常退出路径，进程随后结束"));
     if (state_poller_) state_poller_->stop();
     if (poller_ && poller_->is_open()) stop_stream();
     event->accept();

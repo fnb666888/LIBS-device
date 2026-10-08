@@ -495,4 +495,73 @@ CASE(ac_interlock_communication_failure_is_unsupported); {
     if (!result.ok()) CHECK(is_unsupported(result.error()));
 }
 
+
+// ── 出光窗口内期望的放电发数：派生 + 自洽校验 ────────────────────────────────
+//
+// 背景：`AVS_Measure` 每发只布防一次测量，收到一次触发就出图返回。
+// 出光窗口里激光会连续放电 N 发（N = 频率 × 保持时长），
+// 而采集过去把 scans 写死成 1 —— 于是只有第 1 发的 TTL 找到在等的测量，
+// 其余几发全部无声丢弃："N 发出一张谱"。
+// 现在按窗口发数逐发收谱；配置值与派生值不一致时**直接拒绝**，
+// 不允许静默少采。
+
+{
+    CASE(expected_discharges_is_frequency_times_hold_window);
+    config::LaserFireConfig fire;
+    fire.frequency_hz = 1;  fire.emission_hold_ms = 3000;   // 现网配置
+    CHECK_EQ(services::CaptureCoordinator::expected_discharges(fire), 3u);
+    fire.frequency_hz = 10; fire.emission_hold_ms = 500;
+    CHECK_EQ(services::CaptureCoordinator::expected_discharges(fire), 5u);
+    fire.frequency_hz = 2;  fire.emission_hold_ms = 2500;
+    CHECK_EQ(services::CaptureCoordinator::expected_discharges(fire), 5u);
+}
+
+{
+    CASE(expected_discharges_is_never_zero_even_for_a_short_window);
+    // 窗口短于一个周期时至少算 1 发：出光一旦发生，就不可能采 0 张。
+    config::LaserFireConfig fire;
+    fire.frequency_hz = 1;  fire.emission_hold_ms = 400;
+    CHECK_EQ(services::CaptureCoordinator::expected_discharges(fire), 1u);
+    fire.frequency_hz = 0;  fire.emission_hold_ms = 3000;
+    CHECK_EQ(services::CaptureCoordinator::expected_discharges(fire), 1u);
+}
+
+{
+    CASE(configured_scans_must_agree_with_the_fire_window);
+    config::LaserFireConfig fire;
+    fire.frequency_hz = 1;  fire.emission_hold_ms = 3000;   // 派生 = 3
+
+    fire.scans = 0;   // 未配置 -> 用派生值，允许
+    CHECK(services::CaptureCoordinator::validate_scans(fire).ok());
+
+    fire.scans = 3;   // 与派生一致，允许
+    CHECK(services::CaptureCoordinator::validate_scans(fire).ok());
+
+    fire.scans = 2;   // 少配 -> 拒绝（会静默少采一发）
+    CHECK(!services::CaptureCoordinator::validate_scans(fire).ok());
+
+    fire.scans = 5;   // 多配 -> 也拒绝（后几发等不到触发，整次采集白等）
+    CHECK(!services::CaptureCoordinator::validate_scans(fire).ok());
+}
+
+
+{
+    CASE(spectrometer_must_keep_up_with_the_laser_repetition_rate);
+    // "激光器的频率和光谱仪采集的频率必须同步"是一条硬约束：
+    // 一个激光周期内光谱仪要能完整跑完「触发 → 延时 → 积分」。
+    // 跟不上就会丢发 / 错发，采到的谱与放电发次对不上。
+    config::LaserFireConfig fire;
+    fire.frequency_hz = 1;
+    CHECK(services::CaptureCoordinator::validate_rate_match(fire, 1.05, 1280.0).ok());
+
+    fire.frequency_hz = 10;          // 周期 100 ms，远大于 1.05 ms 积分
+    CHECK(services::CaptureCoordinator::validate_rate_match(fire, 1.05, 1280.0).ok());
+
+    fire.frequency_hz = 1000;        // 周期 1 ms < 积分 1.05 ms -> 跟不上
+    CHECK(!services::CaptureCoordinator::validate_rate_match(fire, 1.05, 1280.0).ok());
+
+    fire.frequency_hz = 1;           // 积分 1.2 s > 周期 1 s -> 跟不上
+    CHECK(!services::CaptureCoordinator::validate_rate_match(fire, 1200.0, 1280.0).ok());
+}
+
 TEST_MAIN_RETURN()

@@ -44,6 +44,7 @@ target_link_libraries(libs_protocols PRIVATE libs_warnings)
 # 把字节送出去并收回来，带超时；不理解任何协议内容。
 add_library(libs_transport STATIC
   src/transport/serial.cpp
+  src/transport/serial_timing.cpp
 )
 target_link_libraries(libs_transport PUBLIC libs_protocols)
 target_link_libraries(libs_transport PRIVATE libs_warnings)
@@ -95,6 +96,11 @@ add_test(NAME air_conditioner_device COMMAND test_air_conditioner_device)
 add_executable(test_su300 tests/test_su300.cpp)
 target_link_libraries(test_su300 PRIVATE libs_test_support libs_transport libs_devices libs_warnings)
 add_test(NAME su300 COMMAND test_su300)
+
+# 串口读循环判定：纯逻辑，不打开任何 COM 口。
+add_executable(test_serial_timing tests/test_serial_timing.cpp)
+target_link_libraries(test_serial_timing PRIVATE libs_test_support libs_transport libs_warnings)
+add_test(NAME serial_timing COMMAND test_serial_timing)
 
 # 光谱仪测试需要一个替身 DLL。驱动自己按绝对 UTF-8 路径加载它，
 # 而 Windows 的 argv 是 ANSI 字节，中文工程目录下会直接被拒；

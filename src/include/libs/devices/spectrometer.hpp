@@ -140,6 +140,12 @@ struct ScanGroup {
 struct CaptureResult {
     std::vector<SpectrometerInfo> devices;
     std::vector<ScanGroup> groups;
+
+    // 按 request.scans 期望收到几组 / 实际收到几组。
+    // 少收 = 出光窗口里触发没来齐，**不是失败**：已经采到的谱照常交付，
+    // 由上层如实标注"期望 N 发 / 实收 M 张"。只有一组都没收到才是失败。
+    std::uint32_t expected_groups = 0;
+    std::uint32_t received_groups = 0;
 };
 
 // AvaSpec 会话。

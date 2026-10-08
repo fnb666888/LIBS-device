@@ -74,6 +74,10 @@ struct ChannelFrame {
     ChannelState state = ChannelState::absent;
     std::string reason;            // state=absent 时的中文原因
     std::uint16_t pixels = 0;
+    // 本帧这一路被抽稀的倍数（1 = 全分辨率）。
+    // pixels 报的始终是**真实像素数**，counts.size() 是实际发来的点数，
+    // 两者一比就能看出抽稀了多少 —— 界面据此标注，不让人把抽稀波形当全分辨率。
+    unsigned decimate = 1;
     unsigned device_time_ticks = 0;
     std::vector<double> wavelength_nm;   // 长度 == pixels
     std::vector<double> counts;          // 长度 == pixels
@@ -157,6 +161,18 @@ public:
         // 否则在没有 TTL 源时每帧都会超时。
         // 需要看真实 LIBS 谱时才置 true，且必须与激光器串好。
         bool follow_site_trigger_mode = false;
+
+        // 预览帧抽稀倍数（1 = 不抽稀，原样发全部像素）。
+        //
+        // 为什么需要：一帧四通道 2048 点的 JSON 序列化 + 过管道实测约 800 ms
+        // （见 ui/src/main_window.cpp 的注释）。预览要跟得上激光的重复频率，
+        // 就必须把单帧体积降下来 —— 抽稀是唯一能真正提吞吐的一步。
+        //
+        // 纪律：**抽稀只作用于预览**（人眼看的波形），不作用于采集落盘 ——
+        // 逐发的原始谱由「出光测量」按全像素保存，预览绝不代替它。
+        // 抽稀倍数如实上报（frame.decimate），界面据此标注"显示已抽稀"，
+        // 不让人把抽稀后的波形当成全分辨率数据。
+        unsigned decimate = 1;
     };
 
     SpectrumStream() = delete;
@@ -175,6 +191,10 @@ public:
 
     // 覆盖选项（限速、队列深度、是否跟随站点触发模式）。必须在 start() 之前调用。
     void set_options(Options options);
+
+    // 只读回显当前生效的选项：界面据此标注"本帧已抽稀 N 倍"与周期，
+    // 不让人把抽稀后的波形当成全分辨率数据。
+    Options options() const;
 
     // 启动 / 停止。重复调用是安全的。
     // 停止会等采集线程 join 完再返回：返回后不会再有新帧。

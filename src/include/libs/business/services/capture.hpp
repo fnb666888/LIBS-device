@@ -76,6 +76,28 @@ public:
     static CapturePace pace_from_frequency(const WorkFrequency& frequency,
                                            const config::SiteConfig& site);
 
+    // 一次出光窗口内期望的放电发数 = 频率 × 保持时长（至少 1）。
+    //
+    // 出光窗口内激光按 frequency_hz 连续放电，持续 emission_hold_ms，
+    // 所以窗口里实际会打 N = 频率 × 保持秒数 发。采集必须按 N 逐发布防，
+    // 否则多出来的 TTL 没有测量在等，会被硬件直接丢弃。
+    static unsigned expected_discharges(const config::LaserFireConfig& fire);
+
+    // 校验 laser_fire.scans 与派生发数一致。
+    //   scans == 0 -> 未配置，用派生值，通过；
+    //   scans != expected -> 拒绝。少配 = 静默少采，多配 = 后几发白等，
+    //   两种都必须当场拒绝，而不是让现场拿到一张"看起来正常"的少采谱。
+    static libs::VoidResult validate_scans(const config::LaserFireConfig& fire);
+
+    // 激光重复频率与光谱仪采集节奏的同步校验：一个激光周期内，光谱仪必须能
+    // 完整跑完「触发 -> 积分延时 -> 积分 -> 读出」。跟不上就会丢发/错发，
+    // 采到的谱与放电发次对不上。这是"两个频率必须同步"的硬约束。
+    //   integration_ms       单次积分时长
+    //   integration_delay_ns 收到触发后到开始积分的延时（纳秒）
+    static libs::VoidResult validate_rate_match(const config::LaserFireConfig& fire,
+                                                double integration_ms,
+                                                double integration_delay_ns);
+
     // 由配置直接给节奏（不经工作频率）。capture_timeout_ms / integration_ms
     // 来自站点配置，是已确认的值；scans 缺省 1 也是保守值。
     static CapturePace pace_from_config(const config::SiteConfig& site);

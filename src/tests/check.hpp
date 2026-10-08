@@ -41,9 +41,18 @@ template <class T>
 struct Streamable<T, std::void_t<decltype(std::declval<std::stringstream&>()
                                          << std::declval<const T&>())>> : std::true_type {};
 
-// 枚举（ErrorKind、ApplyState 等）在库里没有 operator<<。
-// 单独为 ErrorKind 补一个可打印路径：失败时能直接看出是哪种错，
-// 否则只能看到两个 mangled 类型名，排查全靠猜。
+// 枚举（ErrorKind、ApplyState、ReadStep 等）在库里没有 operator<<。
+// 失败时若只能看到两个 mangled 类型名，排查全靠猜——所以这里按 ADL
+// 找库自己提供的 to_string(T)，找不到再退回类型名。
+// 用 std::string(...) 包一层是刻意的：user-defined enum 的关联命名空间里
+// 没有 std，因此 std::to_string 不会被 ADL 选中，不会出现意外的可转换。
+template <class T, class = void>
+struct HasAdlToString : std::false_type {};
+
+template <class T>
+struct HasAdlToString<T, std::void_t<decltype(std::string(to_string(std::declval<const T&>())))>>
+    : std::true_type {};
+
 inline std::string describe(libs::ErrorKind kind) { return libs::to_string(kind); }
 
 template <class T>
@@ -52,6 +61,8 @@ void print_value(std::stringstream& ss, const T& value) {
         ss << libs::to_string(value);
     } else if constexpr (Streamable<T>::value) {
         ss << value;
+    } else if constexpr (HasAdlToString<T>::value) {
+        ss << to_string(value);
     } else {
         ss << "<" << typeid(T).name() << " 值不可打印>";
     }

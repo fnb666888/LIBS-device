@@ -153,6 +153,14 @@ static void test_stream_never_touches_the_laser() {
     options.follow_site_trigger_mode = false;
     stream.set_options(options);
     CHECK_EQ(options.follow_site_trigger_mode, false);
+    // 预览抽稀：默认不抽稀；设了之后必须原样读回（界面据此算出"跟得上"的周期）。
+    CHECK_EQ(stream.options().decimate, 1u);
+    options.decimate = 8;
+    stream.set_options(options);
+    CHECK_EQ(stream.options().decimate, 8u);
+    options.decimate = 1;
+    stream.set_options(options);
+    CHECK_EQ(stream.options().decimate, 1u);
     CHECK_EQ(stream.running(), false);
 }
 

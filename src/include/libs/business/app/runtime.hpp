@@ -98,6 +98,17 @@ public:
     void set_laser_running(bool running) noexcept { laser_running_ = running; }
     bool laser_running() const noexcept { return laser_running_; }
 
+    // ── 优雅停机请求（管道命令 shutdown）──────────────────────────────────────
+    //
+    // **为什么必须有这条路**：stop() 要负责收光 —— 连续出光模式下激光正在出光时，
+    // 直接杀掉进程不会让它停下来，设备自己保持着"工作"状态。
+    // 而一旦守护进程从控制台窗口里解放出来（隐藏窗口启动，见 Fix E），
+    // "关窗口触发 CTRL_CLOSE_EVENT"这条老路就没了，剩下的 `schtasks /End`
+    // 是硬杀 TerminateProcess，**会跳过 stop()、把激光留在出光状态**。
+    // 所以补一条协议内的停机请求：客户端说"请退出"，守护进程照常走完整收光流程。
+    void request_shutdown() noexcept { shutdown_requested_.store(true); }
+    bool shutdown_requested() const noexcept { return shutdown_requested_.load(); }
+
     // 辅助监测（空调 / 测距）上一次**真的去读设备**的时刻（单调钟毫秒）。
     //
     // 为什么需要节流：status 每调用一次就去读空调（2 个 Modbus 事务）+ 测距
@@ -148,6 +159,7 @@ private:
     void log_stage_change(events::DetectionStage from, events::DetectionStage to);
 
     bool running_ = false;
+    std::atomic<bool> shutdown_requested_{false};
     config::SiteConfig config_;
     Options options_;
     std::mutex device_mutex_;

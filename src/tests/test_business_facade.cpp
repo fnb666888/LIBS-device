@@ -518,4 +518,37 @@ CASE(facade_debug_context_is_manual_only); {
     CHECK_EQ(get.payload["belt_sequence"].as_number(), 2.0);
     CHECK_EQ(get.payload["work_frequency"]["frequency_hz"].as_number(), 10.0);
 }
+
+CASE(shutdown_is_a_protocol_command_that_requests_graceful_exit); {
+    // 守护进程从控制台窗口里解放出来之后，"关窗口"这条优雅停机路径就没了，
+    // 而 schtasks /End 是硬杀 —— 会跳过 Runtime::stop() 的收光。
+    // 所以停机必须有一条走协议的正式通道。
+    Fixture f("shutdown");
+    CHECK(!f.runtime.shutdown_requested());
+
+    // 先确认它出现在命令面上（回归：laser_fire 曾经可派发却不在 commands 列表里）。
+    const app::Response ping = f.facade.dispatch(R"({"command":"ping","args":{}})");
+    bool listed = false;
+    for (const auto& c : ping.payload["commands"].as_array()) {
+        if (c.as_string() == "shutdown") listed = true;
+    }
+    CHECK(listed);
+
+    const app::Response response = f.facade.dispatch(R"({"command":"shutdown","args":{}})");
+    CHECK(response.ok);
+    CHECK(response.payload["shutdown_requested"].as_bool());
+    // 请求必须落到 Runtime 上 —— main 的看门线程就是看这个标志去停 server 的。
+    CHECK(f.runtime.shutdown_requested());
+}
+
+CASE(shutdown_only_sets_the_flag_and_touches_no_device); {
+    // 停机命令本身只置位：不读设备、不出光、也不在这里收光。
+    // 收光发生在 Runtime::stop() 里；"命令一执行就先把设备关了"
+    // 等于把收光的前提抽掉。
+    Fixture f("shutdown_quiet");
+    const app::Response response = f.facade.dispatch(R"({"command":"shutdown","args":{}})");
+    CHECK(response.ok);
+    CHECK(f.runtime.shutdown_requested());
+    CHECK(!f.runtime.laser_running());
+}
 TEST_MAIN_RETURN()

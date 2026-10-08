@@ -36,6 +36,54 @@ CapturePace CaptureCoordinator::pace_from_frequency(const WorkFrequency& frequen
     return pace;
 }
 
+unsigned CaptureCoordinator::expected_discharges(const config::LaserFireConfig& fire) {
+    // 光闸保持窗口里，激光按 frequency_hz 连续放电；窗口长度是 emission_hold_ms。
+    // 所以窗口内实际会打 频率 x 保持秒数 发。
+    const double discharges =
+        (static_cast<double>(fire.frequency_hz) * static_cast<double>(fire.emission_hold_ms)) / 1000.0;
+    // 至少 1 发：出光一旦真的发生，就不可能采 0 张谱。
+    // 窗口短于一个周期时这里取 1，而不是 0 —— 0 会让"该采却没采"看起来像正常。
+    if (discharges < 1.0) return 1u;
+    return static_cast<unsigned>(discharges + 0.5);   // 四舍五入到最接近的发数
+}
+
+libs::VoidResult CaptureCoordinator::validate_scans(const config::LaserFireConfig& fire) {
+    if (fire.scans == 0) return libs::VoidResult();   // 未配置：用派生值
+    const unsigned expected = expected_discharges(fire);
+    if (fire.scans != expected) {
+        // 少配 = 多出来的放电 TTL 没有测量在等，被硬件无声丢弃（"N 发出一张谱"）；
+        // 多配 = 后几发等不到触发，整次采集白等到超时。
+        // 两种都必须当场拒绝，不能现场拿到一张"看起来正常"的少采谱。
+        return libs::Error::make(
+            libs::ErrorKind::invalid_argument, "laser_fire_scans_mismatch",
+            "laser_fire.scans=" + std::to_string(fire.scans) +
+                " 与出光窗口的放电发数 " + std::to_string(expected) +
+                " 不一致（频率 " + std::to_string(fire.frequency_hz) + " Hz x 保持 " +
+                std::to_string(fire.emission_hold_ms) + " ms）。" +
+                "配少会静默少采，配多会等不到触发；请改成 0（按窗口自动）或与窗口一致的值");
+    }
+    return libs::VoidResult();
+}
+
+libs::VoidResult CaptureCoordinator::validate_rate_match(const config::LaserFireConfig& fire,
+                                                        double integration_ms,
+                                                        double integration_delay_ns) {
+    if (fire.frequency_hz == 0) {
+        return libs::Error::make(libs::ErrorKind::invalid_argument, "laser_frequency_unset",
+                                 "激光频率为 0，无法校验与光谱仪的采集节奏是否同步");
+    }
+    const double period_ms = 1000.0 / static_cast<double>(fire.frequency_hz);
+    const double occupied_ms = integration_ms + integration_delay_ns / 1.0e6;
+    if (occupied_ms >= period_ms) {
+        return libs::Error::make(
+            libs::ErrorKind::invalid_argument, "laser_spectrometer_rate_mismatch",
+            "光谱仪跟不上激光频率：一个周期只有 " + std::to_string(period_ms) +
+                " ms，而「积分延时 + 积分」就要占 " + std::to_string(occupied_ms) +
+                " ms。两者必须同步，否则会丢发/错发，采到的谱与放电发次对不上");
+    }
+    return libs::VoidResult();
+}
+
 CapturePace CaptureCoordinator::pace_from_config(const config::SiteConfig& site) {
     CapturePace pace;
     pace.configured = true;

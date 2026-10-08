@@ -351,7 +351,14 @@ TEST_MAIN_BEGIN_ARGV()
               CHECK_EQ(value.groups.size(), std::size_t(1));
               if (!value.groups.empty()) {
                   CHECK(value.groups[0].complete);
-                  CHECK(value.groups[0].hardware_synchronized);
+                  // **不能因为"我们请求了同步"就宣称"硬件已同步"。**
+                  // 曾经这里是 `group.hardware_synchronized = request.synchronized`，
+                  // 即请求标志的回声 —— 而 AvaSpec SDK 并不通过这个字段回报
+                  // "通道间时序真的对上了"（SetSyncMode 只回报"模式已设置"）。
+                  // capture.hpp §3.10.1 明令：该字段是 SDK 事实，不得由请求推断。
+                  // 在拿到真正的同步证据之前，它必须是 false；"我们请求了同步"
+                  // 由 SyncView::requested_sync 单独承载。
+                  CHECK(!value.groups[0].hardware_synchronized);
                   // 主通道必须最后 arm
                   CHECK_EQ(value.groups[0].arm_order.size(), std::size_t(3));
                   if (value.groups[0].arm_order.size() == 3)
@@ -787,6 +794,56 @@ TEST_MAIN_BEGIN_ARGV()
           const auto result = session.capture(request);
           CHECK(!result);
           if (!result) CHECK_EQ(result.error().code, std::string("capture_timeout"));
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    // 一次都收不到才是失败。**少收几发不是失败**：出光窗口里触发没来齐时，
+    // 已经采到的那几张谱必须照常交付（由上层如实标注"期望 N / 实收 M"），
+    // 不能因为最后一发没来就把前面采好的全丢掉。
+    { CASE(capture_keeps_what_arrived_when_later_shots_get_no_trigger);
+      fake_reset(7);   // 只让第一发真的布防
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened); if(!opened) show("open", opened.error());
+      if (opened) {
+          auto& session = *opened.value();
+          libs::devices::CaptureRequest request;
+          request.serials = {"SLAVE1"};
+          request.scans = 3;
+          request.timeout_ms = 150;
+          const auto result = session.capture(request);
+          CHECK(result);
+          if (result) {
+              CHECK_EQ(result.value().groups.size(), std::size_t(1));
+              CHECK_EQ(result.value().expected_groups, std::uint32_t(3));
+              CHECK_EQ(result.value().received_groups, std::uint32_t(1));
+              // 采到的那张必须是**真实数据**，不是补出来的空壳。
+              CHECK_EQ(result.value().groups[0].spectra.size(), std::size_t(1));
+              CHECK(result.value().groups[0].complete);
+          }
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    // 收齐时不得报短缺。
+    { CASE(capture_reports_no_shortfall_when_every_shot_arrives);
+      fake_reset(0);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened); if(!opened) show("open", opened.error());
+      if (opened) {
+          auto& session = *opened.value();
+          libs::devices::CaptureRequest request;
+          request.serials = {"SLAVE1"};
+          request.scans = 3;
+          const auto result = session.capture(request);
+          CHECK(result);
+          if (result) {
+              CHECK_EQ(result.value().groups.size(), std::size_t(3));
+              CHECK_EQ(result.value().expected_groups, std::uint32_t(3));
+              CHECK_EQ(result.value().received_groups, std::uint32_t(3));
+          }
           CHECK(session.close());
       }
       fake_reset(0);

@@ -76,6 +76,7 @@ private:
     Response cmd_algorithm(const json::Value& args);
     Response cmd_debug_context(const json::Value& args);
     Response cmd_debug_contract(const json::Value& args);
+    Response cmd_shutdown(const json::Value& args);
 
     // 把一次采集结果交付到本地出口（能力 6.3.1）。
     //

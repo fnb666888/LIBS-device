@@ -131,8 +131,16 @@ int main(int argc, char** argv) {
 
         businessd::NamedPipeServer server(runtime, daemon);
         // stop() 只置位标志，要把它接到 run() 的等待上——所以这里不能只看 stop_flag。
-        std::thread watcher([&server, &stop_flag] {
-            while (!stop_flag.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        //
+        // 停机有两条触发路径，都要接进来：
+        //   1. 控制台事件（Ctrl+C / Ctrl+Break / 关控制台窗口）；
+        //   2. 管道命令 shutdown。窗口隐藏之后第 1 条基本用不上了，而
+        //      `schtasks /End` 是硬杀、会跳过收光，所以第 2 条才是现场主用的
+        //      —— 它让 run() 正常返回，走到下面的 runtime.stop() 去收光。
+        std::thread watcher([&server, &stop_flag, &runtime] {
+            while (!stop_flag.load() && !runtime.shutdown_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
             server.stop();
         });
 

@@ -119,6 +119,17 @@ struct MachineSnapshot {
     // 一次 status 往返的错误（守护进程没起 / 串口错）。有值时 valid=false。
     QString error;
 
+    // status 失败时，守护进程是"忙"还是"断了"。
+    //
+    // 为什么必须分开：`status` 要先取设备锁，而长设备操作（出光、采集、运动）
+    // 全程持锁，于是这一帧 status 只能排队等 —— 排到超过客户端超时就被判失败。
+    // 那**不是掉线**。实测：出光命令本身跑 10411 ms，期间 status 轮询必然超时，
+    // 而 ping 只要 1 ms。
+    //
+    // 把"忙"显示成"未连接"的代价不只是误导：界面会盖上"设备离线"的阻断遮罩，
+    // 操作员在出光进行中就点不到"停止出光"。这是安全相关的，不是观感问题。
+    bool daemon_busy = false;
+
     const DeviceHealth* device(const QString& name) const;
 };
 

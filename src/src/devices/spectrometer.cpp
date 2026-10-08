@@ -421,6 +421,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
                            "master_serial must appear in the explicit serials list");
 
     CaptureResult result;
+        result.expected_groups = request.scans;
     try {
         impl_->initialize();
         const auto identities = impl_->identities();
@@ -551,6 +552,12 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
             // 从通道仍通过内部 SYNC 跟随主通道。
             d.config.trigger.mode = laser_fires ? 1 : 0;
             if (request.synchronized && !master) { d.config.trigger.mode = 1; d.config.trigger.source = 1; }
+            // source_type 显式写 0（厂家的 avaspec.h TriggerType 第三字段，
+            // 多通道示例 Matlab_multichannel 里默认也是 0）。
+            // 这里刻意写出来而不是靠结构体零初始化：时序同步的编程必须每一项
+            // 都是**决定**，不是"碰巧对"。真要改触发沿/输入类型时，
+            // 改这一行就是唯一入口。
+            d.config.trigger.source_type = 0;
 
             // 旧方向必须清零；反向只允许主通道驱动 Pin 23，避免四路各发一脉冲。
             const bool output_laser = spectrometer_fires && master;
@@ -582,7 +589,15 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
         for (std::uint32_t shot = 0; shot < request.scans; ++shot) {
             ScanGroup group;
             group.shot_id = shot + 1;
-            group.hardware_synchronized = request.synchronized;
+            // **如实上报：我们没有拿到"通道间时序真的对上了"的证据。**
+            //
+            // 这里曾经是 `= request.synchronized`，即把"我请求了同步"回显成
+            // "硬件已同步"—— 正是 capture.hpp §3.10.1 禁止的那种推断。
+            // AvaSpec 的 AVS_SetSyncMode 只回报"模式已设置"，不回报通道间
+            // 时序对齐；所以本字段在没有独立证据之前一律 false。
+            // "我们请求了同步"由 ScanGroup/SyncView 的 requested_sync 承载，
+            // 两者不再混为一谈。
+            group.hardware_synchronized = false;
             const auto deadline = Clock::now() + std::chrono::milliseconds(request.timeout_ms);
 
             for (auto i : order) {
@@ -607,10 +622,19 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
                     std::string missing;
                     for (std::size_t k = 0; k < ready.size(); ++k)
                         if (!ready[k]) { if (!missing.empty()) missing += ", "; missing += impl_->devices[active[k]].serial; }
-                    result.groups.push_back(std::move(group));
-                    return Error::make(ErrorKind::timeout, "capture_timeout",
-                                       "timed out waiting for " + missing + "; the partial group is kept "
-                                       "in the result and no shot is retried");
+                    // **一组都没收到才是失败。**
+                    if (result.groups.empty()) {
+                        result.received_groups = 0;
+                        return Error::make(ErrorKind::timeout, "capture_timeout",
+                                           "timed out waiting for " + missing +
+                                               "; no complete shot was received");
+                    }
+                    // 已经采到过谱：不把整次采集判失败。出光窗口里后面几发的触发
+                    // 没来，是窗口本身的事；把**已经采到的谱丢掉**才是真正的损失。
+                    // 当前这一发（group 里没有谱）不入结果，由上层按
+                    // expected_groups / received_groups 如实标注"期望 N / 实收 M"。
+                    result.received_groups = static_cast<std::uint32_t>(result.groups.size());
+                    return result;
                 }
                 for (std::size_t k = 0; k < active.size(); ++k) {
                     if (ready[k]) continue;
@@ -647,6 +671,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
             group.complete = true;
             result.groups.push_back(std::move(group));
         }
+        result.received_groups = static_cast<std::uint32_t>(result.groups.size());
         return result;
     } catch (const std::exception& e) {
         return Error::make(ErrorKind::transport, "capture_failed", e.what());

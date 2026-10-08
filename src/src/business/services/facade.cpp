@@ -296,6 +296,9 @@ std::vector<std::string> BusinessFacade::commands() {
         "recovery_write",
         "health",
         "spectrum_stream",
+        // 优雅停机：先收光再关设备。隐藏窗口启动之后没有"关窗口"这条老路，
+        // 硬杀会跳过收光，所以停机必须有一条走协议的正式通道。
+        "shutdown",
         // 海关报文只提供离线构造/校验；未配置正式边端时绝不联网。
         "heike_report_preview",
         "device_debug",
@@ -364,9 +367,24 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "algorithm")       return cmd_algorithm(args);
     if (command == "debug_context")   return cmd_debug_context(args);
     if (command == "debug_contract")  return cmd_debug_contract(args);
+    if (command == "shutdown")        return cmd_shutdown(args);
     return Response::failure(libs::Error::make(
         libs::ErrorKind::unsupported, "unknown_command",
         "未知命令: " + command + "；可用命令见 commands 字段"));
+}
+
+Response BusinessFacade::cmd_shutdown(const json::Value& args) {
+    (void)args;
+    // 只置位，不在这里退出：响应必须先写回给客户端，退出由 main 的看门线程执行。
+    // 真正的收光与关设备在 Runtime::stop() 里 —— 那里才是唯一负责"关串口之前
+    // 先把激光停下来"的地方（见 runtime.hpp 的说明）。
+    runtime_.request_shutdown();
+    json::Value v = json::object();
+    v.set("shutdown_requested", json::Value(true));
+    v.set("note", json::Value(
+        "守护进程将在本条响应送达后优雅退出：先收光（若在连续出光）再关设备。"
+        "不要用 TerminateProcess / schtasks /End 硬杀 —— 那会跳过收光。"));
+    return Response::success(std::move(v));
 }
 
 Response BusinessFacade::cmd_ping(const json::Value& args) {
@@ -392,7 +410,32 @@ Response BusinessFacade::cmd_status(const json::Value& args) {
     (void)args;
     // 下面要读两个设备（测距仪、空调），必须走 device_mutex：串口是独占资源，
     // 与出光/采集并发轮询会串帧。
-    std::lock_guard<std::mutex> lock(runtime_.device_mutex());
+    //
+    // **但有界等待，不能无限等。** status 是 UI 每 800ms 一次的轮询命令，
+    // 而出光 / 采集 / 运动这类长操作会全程持锁（实测出光命令本身 10411 ms）。
+    // 在这里死等，只会让这一帧 status 一路排到客户端 5000 ms 超时，
+    // 于是 UI 把"后端忙"显示成"守护进程 未连接"——那是现场最贵的一种误导。
+    //
+    // 拿不到锁就**明确回答"我忙，这轮什么状态都没读"**，而不是硬等：
+    // 这条路径不读任何共享状态，因此不需要锁，也就不会与出光线程竞态。
+    // 250ms 的上界保证 status 永远远快于客户端超时。
+    std::unique_lock<std::mutex> lock(runtime_.device_mutex(), std::defer_lock);
+    {
+        constexpr auto kStatusLockWait = std::chrono::milliseconds(250);
+        const auto deadline = std::chrono::steady_clock::now() + kStatusLockWait;
+        while (!lock.try_lock()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                json::Value busy = json::object();
+                busy.set("busy", json::Value(true));
+                busy.set("status_deferred", json::Value(true));
+                busy.set("busy_note", json::Value(
+                    "设备锁被长操作占用（出光 / 采集 / 运动）；本轮未读取任何状态，"
+                    "以避免把状态轮询排到客户端超时。这不是掉线。"));
+                return Response::success(std::move(busy));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     json::Value v = json::object();
     v.set("running", json::Value(runtime_.running()));
@@ -665,6 +708,15 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
     json::Value v = json::object();
     v.set("pace_configured", json::Value(pace.configured));
     v.set("groups", json::Value(static_cast<double>(result.value().groups.size())));
+    // 出光窗口内期望收几张谱 / 实际收到几张。少收不是失败（触发没来齐），
+    // 但必须让操作员看得见 —— 否则"少采了几发"就被一张看起来正常的谱盖过去了。
+    v.set("expected_scans", json::Value(static_cast<double>(result.value().expected_groups)));
+    v.set("received_scans", json::Value(static_cast<double>(result.value().received_groups)));
+    if (result.value().received_groups < result.value().expected_groups) {
+        v.set("scans_shortfall_note", json::Value(
+            "实收谱数少于出光窗口的发数：窗口里后几发的触发没有到达光谱仪。"
+            "已采到的谱照常保存，未采到的发次不重试"));
+    }
     json::Array syncs;
     for (const auto& group : result.value().groups) {
         const services::CaptureCoordinator::SyncView view =
@@ -858,6 +910,23 @@ Response BusinessFacade::cmd_spectrum_stream(const json::Value& args) {
         services::SpectrumStream::Options options;
         options.follow_site_trigger_mode =
             args.has("follow_site_trigger_mode") && args["follow_site_trigger_mode"].as_bool();
+        // 预览抽稀倍数。1..64：下限 1 = 不抽稀，上限 64 够把 2048 点降到 32 点，
+        // 再稀就看不出谱形了。越界一律拒绝而不是就近取值 —— 静默改参数
+        // 会让"我明明设了不抽稀"这种判断失去依据。
+        if (args.has("decimate")) {
+            if (!args["decimate"].is_number()) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "stream_decimate_bad",
+                    "decimate 必须是 1..64 的整数"));
+            }
+            const double d = args["decimate"].as_number();
+            if (!(d >= 1.0 && d <= 64.0)) {
+                return Response::failure(libs::Error::make(
+                    libs::ErrorKind::invalid_argument, "stream_decimate_bad",
+                    "decimate 必须在 1..64"));
+            }
+            options.decimate = static_cast<unsigned>(d);
+        }
         // 预览节奏可由调用方放宽（不能收紧）：一帧是四通道 2048 点，
         // 序列化 + 过管道实测要 ~800ms，按 200ms 产帧的话客户端永远追不上，
         // 队列一路丢帧、界面一直空。允许调用方把它调慢到追得上的节奏。

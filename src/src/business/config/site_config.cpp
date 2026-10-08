@@ -329,6 +329,7 @@ Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
         {"settle_timeout_ms",   &cfg.settle_timeout_ms},
         {"emission_hold_ms",    &cfg.emission_hold_ms},
         {"min_discharges",      &cfg.min_discharges},
+        {"scans",               &cfg.scans},
     };
     for (const Field& f : fields) {
         const unsigned fallback = *f.out;
@@ -498,6 +499,7 @@ json::Value to_json(const SiteConfig& config) {
     lf.set("settle_timeout_ms", json::Value(static_cast<double>(config.laser_fire.settle_timeout_ms)));
     lf.set("emission_hold_ms", json::Value(static_cast<double>(config.laser_fire.emission_hold_ms)));
     lf.set("min_discharges", json::Value(static_cast<double>(config.laser_fire.min_discharges)));
+    lf.set("scans", json::Value(static_cast<double>(config.laser_fire.scans)));
     v.set("laser_fire", std::move(lf));
 
     json::Value gw = json::object();

@@ -121,6 +121,10 @@ private:
     // laser_fire / laser_run 的 args。**两个出光动作共用**：一处改了另一处
     // 没改，"界面能调、实际不生效"就是这么来的。
     QJsonObject current_fire_args() const;
+    // 预览流的节奏与抽稀：按激光频率派生，取不到就退回保守值（不猜）。
+    int preview_decimate() const;
+    int preview_period_ms() const;
+    double preview_laser_frequency_hz() const;
 
     // ── 日志 ─────────────────────────────────────────────────────────
     void log_line(Level level, const QString& text);

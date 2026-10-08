@@ -102,6 +102,17 @@ bool bool_key(const QString& key) {
 }  // namespace
 
 DebugWindow::DebugWindow(QWidget* parent) : QWidget(parent) {
+    // **必须是独立窗口（Qt::Window），不能只传 parent 就当普通子控件。**
+    //
+    // 踩过的坑：`new DebugWindow(this)` 传了 parent，在 Qt 里就是**子控件**——
+    // 没有标题栏、没有关闭按钮，`raise()` / `activateWindow()` 对子控件也是空操作。
+    // 而"调试台"按钮只 show 不 hide，于是点一次它就以 1280x820 永久盖住主界面，
+    // 想摆脱只能整体关掉程序。现场原话就是"界面不是很友好并且无法关闭"。
+    //
+    // 设成 Qt::Window 之后它是带标题栏和 X 的独立窗口；关闭即隐藏
+    // （未设 WA_DeleteOnClose，所以 debug_window_ 的 QPointer 依然有效，
+    // 主界面那个按钮可以把同一实例再打开）。
+    setWindowFlag(Qt::Window, true);
     setWindowTitle(QStringLiteral("LIBS 手动调试台"));
     resize(1280, 820);
     auto* root = new QVBoxLayout(this);
@@ -111,6 +122,11 @@ DebugWindow::DebugWindow(QWidget* parent) : QWidget(parent) {
     top->addWidget(connection_state_, 1);
     auto* retry = new QPushButton(QStringLiteral("连接测试"), this);
     top->addWidget(retry);
+    // 显式关闭按钮：触摸屏上标题栏的 X 不好点，给一个大的。
+    auto* close_button = new QPushButton(QStringLiteral("关闭调试台"), this);
+    close_button->setToolTip(QStringLiteral("关闭本窗口；不影响守护进程与任何设备状态"));
+    top->addWidget(close_button);
+    connect(close_button, &QPushButton::clicked, this, &QWidget::close);
     connect(retry, &QPushButton::clicked, this, [this] {
         for (Page* p : pages_) if (p->command == QStringLiteral("overview")) {
             p->action->setCurrentIndex(p->action->findData(QStringLiteral("ping")));

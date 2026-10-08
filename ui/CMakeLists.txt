@@ -39,6 +39,7 @@ add_executable(libs-spectrum-ui WIN32
     src/main.cpp
     src/main_window.cpp
     src/theme.cpp
+    src/ui_log.cpp
     src/widgets.cpp
     src/machine_state.cpp
     src/status_poller.cpp

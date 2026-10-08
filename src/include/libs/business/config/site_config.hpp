@@ -145,6 +145,17 @@ struct LaserFireConfig {
 
     // 至少要有这么多次放电才算"真的出光了"。计数器不涨 = 没放电 = 失败。
     unsigned min_discharges = 1;
+
+    // 一次出光窗口内**逐发收几张谱**（= 期望的放电发数）。
+    //
+    // 0 = 未配置：按 frequency_hz × emission_hold_ms / 1000 派生（见
+    // CaptureCoordinator::expected_discharges）。
+    //
+    // 为什么必须和窗口发数一致：光谱仪每发只布防一次测量，收到一次 pin 6 触发
+    // 就出图返回。配少了，多出来的放电 TTL 没有测量在等，**被硬件无声丢弃**
+    // （现场表现就是"N 发出一张谱"）；配多了，后几发等不到触发，整次采集白等。
+    // 因此非 0 时与派生值不一致一律拒绝出光，见 validate_scans()。
+    unsigned scans = 0;
 };
 
 struct SiteConfig {
