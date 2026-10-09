@@ -45,7 +45,8 @@
 //     设备自己保持着"工作"状态，守护进程崩了光还在打。
 //
 //  6. **失败不伪造**。采集失败 → 如实报错、帧里带 error code，
-//     **绝不用零值填充出一条"平的谱"冒充数据**；且采集失败**不终止循环**。
+//     **绝不用零值填充出一条"平的谱"冒充数据**。偶发失败允许重试；设备掉线
+//     立即收光，其他连续三次失败收光，避免高速空转与持续无数据出光。
 //
 //  7. **出光会话互斥由 Runtime 记账**（一个布尔 + 一把锁），本类不碰。
 
@@ -81,13 +82,14 @@ inline constexpr std::uint64_t kGateRecheckIntervalMs = 500;
 // 一次出光作业的入参。
 //
 // `laser` 是会话参数（激光电流、脉宽、频率、Q 延时…），
-// 后三项是光谱侧的测量参数。**两类参数来源不同**：出光参数来自装机配置里
-// 已标定的那份（`LaserFireConfig::commissioned`），测量参数来自参数库。
+// 后三项是光谱侧的测量参数。两类参数都由 ParameterService 从参数库提供，
+// 本次请求可显式覆盖；本机默认值只在参数管理层补缺失。
 // 调用方负责按协议量程校验好再交进来。
 struct FireParameters {
     config::LaserFireConfig laser;       // 会话参数（调用方已按协议量程校验）
-    double integration_ms = 10.0;        // 光谱仪积分时间
-    unsigned capture_timeout_ms = 3000;  // 等 pin6 触发的超时
+    // 0 表示未配置，start 校验会拒绝；这里不再选择另一套工作默认值。
+    double integration_ms = 0.0;         // 光谱仪积分时间
+    unsigned capture_timeout_ms = 0;     // 等 pin6 触发的超时
     // 收到 pin6 脉冲后再等多久才开始积分。**测量参数**，由参数管理服务供给。
     // 曾经从 SpectrometerConfig 读，与参数库形成两份来源，已归并到参数库。
     double integration_delay_ns = 0.0;
@@ -118,7 +120,7 @@ struct MeasurementStartRecord {
 struct MeasurementStatus {
     bool running = false;
     std::uint64_t shots_captured = 0;      // 成功采集并投递的帧数
-    std::uint64_t shots_failed = 0;        // 采集失败次数（不终止循环）
+    std::uint64_t shots_failed = 0;        // 采集失败次数（掉线/连续失败会终止循环）
     std::uint64_t disk_writes_ok = 0;
     std::uint64_t disk_writes_failed = 0;
     std::uint64_t disk_backlog = 0;        // 落盘线程还没处理完的帧数
@@ -208,7 +210,7 @@ private:
     SpectrumFrame capture_once(const std::function<libs::VoidResult()>& on_armed = {},
                                const SpectrumMeasurement* initial = nullptr);
     // 运行期重判：中途失锁就自己收光。返回 false = 已因失锁而中止循环。
-    bool recheck_gate();
+    bool recheck_gate(bool emitting);
 
     // 记录一条运行日志。log_ 为空时什么都不做。
     void log_record(logging::RecordKind kind, const std::string& message,

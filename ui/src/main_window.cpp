@@ -2,6 +2,12 @@
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QComboBox>
+#include <QGridLayout>
+#include <QSignalBlocker>
+#include <QRegularExpression>
+#include <QUuid>
+#include <QScrollArea>
 #include <QDateTime>
 #include <QFile>
 #include <QFileDialog>
@@ -23,6 +29,7 @@
 #include "parameter_page.hpp"
 #include "theme.hpp"
 #include "widgets.hpp"
+#include <cmath>
 
 namespace libs::ui {
 namespace {
@@ -34,8 +41,7 @@ namespace {
 // 采集只有一个来源，就是测量作业。现在图上每一帧都是落光射度谱，
 // 所以免责声明只说剩下的那件事：**内存里有曲线 ≠ 已落盘**。
 const char* kDisclaimer =
-    "⚠ 实时光谱：图上每一帧都是激光触发的落光射度谱。"
-    "但图上有曲线不等于已落盘 —— 写盘是另一条线程，结果看底部计数行。";
+    "实时显示激光触发采集的光谱。数据保存进度可在下方采集状态中查看。";
 
 QString humanize_reason_impl(const QString& code) {
     // 码表抄自 readiness/verdict.hpp 的 GateReason，**不认识的码原样透传** ——
@@ -62,6 +68,7 @@ QString humanize_reason_impl(const QString& code) {
 }
 
 QString humanize_state_impl(const QString& s) {
+    if (s == QLatin1String("offline"))  return QStringLiteral("设备离线");
     if (s == QLatin1String("standby"))  return QStringLiteral("待机（未布防）");
     if (s == QLatin1String("ready"))     return QStringLiteral("就绪");
     if (s == QLatin1String("armed"))     return QStringLiteral("已布防");
@@ -78,7 +85,7 @@ QString MainWindow::humanize_state(const QString& s) { return humanize_state_imp
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     setWindowTitle(QStringLiteral("LIBS 现场检测系统"));
-    resize(1600, 1000);
+    resize(1440, 900);
     setMinimumSize(1180, 720);
 
     poller_ = new StreamPoller(client_, this);
@@ -109,7 +116,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     banner_->setObjectName(QStringLiteral("banner"));
     auto* banner_wrap = new QWidget(central);
     auto* bw = new QVBoxLayout(banner_wrap);
-    bw->setContentsMargins(12, 8, 12, 0);
+    bw->setContentsMargins(24, 14, 24, 0);
     bw->addWidget(banner_);
     root->addWidget(banner_wrap);
     set_banner_default();
@@ -123,6 +130,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     root->addWidget(pages_, 1);
 
     setCentralWidget(central);
+
+    prediction_poller_ = new PredictionPoller(client_, this);
+    connect(prediction_poller_, &PredictionPoller::status_ready, this, &MainWindow::render_prediction);
+    connect(prediction_poller_, &PredictionPoller::polling_error, this, [this](const QString& message) {
+        if (prediction_configuring_) return;
+        prediction_status_->setText(QStringLiteral("预测连接暂时中断，保留上次结果。"));
+        prediction_status_->setToolTip(message);
+    });
+    prediction_poller_->start();
 
     auto* clock_timer = new QTimer(this);
     connect(clock_timer, &QTimer::timeout, this, &MainWindow::tick_clock);
@@ -140,19 +156,30 @@ void MainWindow::build_header(QVBoxLayout* root) {
     auto* header = new QWidget();
     header->setObjectName(QStringLiteral("appHeader"));
     auto* h = new QHBoxLayout(header);
-    h->setContentsMargins(16, 12, 16, 12);
-    h->setSpacing(12);
+    h->setContentsMargins(24, 16, 24, 16);
+    h->setSpacing(16);
+    auto* brand = new QLabel(QStringLiteral("LIBS"), header);
+    brand->setObjectName(QStringLiteral("brandMark"));
+    brand->setAlignment(Qt::AlignCenter);
+    brand->setFixedSize(58, 48);
+    h->addWidget(brand);
+    auto* brand_text = new QVBoxLayout;
+    brand_text->setSpacing(3);
 
     title_ = new QLabel(QStringLiteral("LIBS 现场检测系统"), header);
     title_->setObjectName(QStringLiteral("appTitle"));
     // 标题优先级最高：设最小宽度，长详情再怎么长也不会把"LIBS 现场检测系统"挤没。
     title_->setMinimumWidth(190);
-    h->addWidget(title_);
+    brand_text->addWidget(title_);
+    auto* subtitle = new QLabel(QStringLiteral("激光诱导击穿光谱 · 测量工作台"), header);
+    subtitle->setObjectName(QStringLiteral("appSubtitle"));
+    brand_text->addWidget(subtitle);
+    h->addLayout(brand_text);
 
     h->addSpacing(8);
 
     daemon_dot_ = new StatusDot(header);
-    daemon_dot_->set_state(Level::Idle, QStringLiteral("未连接守护进程"));
+    daemon_dot_->set_state(Level::Idle, QStringLiteral("服务未连接"));
     h->addWidget(daemon_dot_);
 
     gate_dot_ = new StatusDot(header);
@@ -160,26 +187,28 @@ void MainWindow::build_header(QVBoxLayout* root) {
     // 顶栏宽度封顶的原因：现场屏只有 1536px，守护进程报错时那条详情（管道名 +
     // Win32 错误码 + 提示）能把右侧按钮整排顶出可视区，用户就点不到「测量参数」。
     // 两个点分开设：守护进程的错误详情长，门禁的短。
-    daemon_dot_->set_max_width(430);
+    daemon_dot_->set_max_width(180);
     gate_dot_->set_state(Level::Idle, QStringLiteral("门禁状态未知"));
     h->addWidget(gate_dot_);
-    gate_dot_->set_max_width(300);
+    gate_dot_->set_max_width(230);
 
     h->addStretch(1);
 
-    param_page_btn_ = new QPushButton(QStringLiteral("测量参数"), header);
-    param_page_btn_->setObjectName(QStringLiteral("ghost"));
+    param_page_btn_ = new QPushButton(QStringLiteral("仪器参数"), header);
+    param_page_btn_->setObjectName(QStringLiteral("navTab"));
+    param_page_btn_->setCheckable(true);
     // 顶栏挤不下时 Qt 会先压这些按钮。锁住尺寸，宁可压上面的详情文本。
     param_page_btn_->setMinimumWidth(96);
     connect(param_page_btn_, &QPushButton::clicked, this, &MainWindow::show_parameter_page);
-    h->addWidget(param_page_btn_);
 
-    main_page_btn_ = new QPushButton(QStringLiteral("返回主页面"), header);
-    main_page_btn_->setObjectName(QStringLiteral("ghost"));
+    main_page_btn_ = new QPushButton(QStringLiteral("实时光谱"), header);
+    main_page_btn_->setObjectName(QStringLiteral("navTab"));
+    main_page_btn_->setCheckable(true);
+    main_page_btn_->setChecked(true);
     main_page_btn_->setMinimumWidth(110);
-    main_page_btn_->hide();
     connect(main_page_btn_, &QPushButton::clicked, this, &MainWindow::show_main_page);
     h->addWidget(main_page_btn_);
+    h->addWidget(param_page_btn_);
 
     clock_ = new QLabel(header);
     clock_->setObjectName(QStringLiteral("appClock"));
@@ -194,17 +223,36 @@ void MainWindow::build_header(QVBoxLayout* root) {
 QWidget* MainWindow::build_main_page() {
     auto* page = new QWidget();
     auto* root = new QVBoxLayout(page);
-    root->setContentsMargins(12, 10, 12, 10);
-    root->setSpacing(10);
+    root->setContentsMargins(24, 18, 24, 22);
+    root->setSpacing(16);
 
     build_action_bar(root);
-    build_chart(root);
+    auto* scroll = new QScrollArea(page);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto* content = new QWidget(scroll);
+    auto* center = new QHBoxLayout(content);
+    center->setContentsMargins(0, 0, 4, 0);
+    center->setSizeConstraint(QLayout::SetMinimumSize);
+    center->setSpacing(16);
+    auto* spectrum = new QVBoxLayout;
+    spectrum->setContentsMargins(0, 0, 0, 0);
+    build_chart(spectrum);
+    center->addLayout(spectrum, 1);
+    auto* prediction = build_prediction_card();
+    prediction->setMinimumWidth(290);
+    prediction->setMaximumWidth(340);
+    center->addWidget(prediction);
+    scroll->setWidget(content);
+    root->addWidget(scroll, 1);
     build_device_bar(root);
     return page;
 }
 
 void MainWindow::build_action_bar(QVBoxLayout* root) {
     auto* bar = new Card(QStringLiteral("检测控制"));
+    bar->set_hint(QStringLiteral("准备设备后开始测量，实时查看光谱和采集状态。"));
     auto* row = new QHBoxLayout;
     row->setSpacing(16);
     bar->body()->addLayout(row);
@@ -213,10 +261,10 @@ void MainWindow::build_action_bar(QVBoxLayout* root) {
     //    它做的是：布防 -> 读一次激光状态 -> 判定 -> 按结论刷状态灯。
     precheck_btn_ = new QPushButton(QStringLiteral("设备预检"), bar);
     precheck_btn_->setObjectName(QStringLiteral("actionBtn"));
-    precheck_btn_->setMinimumSize(150, 74);
+    precheck_btn_->setMinimumSize(140, 48);
     precheck_btn_->setToolTip(QStringLiteral(
-        "只读检测：读一次激光状态并按门禁结论刷新状态灯。\n"
-        "不发出光。判断能不能出光由业务层负责，界面不预判。"));
+        "检查设备连接与激光器状态。\n"
+        "预检不会触发激光出光。"));
     connect(precheck_btn_, &QPushButton::clicked, this, &MainWindow::on_precheck);
     row->addWidget(precheck_btn_);
 
@@ -224,21 +272,19 @@ void MainWindow::build_action_bar(QVBoxLayout* root) {
     //    可用性**只**由 status.laser_running 决定（见 render_buttons）。
     start_btn_ = new QPushButton(QStringLiteral("开始检测"), bar);
     start_btn_->setObjectName(QStringLiteral("startBig"));
-    start_btn_->setMinimumSize(150, 74);
+    start_btn_->setMinimumSize(140, 48);
     start_btn_->setToolTip(QStringLiteral(
-        "执行 LIBS 全流程：写参数 -> 工作使能 -> 等放电 -> 开光闸\n"
-        "-> 收光 -> 采集 -> 落盘。成功即已开光。\n"
-        "条件不满足时业务层一条写指令都不会发。"));
+        "启动激光触发光谱采集，持续显示并保存数据。\n"
+        "启动前自动检查设备状态与测量条件。"));
     connect(start_btn_, &QPushButton::clicked, this, &MainWindow::on_start_detection);
     row->addWidget(start_btn_);
 
     // ③ 停止检测 —— 发 measurement_stop。不做确认弹窗。
     stop_btn_ = new QPushButton(QStringLiteral("停止检测"), bar);
     stop_btn_->setObjectName(QStringLiteral("stopBig"));
-    stop_btn_->setMinimumSize(150, 74);
+    stop_btn_->setMinimumSize(140, 48);
     stop_btn_->setToolTip(QStringLiteral(
-        "停止测量：把剩余帧写完再返回，然后确认激光已关断。\n"
-        "停止是安全方向的动作，不做二次确认。"));
+        "停止测量、关闭激光，并保存剩余光谱数据。"));
     connect(stop_btn_, &QPushButton::clicked, this, &MainWindow::on_stop_detection);
     row->addWidget(stop_btn_);
 
@@ -249,8 +295,7 @@ void MainWindow::build_action_bar(QVBoxLayout* root) {
 void MainWindow::build_chart(QVBoxLayout* root) {
     auto* card = new Card(QStringLiteral("实时光谱"));
     card->set_hint(QStringLiteral(
-        "全程订阅显示通道。图上每一帧都是激光触发的落光射度谱；"
-        "不测量时这里保持空屏 —— 不补零、不画背景谱。"));
+        "各通道按独立颜色显示，支持纵轴调整、暂停显示与原始数据导出。"));
 
     auto* tools = new QHBoxLayout;
     auto_y_ = new QCheckBox(QStringLiteral("纵轴自动"), card);
@@ -268,7 +313,7 @@ void MainWindow::build_chart(QVBoxLayout* root) {
     connect(pause_, &QCheckBox::toggled, this, &MainWindow::on_pause_toggled);
     tools->addWidget(pause_);
 
-    auto* export_btn = new QPushButton(QStringLiteral("导出本次已见帧（CSV）"), card);
+    auto* export_btn = new QPushButton(QStringLiteral("导出数据"), card);
     export_btn->setObjectName(QStringLiteral("ghost"));
     export_btn->setToolTip(QStringLiteral(
         "导出当前会话已收到的每一帧的原始计数，不做归一化。\n"
@@ -284,7 +329,7 @@ void MainWindow::build_chart(QVBoxLayout* root) {
     plot_ = new SpectrumPlot(card);
     card->body()->addWidget(plot_, 1);
 
-    frame_label_ = make_hint(QStringLiteral("尚未收到任何帧。"));
+    frame_label_ = make_hint(QStringLiteral("等待采集 · 尚无光谱数据"));
     card->body()->addWidget(frame_label_);
 
     // 这张卡片以前建完就没人管了：build_chart 不接收 root，卡片既没被
@@ -293,6 +338,219 @@ void MainWindow::build_chart(QVBoxLayout* root) {
     // 伸缩比 1 给绘图区：现场主要看的就是这条谱。
     root->addWidget(card, 1);
     chart_card_ = card;
+}
+
+Card* MainWindow::build_prediction_card() {
+    auto* card = new Card(QStringLiteral("成分预测"));
+    card->set_hint(QStringLiteral("铁矿模型 · 质量分数 %"));
+    auto* controls = new QHBoxLayout;
+    prediction_branch_ = new QComboBox(card);
+    prediction_branch_->setObjectName(QStringLiteral("predictionBranch"));
+    prediction_branch_->addItem(QStringLiteral("关闭预测"), QString());
+    prediction_branch_->addItem(QStringLiteral("氧化矿"), QStringLiteral("oxide"));
+    prediction_branch_->addItem(QStringLiteral("硫化矿"), QStringLiteral("sulfide"));
+    prediction_branch_->setToolTip(QStringLiteral("请选择与样品一致的模型分支；预测独立于采集启停。"));
+    controls->addWidget(prediction_branch_, 1);
+    prediction_retry_ = new QPushButton(QStringLiteral("重试"), card);
+    prediction_retry_->setObjectName(QStringLiteral("ghost"));
+    prediction_retry_->setToolTip(QStringLiteral("按当前选择重新加载模型，并清空上一条结果。"));
+    controls->addWidget(prediction_retry_);
+    card->body()->addLayout(controls);
+    prediction_import_ = new QPushButton(QStringLiteral("导入 LIBS 光谱预测"), card);
+    prediction_import_->setObjectName(QStringLiteral("predictionImport"));
+    prediction_import_->setToolTip(QStringLiteral("导入两列数据：波长 nm、原始强度 counts。新模型使用 200–565 nm；真机末端可适配到 564.7 nm，须覆盖全部特征窗口。"));
+    card->body()->addWidget(prediction_import_);
+    connect(prediction_import_, &QPushButton::clicked, this, &MainWindow::import_prediction_spectrum);
+    prediction_status_ = make_hint(QStringLiteral("选择矿石类型后启用实时预测。"));
+    prediction_status_->setObjectName(QStringLiteral("predictionStatus"));
+    prediction_status_->setWordWrap(true);
+    card->body()->addWidget(prediction_status_);
+    auto* values = new QGridLayout;
+    values->setVerticalSpacing(1);
+    const QStringList targets = {QStringLiteral("TFe"), QStringLiteral("SiO₂"), QStringLiteral("Al₂O₃"),
+        QStringLiteral("TiO₂"), QStringLiteral("CaO"), QStringLiteral("MgO"), QStringLiteral("MnO"),
+        QStringLiteral("P"), QStringLiteral("S"), QStringLiteral("FeO")};
+    for (int i = 0; i < targets.size(); ++i) {
+        auto* name = new QLabel(targets[i], card);
+        name->setObjectName(QStringLiteral("dim"));
+        auto* value = new QLabel(QStringLiteral("—"), card);
+        value->setObjectName(QStringLiteral("predictionValue"));
+        value->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        value->setStyleSheet(QStringLiteral("font-size:16px; font-weight:600;"));
+        values->addWidget(name, i, 0);
+        values->addWidget(value, i, 1);
+        prediction_values_.append(value);
+    }
+    card->body()->addLayout(values);
+    prediction_info_ = make_hint(QStringLiteral("研究预测，尚未验证定量精度。P 为元素磷。"));
+    prediction_info_->setObjectName(QStringLiteral("predictionInfo"));
+    prediction_info_->setWordWrap(true);
+    card->body()->addWidget(prediction_info_);
+    card->body()->addStretch(1);
+    connect(prediction_branch_, &QComboBox::currentIndexChanged, this, [this] { configure_prediction(); });
+    connect(prediction_retry_, &QPushButton::clicked, this, &MainWindow::configure_prediction);
+    return card;
+}
+
+void MainWindow::configure_prediction() {
+    if (prediction_configuring_) return;
+    prediction_configuring_ = true;
+    prediction_branch_->setEnabled(false);
+    prediction_retry_->setEnabled(false);
+    prediction_import_->setEnabled(false);
+    QJsonObject args;
+    const QString branch = prediction_branch_->currentData().toString();
+    args.insert(QStringLiteral("action"), QStringLiteral("configure"));
+    args.insert(QStringLiteral("enabled"), !branch.isEmpty());
+    args.insert(QStringLiteral("branch"), branch);
+    prediction_status_->setText(QStringLiteral("正在更新预测设置…"));
+    for (auto* label : prediction_values_) label->setText(QStringLiteral("—"));
+    call_async(QStringLiteral("prediction"), args, 5000,
+        [this](const QJsonObject& payload, bool ok, const QString& message) {
+            prediction_configuring_ = false;
+            prediction_branch_->setEnabled(true);
+            prediction_retry_->setEnabled(true);
+            prediction_import_->setEnabled(true);
+            if (ok) render_prediction(payload);
+            else prediction_status_->setText(QStringLiteral("设置失败：%1").arg(message));
+            prediction_poller_->request_refresh();
+            state_poller_->request_refresh();
+        });
+}
+
+void MainWindow::import_prediction_spectrum() {
+    if (prediction_configuring_) return;
+    const QString branch = prediction_branch_->currentData().toString();
+    if (branch.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("选择模型"), QStringLiteral("请先选择氧化矿或硫化矿。"));
+        return;
+    }
+    // Screenshot self-check can exercise the same parser and IPC without a modal picker.
+    const QString test_path = qEnvironmentVariable("LIBS_UI_SHOT").isEmpty()
+        ? QString() : qEnvironmentVariable("LIBS_UI_SHOT_IMPORT");
+    const QString path = test_path.isEmpty()
+        ? QFileDialog::getOpenFileName(this, QStringLiteral("导入 LIBS 光谱"), QString(),
+            QStringLiteral("光谱数据 (*.txt *.csv *.dat);;所有文件 (*)")) : test_path;
+    if (path.isEmpty()) return;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly) || file.size() > 16 * 1024 * 1024) {
+        QMessageBox::warning(this, QStringLiteral("读取失败"), QStringLiteral("无法读取文件，或文件超过 16 MB。"));
+        return;
+    }
+    const auto lines = QString::fromUtf8(file.readAll()).split(QLatin1Char('\n'));
+    const QRegularExpression separators(QStringLiteral("[,;\\s]+"));
+    QJsonArray wavelengths, counts;
+    for (int i = 0; i < lines.size(); ++i) {
+        const QString line = lines[i].trimmed();
+        if (line.isEmpty() || line.startsWith(QLatin1Char('#'))) continue;
+        const auto parts = line.split(separators, Qt::SkipEmptyParts);
+        bool wave_ok = false, count_ok = false;
+        const double wave = parts.value(0).toDouble(&wave_ok), count = parts.value(1).toDouble(&count_ok);
+        if (parts.size() != 2 || !wave_ok || !count_ok || !std::isfinite(wave) || !std::isfinite(count) ||
+            wave <= 0 || wavelengths.size() >= 100000) {
+            QMessageBox::warning(this, QStringLiteral("光谱格式错误"),
+                QStringLiteral("第 %1 行无效。请使用两列数字：波长 nm、原始强度 counts；最多 100000 个点。").arg(i + 1));
+            return;
+        }
+        wavelengths.append(wave); counts.append(count);
+    }
+    if (wavelengths.size() < 3) {
+        QMessageBox::warning(this, QStringLiteral("光谱格式错误"), QStringLiteral("至少需要三个光谱数据点。"));
+        return;
+    }
+    QJsonObject channel{{QStringLiteral("serial"), QStringLiteral("imported-spectrum")},
+        {QStringLiteral("pixels"), wavelengths.size()}, {QStringLiteral("wavelength_nm"), wavelengths},
+        {QStringLiteral("counts"), counts}};
+    // Imported files do not assert physical hardware synchronization.
+    QJsonObject group{{QStringLiteral("complete"), true}, {QStringLiteral("channels"), QJsonArray{channel}}};
+    QJsonObject spectrum{{QStringLiteral("spectrum_source"), QStringLiteral("LIBS")},
+        {QStringLiteral("spectrum_format"), QStringLiteral("wavelength_nm+counts")},
+        {QStringLiteral("scan_groups"), QJsonArray{group}}};
+    QJsonObject input{{QStringLiteral("schema_version"), QStringLiteral("libs.algorithm.v1")},
+        {QStringLiteral("request_id"), QUuid::createUuid().toString(QUuid::WithoutBraces)},
+        {QStringLiteral("parameters"), QJsonObject{{QStringLiteral("branch"), branch}}},
+        {QStringLiteral("context"), QJsonObject{{QStringLiteral("source_file"), path}}},
+        {QStringLiteral("spectrum"), spectrum}};
+    prediction_configuring_ = true;
+    prediction_import_->setEnabled(false); prediction_branch_->setEnabled(false); prediction_retry_->setEnabled(false);
+    prediction_status_->setText(QStringLiteral("正在提交离线光谱…"));
+    for (auto* label : prediction_values_) label->setText(QStringLiteral("—"));
+    call_async(QStringLiteral("prediction"), QJsonObject{{QStringLiteral("action"), QStringLiteral("analyze")},
+        {QStringLiteral("input"), input}}, 15000,
+        [this](const QJsonObject&, bool ok, const QString& message) {
+            prediction_configuring_ = false;
+            prediction_import_->setEnabled(true); prediction_branch_->setEnabled(true); prediction_retry_->setEnabled(true);
+            prediction_status_->setText(ok ? QStringLiteral("已提交，正在预测…") : QStringLiteral("提交失败：%1").arg(message));
+            prediction_poller_->request_refresh();
+            state_poller_->request_refresh();
+        });
+}
+
+void MainWindow::render_prediction(const QJsonObject& status) {
+    if (prediction_configuring_) return;
+    const QSignalBlocker blocker(prediction_branch_);
+    const QString branch = status.value("enabled").toBool() ? status.value("branch").toString() : QString();
+    const int index = prediction_branch_->findData(branch);
+    prediction_branch_->setCurrentIndex(index >= 0 ? index : 0);
+    const QString state = status.value("state").toString();
+    const auto result = status.value("latest").toObject();
+    const auto values = result.value("composition").toObject().value("target_values").toObject();
+    const QStringList keys = {QStringLiteral("TFe"), QStringLiteral("SiO2"), QStringLiteral("Al2O3"),
+        QStringLiteral("TiO2"), QStringLiteral("CaO"), QStringLiteral("MgO"), QStringLiteral("MnO"),
+        QStringLiteral("P"), QStringLiteral("S"), QStringLiteral("FeO")};
+    const bool available = result.value("availability").toString() == QLatin1String("available");
+    for (int i = 0; i < keys.size(); ++i) {
+        const auto value = values.value(keys[i]);
+        prediction_values_[i]->setText(available && value.isDouble() ? QString::number(value.toDouble(), 'f', 3) : QStringLiteral("—"));
+    }
+    QString text;
+    if (status.isEmpty()) text = QStringLiteral("尚未读取到预测服务状态。");
+    else if (state == QLatin1String("disabled")) text = QStringLiteral("选择矿石类型后启用实时预测。");
+    else if (state == QLatin1String("loading")) text = QStringLiteral("正在加载模型…");
+    else if (state == QLatin1String("waiting")) text = QStringLiteral("模型已加载，等待测量光谱。");
+    else if (state == QLatin1String("queued") || state == QLatin1String("predicting")) {
+        text = available ? QStringLiteral("显示帧 %1 结果 · 正在计算下一帧…")
+            .arg(result.value("context").toObject().value("frame_index").toDouble(), 0, 'f', 0)
+            : QStringLiteral("正在预测…");
+    }
+    else if (state == QLatin1String("model_unavailable")) text = QStringLiteral("模型加载失败，可检查模型配置后重试。");
+    else if (state == QLatin1String("completed")) {
+        const auto context = result.value("context").toObject();
+        const QString source = result.value("source").toString() == QLatin1String("offline")
+            ? QStringLiteral("离线光谱") : QStringLiteral("帧 %1").arg(context.value("frame_index").toDouble(), 0, 'f', 0);
+        text = QStringLiteral("%1 · 预测耗时 %2 ms").arg(source).arg(result.value("inference_ms").toDouble(), 0, 'f', 1);
+    } else {
+        QString reason = result.value("detail").toString();
+        const auto rows = result.value("results").toArray();
+        if (!rows.isEmpty()) {
+            const auto row = rows.first().toObject();
+            reason = row.value("detail").toString(row.value("status").toString(reason));
+        }
+        if (reason.contains(QLatin1String("insufficient_model_wavelength_coverage"))) text = QStringLiteral("波段不足：当前模型至少需要覆盖 200–564.7 nm。");
+        else if (reason.contains(QLatin1String("insufficient_200_600_nm_coverage"))) text = QStringLiteral("旧模型波段不足：需要覆盖 200–600 nm。");
+        else if (reason.contains(QLatin1String("spectral_gap_exceeds_1_nm"))) text = QStringLiteral("光谱存在大于 1 nm 的缺口，无法预测。");
+        else if (reason.contains(QLatin1String("blank_or_low_snr"))) text = QStringLiteral("信号过弱或接近空白，无法预测。");
+        else if (reason.contains(QLatin1String("incomplete_scan_group"))) text = QStringLiteral("采集通道不完整，无法预测。");
+        else text = QStringLiteral("本次无法预测：%1").arg(reason.isEmpty() ? status.value("detail").toString() : reason);
+    }
+    prediction_status_->setText(text);
+    prediction_status_->setToolTip(status.value("detail").toString() + QStringLiteral("\n") + result.value("request_id").toString());
+    QString info = QStringLiteral("研究预测，尚未验证定量精度。P 为元素磷。");
+    const auto issues = result.value("quality").toObject().value("issues").toArray();
+    QStringList notes;
+    for (const auto& value : issues) {
+        const auto issue = value.toString();
+        if (issue == QLatin1String("outside_observed_domain")) notes << QStringLiteral("超出模型训练域");
+        else if (issue == QLatin1String("model_boundary_adapted")) notes << QStringLiteral("末端波段适配至 564.7 nm");
+        else if (issue == QLatin1String("unphysical_output")) notes << QStringLiteral("预测值超出物理范围");
+        else if (issue == QLatin1String("iron_pool_violation")) notes << QStringLiteral("铁含量约束未满足");
+        else if (issue == QLatin1String("hardware_synchronization_not_confirmed")) notes << QStringLiteral("硬件同步未确认");
+    }
+    if (status.value("skipped_frames").toDouble() > 0) notes << QStringLiteral("预测队列曾跳过部分帧");
+    if (result.contains("saved") && !result.value("saved").toBool()) notes << QStringLiteral("预测记录保存失败");
+    if (!notes.isEmpty()) info += QStringLiteral("\n") + notes.join(QStringLiteral("；"));
+    prediction_info_->setText(info);
+    prediction_info_->setToolTip(result.value("result_path").toString());
 }
 
 void MainWindow::build_device_bar(QVBoxLayout* root) {
@@ -361,13 +619,12 @@ void MainWindow::set_banner_default() {
 void MainWindow::render_snapshot(const MachineSnapshot& s) {
     // 顶栏：守护进程连通性。
     if (!s.error.isEmpty()) {
-        daemon_dot_->set_state(Level::Danger, QStringLiteral("守护进程未连接"), s.error);
-        set_banner(QStringLiteral("守护进程未连接，下面显示的是上一次成功读到的数据，可能已过期。\n%1")
+        daemon_dot_->set_state(Level::Danger, QStringLiteral("服务未连接"), s.error);
+        set_banner(QStringLiteral("服务未连接，当前显示上一次读取的数据。\n%1")
                        .arg(s.error),
                    Level::Danger);
     } else if (s.valid) {
-        daemon_dot_->set_state(Level::Ok, QStringLiteral("守护进程已连接"),
-                               QStringLiteral("管道 %1 · 日志 %2 条").arg(client_.pipe_name()).arg(s.log_records));
+        daemon_dot_->set_state(Level::Ok, QStringLiteral("服务已连接"));
         set_banner_default();
     } else {
         daemon_dot_->set_state(Level::Idle, QStringLiteral("尚未取到状态"));
@@ -377,6 +634,8 @@ void MainWindow::render_snapshot(const MachineSnapshot& s) {
     render_devices(s);
     render_measurement(s);
     render_buttons(s);
+    // Prediction has its own fast cached-status poller. An older machine
+    // snapshot must not overwrite a newer prediction result.
 
     if (param_page_) param_page_->apply_snapshot(s);
 }
@@ -429,7 +688,7 @@ void MainWindow::render_devices(const MachineSnapshot& s) {
         }
         if (!d->configured) {
             sl.dot->set_state(Level::Idle, QStringLiteral("%1 · 未配置").arg(d->name),
-                              QStringLiteral("配置里没有这台设备，属于正常状态"));
+                              QStringLiteral("未启用此设备"));
         } else if (d->opened) {
             sl.dot->set_state(Level::Ok, QStringLiteral("%1 · 已打开").arg(d->name), d->endpoint);
         } else {
@@ -530,8 +789,8 @@ void MainWindow::render_buttons(const MachineSnapshot& s) {
         start_btn_->setToolTip(s.laser_running
                                    ? QStringLiteral("激光正在出光。先点「停止检测」再重新开始。")
                                    : QStringLiteral(
-                                         "执行 LIBS 全流程：写参数 -> 工作使能 -> 等放电 -> 开光闸\n"
-                                         "-> 收光 -> 采集 -> 落盘。成功即已开光。\n"
+                                         "启动激光触发光谱采集，持续显示并保存数据。\n"
+                                         ""
                                          "条件不满足时业务层一条写指令都不会发。"));
     }
     if (stop_btn_) {
@@ -842,8 +1101,7 @@ void MainWindow::on_param_save_requested(const QJsonObject& request) {
                    }
                    // 成功也不许说"现在可以出光了" —— 那是 UI 自己做安全判定。
                    on_param_result(true,
-                                   QStringLiteral("【%1】已更新：%2\n参数立即生效，下次判定按新值走。"
-                                                  "（能不能出光由业务层判定，界面不预判。）")
+                                   QStringLiteral("【%1】已保存：%2\n光谱参数用于后续采集，激光会话参数在下次启动测量时使用。")
                                        .arg(group, msg));
                });
 }
@@ -869,14 +1127,14 @@ void MainWindow::on_param_result(bool ok, const QString& summary) {
 
 void MainWindow::show_main_page() {
     if (pages_) pages_->setCurrentIndex(0);
-    if (param_page_btn_) param_page_btn_->show();
-    if (main_page_btn_) main_page_btn_->hide();
+    if (param_page_btn_) param_page_btn_->setChecked(false);
+    if (main_page_btn_) main_page_btn_->setChecked(true);
 }
 
 void MainWindow::show_parameter_page() {
     if (pages_) pages_->setCurrentIndex(1);
-    if (param_page_btn_) param_page_btn_->hide();
-    if (main_page_btn_) main_page_btn_->show();
+    if (param_page_btn_) param_page_btn_->setChecked(true);
+    if (main_page_btn_) main_page_btn_->setChecked(false);
     // 切进参数页立刻拉一次状态：新参数齐备指示要马上反映出来。
     if (state_poller_) state_poller_->request_refresh();
 }
@@ -948,6 +1206,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
     // 它的队列没人取，每一帧都被丢一次。
     stop_stream();
     if (state_poller_) state_poller_->stop();
+    if (prediction_poller_) prediction_poller_->stop();
     event->accept();
 }
 

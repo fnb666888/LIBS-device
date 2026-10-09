@@ -32,6 +32,7 @@
 #include "libs/business/app/parameter_service.hpp"
 #include "libs/business/measurement/frame_bus.hpp"
 #include "libs/business/measurement/job.hpp"
+#include "libs/business/measurement/prediction/service.hpp"
 #include "libs/business/measurement/writer.hpp"
 #include "libs/business/readiness/monitor.hpp"
 #include "libs/business/readiness/precheck.hpp"
@@ -112,6 +113,8 @@ public:
 
     // 落盘子模块。测量作业调用它，Runtime 只是持有。
     measurement::Writer* writer() noexcept { return writer_.get(); }
+    measurement::prediction::Service* prediction() noexcept { return prediction_.get(); }
+    const measurement::prediction::Service* prediction() const noexcept { return prediction_.get(); }
 
     // 帧出口。**纯内存通道，不碰设备、不起线程**，
     // 所以它可以当普通成员直接构造，不需要延迟到 start()。
@@ -199,6 +202,7 @@ private:
     // 作业还在 push 帧，下游已经被销毁。
     std::unique_ptr<measurement::Writer> writer_;
     std::unique_ptr<measurement::MeasurementJob> measurement_;
+    std::unique_ptr<measurement::prediction::Service> prediction_;
 
     std::optional<data_delivery::DeliveryStatus> last_delivery_;
 

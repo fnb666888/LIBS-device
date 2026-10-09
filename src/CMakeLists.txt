@@ -138,6 +138,9 @@ add_library(libs_business STATIC
   src/business/measurement/writer.cpp
   src/business/measurement/capture_plan.cpp
   src/business/measurement/job.cpp
+  src/business/measurement/prediction/algorithm_contract.cpp
+  src/business/measurement/prediction/model_inference.cpp
+  src/business/measurement/prediction/service.cpp
   # app/：进程边界与装配。ParameterService 在这儿而不是 shared/，
   # 因为它要引用 measurement 的参数类型。
   src/business/app/parameter_service.cpp
@@ -170,6 +173,12 @@ target_link_libraries(test_business_facade PRIVATE libs_test_support libs_busine
 add_test(NAME business_facade COMMAND test_business_facade)
 
 # IPC 测试直接调 handle_line，不真的建管道，所以不拖 main.cpp。
+foreach(prediction_test IN ITEMS algorithm_contract model_inference prediction_service)
+  add_executable(test_${prediction_test} tests/test_${prediction_test}.cpp)
+  target_link_libraries(test_${prediction_test} PRIVATE libs_test_support libs_business libs_warnings)
+  add_test(NAME ${prediction_test} COMMAND test_${prediction_test})
+endforeach()
+
 add_executable(test_business_ipc tests/test_business_ipc.cpp src/businessd/named_pipe_server.cpp)
 target_link_libraries(test_business_ipc PRIVATE libs_test_support libs_business advapi32 libs_warnings)
 add_test(NAME business_ipc COMMAND test_business_ipc)

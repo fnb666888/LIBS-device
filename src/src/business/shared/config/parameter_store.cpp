@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "libs/business/shared/json/json.hpp"
+#include "libs/measurement_limits.hpp"
 
 namespace business::config {
 namespace {
@@ -37,7 +38,8 @@ ReadinessReport make_readiness(const std::map<std::string, ParameterGroup>& grou
         }
         bool group_ok = true;
         for (const std::string& f : wanted) {
-            if (!it->second.has(f)) {
+            const auto* range = libs::measurement_limits::find(g, f);
+            if (!it->second.has(f) || (range && !range->contains(it->second.values.at(f)))) {
                 r.missing_fields.push_back(g + "." + f);
                 group_ok = false;
             }
@@ -49,7 +51,7 @@ ReadinessReport make_readiness(const std::map<std::string, ParameterGroup>& grou
     if (r.ready) {
         os << "核心参数齐备";
     } else {
-        os << "核心参数未齐备：缺 " << r.missing_groups.size() << " 个分组、"
+        os << "核心参数缺失或越界：涉及 " << r.missing_groups.size() << " 个分组、"
            << r.missing_fields.size() << " 个字段";
     }
     r.summary = os.str();
@@ -119,6 +121,13 @@ ApplyResult FileParameterStore::apply(const std::string& group,
             r.failed_fields.push_back(kv.first);
             return r;
         }
+        const auto* range = libs::measurement_limits::find(group, kv.first);
+        if (range && !range->contains(kv.second)) {
+            r.state = ApplyState::rejected;
+            r.message = "参数 " + group + "." + kv.first + " 超出允许范围或不是要求的整数";
+            r.failed_fields.push_back(kv.first);
+            return r;
+        }
     }
 
     // 立即生效：直接写进 groups_，没有暂存区。
@@ -138,7 +147,8 @@ ApplyResult FileParameterStore::apply(const std::string& group,
         const auto rf = required_fields_.find(group);
         if (rf != required_fields_.end()) {
             for (const std::string& f : rf->second) {
-                if (!target.has(f)) ok = false;
+                const auto* range = libs::measurement_limits::find(group, f);
+                if (!target.has(f) || (range && !range->contains(target.values.at(f)))) ok = false;
             }
         }
         target.complete = ok;
@@ -254,7 +264,8 @@ VoidResult FileParameterStore::load() {
         const auto rf = required_fields_.find(kv.first);
         if (rf != required_fields_.end()) {
             for (const std::string& f : rf->second) {
-                if (!kv.second.has(f)) ok = false;
+                const auto* range = libs::measurement_limits::find(kv.first, f);
+                if (!kv.second.has(f) || (range && !range->contains(kv.second.values.at(f)))) ok = false;
             }
         }
         kv.second.complete = ok;

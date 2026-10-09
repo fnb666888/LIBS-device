@@ -37,10 +37,12 @@
 #include "machine_state.hpp"
 #include "spectrum_plot.hpp"
 #include "status_poller.hpp"
+#include "prediction_poller.hpp"
 #include "stream_poller.hpp"
 #include "widgets.hpp"
 
 class QCheckBox;
+class QComboBox;
 class QCloseEvent;
 class QLabel;
 class QPushButton;
@@ -110,6 +112,17 @@ private:
     void build_action_bar(QVBoxLayout* root);
     Card* chart_card_ = nullptr;
     void build_chart(QVBoxLayout* root);
+    Card* build_prediction_card();
+    void configure_prediction();
+    void import_prediction_spectrum();
+    void render_prediction(const QJsonObject& status);
+    QComboBox* prediction_branch_ = nullptr;
+    QPushButton* prediction_retry_ = nullptr;
+    QPushButton* prediction_import_ = nullptr;
+    QLabel* prediction_status_ = nullptr;
+    QLabel* prediction_info_ = nullptr;
+    QVector<QLabel*> prediction_values_;
+    bool prediction_configuring_ = false;
     void build_device_bar(QVBoxLayout* root);
 
     // ── 状态渲染 ─────────────────────────────────────────────────────
@@ -142,6 +155,7 @@ private:
     PipeClient client_;
     StreamPoller* poller_ = nullptr;
     StatusPoller* state_poller_ = nullptr;
+    PredictionPoller* prediction_poller_ = nullptr;
 
     // ── 顶栏（两页共用）───────────────────────────────────────────────
     QLabel* title_ = nullptr;

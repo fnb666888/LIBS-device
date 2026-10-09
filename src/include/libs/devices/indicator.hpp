@@ -34,6 +34,9 @@ struct LampWrite {
 };
 
 struct IndicatorApplyReport {
+    Bytes reset_request;
+    Bytes reset_response;
+    bool reset_echo_seen = false;
     std::vector<libs::indicator::WriteRequest> writes;
     std::vector<LampWrite> write_results;
     std::vector<LampQuery> queries;
@@ -52,6 +55,8 @@ public:
     Result<LampWrite> apply(libs::indicator::Channel channel,
                             libs::indicator::State state,
                             bool verify = false);
+    // Replace the whole lamp state: clear all first, then enable requested
+    // channels supported by the configured model. Omitted channels stay off.
     Result<IndicatorApplyReport> applyAll(
         const std::map<libs::indicator::Channel, libs::indicator::State>& states,
         bool verify = false);

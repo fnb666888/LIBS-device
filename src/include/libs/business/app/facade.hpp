@@ -16,7 +16,7 @@
 //     正确形态是 `measurement_start` 一次性成功或失败：
 //     成功就当成"已开光"，失败原因看返回码。`gate` / `status` 只读**缓存**
 //     （`monitor()->latest()`），供界面显示，**不参与决策**。
-//   * 不自己算成分（算法服务已裁剪，属未来扩展）；
+//   * 不自己算成分（交给 measurement/prediction 子模块）；
 //   * 不自己重发恢复命令（只给快照）。
 
 #include <map>
@@ -82,6 +82,7 @@ public:
 
 private:
     Response handle(const std::string& command, const json::Value& args);
+    Response cmd_prediction(const json::Value& args);
     Response cmd_ping(const json::Value& args);
     Response cmd_config_show(const json::Value& args);
     Response cmd_status(const json::Value& args);

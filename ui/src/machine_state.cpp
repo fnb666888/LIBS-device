@@ -71,6 +71,7 @@ MachineSnapshot parse_status(const QJsonObject& p) {
     }
 
     s.laser_running = bool_of(p, "laser_running");
+    s.prediction = p.value("prediction").toObject();
     return s;
 }
 

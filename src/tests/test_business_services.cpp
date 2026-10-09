@@ -146,8 +146,8 @@ CASE(buzzer_is_never_rung_by_policy); {
     }
 }
 
-CASE(precheck_always_writes_all_six_channels); {
-    // 每次下发写全 6 路：灯是自保持的，只写变化的那一路，旧颜色会一直亮着。
+CASE(precheck_describes_the_complete_lamp_intent); {
+    // 六路是业务意图；实际全灭/点亮指令由驱动按型号选择。
     const auto m = readiness::lamp_states(readiness::MachineState::ready);
     CHECK_EQ(m.size(), std::size_t(6));
     CHECK(m.at(libs::indicator::Channel::buzzer) == libs::indicator::State::off);

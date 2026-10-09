@@ -72,6 +72,7 @@ $sources = @(
     "src/widgets.cpp",
     "src/machine_state.cpp",
     "src/status_poller.cpp",
+    "src/prediction_poller.cpp",
     "src/stream_poller.cpp",
     "src/frame_model.cpp",
     "src/ui_log.cpp",
@@ -107,11 +108,19 @@ if ($generatedSources.Count -eq 0) {
     throw "一个 moc 文件都没生成——Q_OBJECT 的类不会有关于 meta object 的代码，链接必失败。"
 }
 
+# 将控件图标嵌入 exe，避免依赖工作目录中的外部图片。
+$rcc = Join-Path $QtPrefix "bin\rcc.exe"
+if (-not (Test-Path $rcc)) { throw "找不到 rcc.exe（$rcc）" }
+$resourceSource = Join-Path $generated "ui_icons.cpp"
+& $rcc --name ui_icons (Join-Path $PSScriptRoot "resources.qrc") -o $resourceSource
+if ($LASTEXITCODE -ne 0) { throw "UI 图标资源编译失败" }
+$generatedSources += $resourceSource
+
 # windeployqt 也要在 PATH（它调用同目录的其它 exe）。
 $env:PATH = (Join-Path $QtPrefix "bin") + ";" + $compilerDir + ";" + $env:PATH
 
 $includeFlags = @("-I$QtPrefix\include", "-I$QtPrefix\include\QtCore", "-I$QtPrefix\include\QtGui",
-                  "-I$QtPrefix\include\QtWidgets", "-I$QtPrefix\include\QtCharts", "-Isrc")
+                  "-I$QtPrefix\include\QtWidgets", "-I$QtPrefix\include\QtCharts", "-Isrc", "-I../src/include")
 
 $libFlags = @("-L$QtPrefix\bin", "-lQt6Charts", "-lQt6Widgets", "-lQt6Gui", "-lQt6Core",
               "-lmingw32", "-luserenv", "-lAdvapi32", "-lShell32", "-limm32", "-lwinmm", "-lopengl32")

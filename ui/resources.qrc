@@ -1,0 +1,7 @@
+<RCC>
+  <qresource prefix="/ui/icons">
+    <file alias="chevron-up.svg">assets/chevron-up.svg</file>
+    <file alias="chevron-down.svg">assets/chevron-down.svg</file>
+    <file alias="check.svg">assets/check.svg</file>
+  </qresource>
+</RCC>

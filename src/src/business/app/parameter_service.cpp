@@ -3,7 +3,9 @@
 #include <cmath>
 
 #include "libs/business/app/runtime.hpp"
+#include "libs/business/app/measurement_defaults.hpp"
 #include "libs/business/measurement/frame.hpp"
+#include "libs/measurement_limits.hpp"
 
 namespace business::app {
 namespace {
@@ -25,33 +27,7 @@ constexpr const char* kFieldIntegrationMs     = "integration_ms";
 constexpr const char* kFieldCaptureTimeoutMs = "capture_timeout_ms";
 constexpr const char* kFieldIntegrationDelay = "integration_delay_ns";
 
-// ── 出厂（本机）默认值：全部取自 docs/real-device-parameters-20260929.md ──
-//
-// 为什么这里是**真机参数**而不是通用占位值：这份默认值是 2026-09-29 真机
-// 联调读回并确认过的本机工作点。它在启动时只补参数库里**缺失**的字段
-//（见 seed_defaults），所以进程一起来、界面第一次 param_get 拿到的就是
-// 真机参数；操作员在参数页调过的值永远优先，重启不会被打回默认。
-//
-// 光谱侧三个默认值曾经是 10 ms / 3000 ms / 5000 ns（通用占位），与真机记录
-// 对不上 —— 真机是 1.05 ms / 10000 ms / 1280 ns。这三个字段曾经同时住在
-// SpectrometerConfig / SiteConfig，现已明确归属测量参数，装机配置里不再有
-// 第二份来源。
-constexpr double kDefaultIntegrationMs        = 1.05;     // 真机 1.05 ms
-constexpr double kDefaultCaptureTimeoutMs     = 10000.0;  // 真机 10000 ms（覆盖整个出光窗口）
-constexpr double kDefaultIntegrationDelayNs   = 1280.0;   // 真机 1.28 us = 1280 ns
-
-// 激光器 9 个出光参数的真机默认值（0xB1 会话参数 + 出光时序）。
-constexpr double kDefaultDischargeCurrentA    = 80.0;     // 0x11  80 A
-constexpr double kDefaultPulseWidthUs         = 200.0;    // 0x12  200 us
-constexpr double kDefaultFrequencyHz          = 1.0;      // 0x13  1 Hz
-constexpr double kDefaultDischargeDelayUs     = 0.0;      // 0x14  0 us
-constexpr double kDefaultQDelayUs             = 210.0;    // 0x16  210 us
-constexpr double kDefaultQWarmupS             = 0.0;      // 0x19  0 s
-constexpr double kDefaultSettleTimeoutMs      = 20000.0;  // 等 work_state=1 的上限
-constexpr double kDefaultEmissionHoldMs       = 3000.0;   // 连续出光窗口
-constexpr double kDefaultMinDischarges        = 1.0;      // 计数器至少 +1 次
-
-
+// 本机默认表集中在 measurement_defaults.hpp；驱动和测量 DTO 不选择工作点。
 libs::Error bad(const char* code, const std::string& message) {
     return libs::Error::make(libs::ErrorKind::invalid_argument, code, message);
 }
@@ -63,7 +39,7 @@ libs::Error bad(const char* code, const std::string& message) {
 bool take_uint(const std::map<std::string, double>& values, const char* field, unsigned* out) {
     const auto it = values.find(field);
     if (it == values.end()) return false;
-    if (it->second < 0.0 || it->second != std::floor(it->second)) return false;
+    if (!libs::measurement_limits::accepts("laser", field, it->second)) return false;
     *out = static_cast<unsigned>(it->second);
     return true;
 }
@@ -143,9 +119,9 @@ libs::VoidResult ParameterService::seed_defaults() {
 
     // 光谱侧先种：光谱仪能不能预览与激光器标定无关。
     const libs::VoidResult spec = ensure("spectrometer", {
-        {kFieldIntegrationMs,     kDefaultIntegrationMs},
-        {kFieldCaptureTimeoutMs,  kDefaultCaptureTimeoutMs},
-        {kFieldIntegrationDelay,  kDefaultIntegrationDelayNs},
+        {kFieldIntegrationMs,     kRealDeviceDefaults.integration_ms},
+        {kFieldCaptureTimeoutMs,  kRealDeviceDefaults.capture_timeout_ms},
+        {kFieldIntegrationDelay,  kRealDeviceDefaults.integration_delay_ns},
     });
     if (!spec) return spec;
 
@@ -153,15 +129,15 @@ libs::VoidResult ParameterService::seed_defaults() {
     // 真机默认值来自 2026-09-29 记录。只补缺失字段，所以现场标定过的值不会被
     // 打回；"已标定"仍由 commissioned_from_store() 按参数库实际内容判定。
     const libs::VoidResult laser = ensure("laser", {
-        {kFieldDischargeCurrent, kDefaultDischargeCurrentA},
-        {kFieldPulseWidth,       kDefaultPulseWidthUs},
-        {kFieldFrequency,        kDefaultFrequencyHz},
-        {kFieldDischargeDelay,   kDefaultDischargeDelayUs},
-        {kFieldQDelay,           kDefaultQDelayUs},
-        {kFieldQWarmup,          kDefaultQWarmupS},
-        {kFieldSettleTimeout,    kDefaultSettleTimeoutMs},
-        {kFieldEmissionHold,     kDefaultEmissionHoldMs},
-        {kFieldMinDischarges,    kDefaultMinDischarges},
+        {kFieldDischargeCurrent, kRealDeviceDefaults.discharge_current_a},
+        {kFieldPulseWidth,       kRealDeviceDefaults.pulse_width_us},
+        {kFieldFrequency,        kRealDeviceDefaults.frequency_hz},
+        {kFieldDischargeDelay,   kRealDeviceDefaults.discharge_delay_us},
+        {kFieldQDelay,           kRealDeviceDefaults.q_delay_us},
+        {kFieldQWarmup,          kRealDeviceDefaults.q_warmup_s},
+        {kFieldSettleTimeout,    kRealDeviceDefaults.settle_timeout_ms},
+        {kFieldEmissionHold,     kRealDeviceDefaults.emission_hold_ms},
+        {kFieldMinDischarges,    kRealDeviceDefaults.min_discharges},
     });
     if (!laser) return laser;
 
@@ -232,10 +208,16 @@ libs::VoidResult ParameterService::collect_spectrometer(measurement::FireParamet
     if (!take_double(values, kFieldIntegrationMs, &out.integration_ms)) {
         return bad("parameter_field_bad", "spectrometer.integration_ms 缺失");
     }
-    double timeout = kDefaultCaptureTimeoutMs;
+    double timeout = kRealDeviceDefaults.capture_timeout_ms;
     (void)take_double(values, kFieldCaptureTimeoutMs, &timeout);
+    if (!libs::measurement_limits::accepts("spectrometer", kFieldCaptureTimeoutMs, timeout))
+        return bad("parameter_field_bad", "spectrometer.capture_timeout_ms 超出允许范围或不是整数");
     out.capture_timeout_ms = static_cast<unsigned>(timeout);
+    out.integration_delay_ns = kRealDeviceDefaults.integration_delay_ns;
     (void)take_double(values, kFieldIntegrationDelay, &out.integration_delay_ns);
+    if (!libs::measurement_limits::accepts("spectrometer", kFieldIntegrationMs, out.integration_ms) ||
+        !libs::measurement_limits::accepts("spectrometer", kFieldIntegrationDelay, out.integration_delay_ns))
+        return bad("parameter_field_bad", "spectrometer 积分时间或积分延时超出允许范围");
     return libs::VoidResult();
 }
 
@@ -289,7 +271,7 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
             if (!o.has(key)) return true;
             if (!o[key].is_number()) return false;
             const double v = o[key].as_number();
-            if (v < 0.0 || v != std::floor(v)) return false;
+            if (!libs::measurement_limits::accepts("laser", key, v)) return false;
             *dst = static_cast<unsigned>(v);
             return true;
         };
@@ -319,7 +301,7 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
             }
             // 与驱动硬校验一致（spectrometer.cpp: [0.002, 60000] ms）。
             const double v = o[kFieldIntegrationMs].as_number();
-            if (!(v >= 0.002 && v <= 60000.0)) {
+            if (!libs::measurement_limits::accepts("spectrometer", kFieldIntegrationMs, v)) {
                 return bad("spectrometer_overrides_bad",
                            "spectrometer.integration_ms 必须在 0.002~60000 ms 之间");
             }
@@ -330,7 +312,7 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
                 return bad("spectrometer_overrides_bad", "spectrometer.capture_timeout_ms 必须是数字");
             }
             const double v = o[kFieldCaptureTimeoutMs].as_number();
-            if (!(v >= 1.0 && v <= 600000.0 && v == std::floor(v))) {
+            if (!libs::measurement_limits::accepts("spectrometer", kFieldCaptureTimeoutMs, v)) {
                 return bad("spectrometer_overrides_bad",
                            "spectrometer.capture_timeout_ms 必须是 1~600000 的整数毫秒");
             }
@@ -341,8 +323,8 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
                 return bad("spectrometer_overrides_bad", "spectrometer.integration_delay_ns 必须是数字");
             }
             const double v = o[kFieldIntegrationDelay].as_number();
-            if (!(v >= 0.0)) {
-                return bad("spectrometer_overrides_bad", "spectrometer.integration_delay_ns 必须是非负纳秒数");
+            if (!libs::measurement_limits::accepts("spectrometer", kFieldIntegrationDelay, v)) {
+                return bad("spectrometer_overrides_bad", "spectrometer.integration_delay_ns 必须在 0~1000000 ns 之间");
             }
             out.integration_delay_ns = v;
         }
@@ -376,11 +358,13 @@ double ParameterService::value_or(const std::string& group, const std::string& f
 
 measurement::SpectrumMeasurement ParameterService::spectrometer_measurement() const {
     measurement::SpectrumMeasurement m;
-    m.integration_ms = value_or("spectrometer", kFieldIntegrationMs, kDefaultIntegrationMs);
-    m.timeout_ms = static_cast<unsigned>(
-        value_or("spectrometer", kFieldCaptureTimeoutMs, kDefaultCaptureTimeoutMs));
+    m.integration_ms = value_or("spectrometer", kFieldIntegrationMs, kRealDeviceDefaults.integration_ms);
+    const double timeout = value_or("spectrometer", kFieldCaptureTimeoutMs, kRealDeviceDefaults.capture_timeout_ms);
+    // 历史参数库可能含坏值：转换为 unsigned 前检查，拒绝时保留未配置哨兵 0。
+    m.timeout_ms = libs::measurement_limits::accepts("spectrometer", kFieldCaptureTimeoutMs, timeout)
+        ? static_cast<unsigned>(timeout) : 0;
     m.integration_delay_ns =
-        value_or("spectrometer", kFieldIntegrationDelay, kDefaultIntegrationDelayNs);
+        value_or("spectrometer", kFieldIntegrationDelay, kRealDeviceDefaults.integration_delay_ns);
     return m;
 }
 

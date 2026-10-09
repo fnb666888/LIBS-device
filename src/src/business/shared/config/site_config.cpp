@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <fstream>
 #include <sstream>
+#include <utility>
+#include "libs/measurement_limits.hpp"
 
 namespace business::config {
 namespace {
@@ -387,19 +389,20 @@ VoidResult validate_laser_fire(const LaserFireConfig& lf) {
     // "还没标定"这个完全合法的中间状态。
     if (!lf.commissioned) return libs::VoidResult();
 
-    const auto outside = [](unsigned v, unsigned lo, unsigned hi) { return v < lo || v > hi; };
-    if (outside(lf.discharge_current_a, 15, 100))
-        return invalid("laser_fire.discharge_current_a must be 15..100 A (protocol §3.1)");
-    if (outside(lf.pulse_width_us, 50, 300))
-        return invalid("laser_fire.pulse_width_us must be 50..300 us (protocol §3.1)");
-    if (outside(lf.frequency_hz, 1, 10))
-        return invalid("laser_fire.frequency_hz must be 1..10 Hz (protocol §3.1)");
-    if (lf.discharge_delay_us > 500)
-        return invalid("laser_fire.discharge_delay_us must be 0..500 us (protocol §3.1)");
-    if (outside(lf.q_delay_us, 2, 500))
-        return invalid("laser_fire.q_delay_us must be 2..500 us (protocol §3.1)");
-    if (lf.settle_timeout_ms == 0)
-        return invalid("laser_fire.settle_timeout_ms must be positive");
+    const std::pair<const char*, unsigned> fields[] = {
+        {"discharge_current_a", lf.discharge_current_a}, {"pulse_width_us", lf.pulse_width_us},
+        {"frequency_hz", lf.frequency_hz}, {"discharge_delay_us", lf.discharge_delay_us},
+        {"q_delay_us", lf.q_delay_us}, {"q_warmup_s", lf.q_warmup_s},
+        {"settle_timeout_ms", lf.settle_timeout_ms}, {"emission_hold_ms", lf.emission_hold_ms},
+        {"min_discharges", lf.min_discharges},
+    };
+    for (const auto& field : fields) {
+        const auto* range = libs::measurement_limits::find("laser", field.first);
+        if (!range->contains(field.second))
+            return invalid(std::string("laser_fire.") + field.first + " must be " +
+                std::to_string(range->lo) + ".." + std::to_string(range->hi) + " " +
+                range->unit + " (" + range->source + ")");
+    }
     return libs::VoidResult();
 }
 

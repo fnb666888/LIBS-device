@@ -23,8 +23,9 @@ namespace business::measurement {
 // 认字段名、认单位，字段一改要改一片，而且"这个字段归谁管"就再也说不清了。
 // 参数库只被 ParameterService 认，其它服务只认本结构 —— **字段归属集中在一处**。
 struct SpectrumMeasurement {
-    double integration_ms = 10.0;        // 积分时间
-    unsigned timeout_ms = 3000;          // 采集超时（含等激光 TTL）
+    // 0 表示尚未由 ParameterService 填入，校验会拒绝，不能作为工作默认值。
+    double integration_ms = 0.0;         // 积分时间
+    unsigned timeout_ms = 0;             // 采集超时（含等激光 TTL）
     // 收到激光 TTL 后延迟多久开始积分。自由触发模式下不用。
     //
     // 曾经放在 SpectrometerConfig 里，与参数库形成**两份来源** ——

@@ -1,0 +1,5 @@
+{
+  "python": "C:/Python314/python.exe",
+  "model_dir": "iron_ore/model/current",
+  "timeout_ms": 60000
+}

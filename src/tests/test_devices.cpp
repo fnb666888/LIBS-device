@@ -270,4 +270,79 @@ TEST_MAIN_BEGIN()
     CHECK_EQ(link.sent.size(), size_t(0));
 }
 
+{
+    CASE(k50_complete_state_resets_then_switches_color_and_verifies_supported_channels);
+    using Ch = indicator::Channel;
+    using St = indicator::State;
+    FakeLink link;
+    devices::Indicator lamp(link, 1, "CL50S+K50-485", 650, 0);
+    const auto queue_states = [&](Ch active) {
+        for (const auto ch : {Ch::red, Ch::yellow, Ch::green, Ch::buzzer}) {
+            Bytes reply{1, 1, 0, static_cast<std::uint8_t>(indicator::query_register(ch)),
+                        0, static_cast<std::uint8_t>(ch == active ? 0xFF : 0)};
+            const auto crc = modbus::crc16(reply.data(), reply.size());
+            reply.push_back(static_cast<std::uint8_t>(crc));
+            reply.push_back(static_cast<std::uint8_t>(crc >> 8));
+            link.queue(reply);
+        }
+    };
+    const Bytes reset{1, 5, 0, 0, 0, 0, 0xCD, 0xCA};
+    std::map<Ch, St> intent{{Ch::red, St::off}, {Ch::yellow, St::on},
+        {Ch::green, St::off}, {Ch::blue, St::off}, {Ch::white, St::off}, {Ch::buzzer, St::off}};
+    queue_states(Ch::yellow);
+    auto yellow = lamp.applyAll(intent, true);
+    CHECK(yellow.ok());
+    CHECK_EQ(yellow.value().queries.size(), size_t(4));
+    CHECK_EQ(yellow.value().writes.size(), size_t(1));
+    CHECK(yellow.value().reset_echo_seen);
+    CHECK(link.sent[0].request == reset);
+    CHECK(link.sent[1].request == (Bytes{1, 5, 0, 3, 0xFF, 0, 0x7C, 0x3A}));
+    intent[Ch::yellow] = St::off;
+    intent[Ch::green] = St::on;
+    queue_states(Ch::green);
+    auto green = lamp.applyAll(intent, true);
+    CHECK(green.ok());
+    CHECK(link.sent[6].request == reset);
+    CHECK(link.sent[7].request == (Bytes{1, 5, 0, 2, 0xFF, 0, 0x2D, 0xFA}));
+    CHECK_EQ(link.sent.size(), size_t(12));
+    intent[Ch::green] = St::off;
+    queue_states(Ch::blue); // nonexistent blue is never queried: all supported channels off
+    auto off = lamp.applyAll(intent, true);
+    CHECK(off.ok());
+    CHECK(off.value().writes.empty());
+    CHECK(link.sent[12].request == reset);
+    CHECK_EQ(link.sent.size(), size_t(17));
+}
+
+{
+    CASE(indicator_complete_state_validates_before_any_io);
+    using Ch = indicator::Channel;
+    using St = indicator::State;
+    FakeLink link;
+    devices::Indicator lamp(link, 1, "CL50S+K50-485", 650, 0);
+    auto unsupported = lamp.applyAll({{Ch::red, St::on}, {Ch::blue, St::on}}, true);
+    CHECK(!unsupported.ok());
+    CHECK_EQ(unsupported.error().code, std::string("model_has_no_color"));
+    CHECK(link.sent.empty());
+    link.fail_next = true;
+    auto broken = lamp.applyAll({{Ch::green, St::on}}, true);
+    CHECK(!broken.ok());
+    CHECK_EQ(broken.error().code, std::string("cable_unplugged"));
+    CHECK_EQ(link.sent.size(), size_t(1)); // no color write after a failed reset
+}
+
+{
+    CASE(indicator_complete_state_rejects_stale_color_readback);
+    FakeLink link;
+    Bytes stale{1, 1, 0, 1, 0, 0xFF}; // red still on after a green intent
+    const auto crc = modbus::crc16(stale.data(), stale.size());
+    stale.push_back(static_cast<std::uint8_t>(crc));
+    stale.push_back(static_cast<std::uint8_t>(crc >> 8));
+    link.queue(stale);
+    devices::Indicator lamp(link, 1, "CL50S+K50-485", 650, 0);
+    auto result = lamp.applyAll({{indicator::Channel::green, indicator::State::on}}, true);
+    CHECK(!result.ok());
+    CHECK_EQ(result.error().code, std::string("indicator_state_mismatch"));
+}
+
 TEST_MAIN_RETURN()

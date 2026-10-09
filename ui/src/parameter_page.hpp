@@ -95,8 +95,6 @@ private:
     struct FieldSpec {
         const char* key;
         const char* label;
-        double lo;
-        double hi;
         int decimals;
         const char* unit;
         const char* tooltip;

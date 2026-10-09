@@ -1,4 +1,5 @@
 #include "libs/devices/spectrometer.hpp"
+#include "libs/measurement_limits.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +33,13 @@ using Clock = std::chrono::steady_clock;
 // AvsHandle 在 x64 Windows 上仍是 32 位 long，函数指针一律 __stdcall。
 using AvsHandle = std::int32_t;
 constexpr AvsHandle kInvalidHandle = 1000;
+
+Error capture_sdk_error(const char* operation, const std::string& serial,
+                        int rc, const char* code) {
+    // Vendor ERR_DEVICE_NOT_FOUND (-3) is a lost device, not a missed trigger.
+    return Error::make(ErrorKind::device, rc == -3 ? "spectrometer_disconnected" : code,
+                       std::string(operation) + " " + serial + " failed: " + std::to_string(rc));
+}
 
 #pragma pack(push, 1)
 struct AvsIdentity {
@@ -199,6 +207,9 @@ struct Device {
     std::uint16_t pixels = 0;
     std::vector<double> wavelengths;
     MeasureConfig config{};
+    MeasureConfig prepared_config{};
+    unsigned char prepared_sync = 0;
+    bool prepared = false;
     bool touched = false;
     bool output_possible = false;   // 该通道是否被写入过脉冲参数
 };
@@ -409,14 +420,16 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                                            const std::function<VoidResult()>& on_armed,
                                            const std::function<bool()>& cancelled) {
     if (!impl_) return Error::make(ErrorKind::internal, "not_open", "the session is not open");
-    if (request.integration_ms < 0.002 || request.integration_ms > 60000.0 ||
-        !std::isfinite(request.integration_ms))
+    if (!libs::measurement_limits::accepts("spectrometer", "integration_ms", request.integration_ms))
         return Error::make(ErrorKind::invalid_argument, "bad_integration",
                            "integration_ms must be finite and in [0.002, 60000]");
     if (request.scans < 1 || request.scans > 100)
         return Error::make(ErrorKind::invalid_argument, "bad_scans", "scans must be 1..100");
-    if (request.timeout_ms < 1)
-        return Error::make(ErrorKind::invalid_argument, "bad_timeout", "timeout_ms must be positive");
+    if (!libs::measurement_limits::accepts("spectrometer", "capture_timeout_ms", request.timeout_ms))
+        return Error::make(ErrorKind::invalid_argument, "bad_timeout", "timeout_ms must be in 1..600000 ms");
+    if (!libs::measurement_limits::accepts("spectrometer", "integration_delay_ns", request.integration_delay_ns))
+        return Error::make(ErrorKind::invalid_argument, "bad_integration_delay",
+                           "integration_delay_ns must be finite and in 0..1000000 ns");
     if (!request.master_serial.empty() &&
         std::find(request.serials.begin(), request.serials.end(), request.master_serial) == request.serials.end())
         return Error::make(ErrorKind::invalid_argument, "master_not_listed",
@@ -424,6 +437,16 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
 
     CaptureResult result;
     result.expected_groups = request.scans;
+    // A failed/cancelled transaction cannot leave a reusable preparation behind.
+    // Keep the cache inside the SDK session; it never survives close/reopen.
+    struct PreparationGuard {
+        Impl* impl;
+        bool complete = false;
+        ~PreparationGuard() {
+            if (!complete)
+                for (auto& device : impl->devices) device.prepared = false;
+        }
+    } preparation{impl_.get()};
     try {
         impl_->initialize();
         const auto identities = impl_->identities();
@@ -560,7 +583,15 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
             d.output_possible = false;
             d.touched = true;
 
-            // 下发前先把设备上可能残留的上一次测量停掉。
+            // Stable successful frames only re-arm AVS_Measure. Reconfiguring
+            // SYNC/Prepare on every TTL cycle adds unnecessary USB transactions.
+            const unsigned char sync = request.synchronized && master ? 1 : 0;
+            if (d.prepared && d.prepared_sync == sync &&
+                std::memcmp(&d.prepared_config, &d.config, sizeof(MeasureConfig)) == 0)
+                continue;
+            d.prepared = false;
+
+            // 初次准备、参数变化或前次异常时，清理可能残留的测量。
             //
             // 为什么必须无条件清：超时（capture_timeout）那条路径会直接 return，
             // 被 arm 过的通道就留在 pending 状态；如果残留是**上一个进程**留下的
@@ -570,14 +601,15 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
             // 这是清场动作、不是断言，所以返回码不参与判定——紧接着的 prepare 会说话。
             (void)impl_->api.stop(d.handle);
 
-            int rc = impl_->api.sync(d.handle, request.synchronized && master ? 1 : 0);
+            int rc = impl_->api.sync(d.handle, sync);
             if (rc != 0)
-                return Error::make(ErrorKind::device, "set_sync_failed",
-                                   "AVS_SetSyncMode " + d.serial + " failed: " + std::to_string(rc));
+                return capture_sdk_error("AVS_SetSyncMode", d.serial, rc, "set_sync_failed");
             rc = impl_->api.prepare(d.handle, &d.config);
             if (rc != 0)
-                return Error::make(ErrorKind::device, "prepare_failed",
-                                   "AVS_PrepareMeasure " + d.serial + " failed: " + std::to_string(rc));
+                return capture_sdk_error("AVS_PrepareMeasure", d.serial, rc, "prepare_failed");
+            d.prepared_config = d.config;
+            d.prepared_sync = sync;
+            d.prepared = true;
         }
 
         for (std::uint32_t shot = 0; shot < request.scans; ++shot) {
@@ -592,8 +624,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                                        "the deadline passed before every channel was armed");
                 const int rc = impl_->api.measure(impl_->devices[i].handle, nullptr, 1);
                 if (rc != 0)
-                    return Error::make(ErrorKind::device, "measure_failed",
-                                       "AVS_Measure " + impl_->devices[i].serial + " failed: " + std::to_string(rc));
+                    return capture_sdk_error("AVS_Measure", impl_->devices[i].serial, rc, "measure_failed");
                 group.arm_order.push_back(impl_->devices[i].serial);
             }
 
@@ -624,8 +655,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                     auto& d = impl_->devices[active[k]];
                     const int rc = impl_->api.poll(d.handle);
                     if (rc < 0)
-                        return Error::make(ErrorKind::device, "poll_failed",
-                                           "AVS_PollScan " + d.serial + " failed: " + std::to_string(rc));
+                        return capture_sdk_error("AVS_PollScan", d.serial, rc, "poll_failed");
                     if (rc == 0) continue;
                     if (rc != 1)
                         return Error::make(ErrorKind::device, "poll_unexpected",
@@ -634,8 +664,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                     unsigned int ticks = 0;
                     const int src = impl_->api.scope(d.handle, &ticks, counts.data());
                     if (src != 0)
-                        return Error::make(ErrorKind::device, "scope_failed",
-                                           "AVS_GetScopeData " + d.serial + " failed: " + std::to_string(src));
+                        return capture_sdk_error("AVS_GetScopeData", d.serial, src, "scope_failed");
                     if (!std::all_of(counts.begin(), counts.end(), [](double v) { return std::isfinite(v); }))
                         return Error::make(ErrorKind::device, "non_finite_spectrum",
                                            "the spectrum from " + d.serial + " contains non-finite values");
@@ -656,6 +685,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
         }
         result.received_groups = static_cast<std::uint32_t>(result.groups.size());
         cleanup.active = false;
+        preparation.complete = true;
         return result;
     } catch (const std::exception& e) {
         return Error::make(ErrorKind::transport, "capture_failed", e.what());

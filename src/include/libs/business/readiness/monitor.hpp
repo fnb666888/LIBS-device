@@ -45,7 +45,7 @@ public:
     ReadinessMonitor& operator=(const ReadinessMonitor&) = delete;
 
     // 现状：UI 请求时同步跑一次。**这是 UI 与业务二共用的判定入口。**
-    GateVerdict evaluate_now();
+    GateVerdict evaluate_now(GateCheckPhase phase = GateCheckPhase::before_emission);
 
     // ── 常驻线程：接口先定死，线程实现以后补 ────────────────────────────
     //

@@ -12,14 +12,8 @@ namespace business::measurement {
 namespace {
 
 libs::devices::LaserSessionSettings to_device_settings(const config::LaserFireConfig& cfg) {
-    libs::devices::LaserSessionSettings s;
-    s.discharge_current_a = cfg.discharge_current_a;
-    s.pulse_width_us = cfg.pulse_width_us;
-    s.frequency_hz = cfg.frequency_hz;
-    s.discharge_delay_us = cfg.discharge_delay_us;
-    s.q_delay_us = cfg.q_delay_us;
-    s.q_warmup_s = cfg.q_warmup_s;
-    return s;
+    return {cfg.discharge_current_a, cfg.pulse_width_us, cfg.frequency_hz,
+            cfg.discharge_delay_us, cfg.q_delay_us, cfg.q_warmup_s};
 }
 
 }  // namespace
@@ -287,6 +281,7 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
                           std::function<void(const SpectrumFrame&)> on_first,
                           SpectrumMeasurement initial) {
     bool first = true;
+    unsigned consecutive_failures = 0;
     while (!stopping_.load()) {
         // ── 纪律 2：运行期重判 ──────────────────────────────────────────
         //
@@ -296,30 +291,64 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
         // 所以这里周期性重判。**判定的执行方和收光的执行方必须是同一个对象**：
         // 不能靠 UI（可能崩/被关/卡住），也不能靠互锁自己
         // （互锁是"事实变了"，它不负责"去把光关掉"）。
-        if (!recheck_gate()) break;
+        if (!recheck_gate(!first)) break;
 
         const SpectrumFrame frame = capture_once(first ? on_armed : std::function<libs::VoidResult()>{},
                                                 first ? &initial : nullptr);
         if (first) { on_first(frame); first = false; }
         if (stopping_.load()) break;
         if (!frame.ok()) {
-            // 采集失败**不终止循环**：激光还在打，光谱仪可能只是偶发丢一帧。
-            // 但每失败一次都要计数并留下最近错误，绝不静默。
+            // An isolated missed trigger may recover; device loss cannot.
             shots_failed_++;
+            ++consecutive_failures;
             // 失败帧也要推给 UI：界面据此把图置灰，让人一眼看出
             // "这一帧不是新数据"，而不是停在上一帧假装一切正常。
             frame_bus_.publish(frame);
-            if (frame.capture_error_code == "laser_spectrometer_rate_mismatch" ||
-                frame.capture_error_code == "capture_parameters_invalid") {
-                libs::devices::LaserOperationTrace trace;
-                (void)laser_->stopContinuous(trace);
+            const auto& code = frame.capture_error_code;
+            const bool fatal = code == "laser_spectrometer_rate_mismatch" ||
+                code == "capture_parameters_invalid" || code == "spectrometer_disconnected" ||
+                code == "serial_not_found" || code == "serial_not_available" ||
+                code == "no_devices" || code == "spectrometer_not_open";
+            const bool abort = fatal || consecutive_failures >= 3;
+            if (abort) {
                 stopping_.store(true);
+                libs::devices::LaserOperationTrace trace;
+                const auto stopped = laser_->stopContinuous(trace);
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    last_error_message_ = frame.capture_error_message +
+                        (fatal ? "；设备或配置异常，已请求自动停止测量。" :
+                                 "；连续三次采集失败，已请求自动停止测量。");
+                    if (!stopped) last_error_message_ += " 停止回读失败：" + stopped.error().message;
+                }
                 running_.store(false);
+                log_record(logging::RecordKind::exception_recovery, "采集异常，自动停止测量",
+                    [&]() {
+                        json::Value v = json::object();
+                        v.set("error_code", json::Value(code));
+                        v.set("detail", json::Value(frame.capture_error_message));
+                        v.set("consecutive_failures", json::Value(static_cast<double>(consecutive_failures)));
+                        v.set("stop_readback_confirmed", json::Value(static_cast<bool>(stopped)));
+                        if (!stopped) v.set("stop_error", json::Value(stopped.error().message));
+                        return v;
+                    });
                 break;
             }
+            log_record(logging::RecordKind::exception_recovery, "采集失败，等待重试",
+                [&]() {
+                    json::Value v = json::object();
+                    v.set("error_code", json::Value(code));
+                    v.set("detail", json::Value(frame.capture_error_message));
+                    v.set("consecutive_failures", json::Value(static_cast<double>(consecutive_failures)));
+                    return v;
+                });
+            // Bound immediate SDK error retries and keep manual stop responsive.
+            for (int i = 0; i < 4 && !stopping_.load(); ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
             continue;
         }
 
+        consecutive_failures = 0;
         shots_captured_++;
         // 帧 → UI（纯内存 push，不碰设备、不阻塞）
         frame_bus_.publish(frame);
@@ -328,7 +357,7 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
     }
 }
 
-bool MeasurementJob::recheck_gate() {
+bool MeasurementJob::recheck_gate(bool emitting) {
     const std::uint64_t now = monotonic_ms();
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -339,7 +368,11 @@ bool MeasurementJob::recheck_gate() {
         last_gate_check_ms_ = now;
     }
 
-    const readiness::GateVerdict verdict = readiness_.evaluate_now();
+    // Preserve B2 facts. Opening Q is expected only after this job has armed
+    // the spectrometers and opened the gate; all other safety checks still apply.
+    const readiness::GateVerdict verdict = readiness_.evaluate_now(emitting
+        ? readiness::GateCheckPhase::during_emission
+        : readiness::GateCheckPhase::before_emission);
     if (verdict.allowed) return true;
 
     // 中途失锁：**自己收光**。不等 UI，不等互锁，不等下一次 status 查询。
@@ -445,6 +478,9 @@ SpectrumFrame MeasurementJob::capture_once(const std::function<libs::VoidResult(
     if (!result) {
         frame.capture_error_code = result.error().code;
         frame.capture_error_message = result.error().message;
+        // Owner cancellation is the normal stop path, not a failed acquisition.
+        // Keep any earlier real error; the loop discards this frame on stopping_.
+        if (stopping_.load() && result.error().code == "capture_cancelled") return frame;
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_code_ = frame.capture_error_code;
         last_error_message_ = frame.capture_error_message;

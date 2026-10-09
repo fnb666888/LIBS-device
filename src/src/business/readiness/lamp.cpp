@@ -9,11 +9,8 @@ lamp_states(MachineState state) {
     using Ch = libs::indicator::Channel;
     using St = libs::indicator::State;
 
-    // 三色灯 + 蜂鸣器的全量表：**每次下发都写全 6 个通道**，不能只写变化的那个。
-    // 原因是灯是掉电自保持的设备：只写"绿"不会让"黄"灭掉，
-    // 现场会看到一个从来没被清掉的旧颜色。
-    // 写全量的代价是每路 50 ms 间隔（6 路约 300 ms），
-    // 这个代价换"灯色唯一确定"是值得的。
+    // 完整业务意图。驱动按型号先全灭，再点亮使用的颜色，避免残留旧灯色；
+    // 不向三色灯发送蓝/白指令，也不要求 K50 支持逐路关闭。
     std::map<Ch, St> table;
     switch (state) {
         case MachineState::ready:
@@ -73,7 +70,7 @@ libs::Result<libs::devices::IndicatorApplyReport> apply_lamp(
         return libs::Error::make(libs::ErrorKind::unsupported, "indicator_not_open",
                                  "状态灯未打开或未启用，本次灯色未下发");
     }
-    return indicator->applyAll(lamp_states(state), /*verify=*/false);
+    return indicator->applyAll(lamp_states(state), /*verify=*/true);
 }
 
 }  // namespace business::readiness

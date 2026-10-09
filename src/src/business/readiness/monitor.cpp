@@ -104,9 +104,9 @@ ReadinessFacts ReadinessMonitor::collect_facts() const {
     return facts;
 }
 
-GateVerdict ReadinessMonitor::evaluate_now() {
+GateVerdict ReadinessMonitor::evaluate_now(GateCheckPhase phase) {
     const ReadinessFacts facts = collect_facts();
-    const GateVerdict verdict = evaluate(facts);
+    const GateVerdict verdict = evaluate(facts, phase);
     const MachineState state = state_of(facts, verdict);
     std::lock_guard<std::mutex> lock(mutex_);
     latest_ = verdict;

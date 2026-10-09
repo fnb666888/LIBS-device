@@ -3,10 +3,13 @@
 // 坏 JSON、缺字段、未知命令都必须返回 JSON 错误，而不是抛异常、也不是静默成功。
 // 全程 open_devices=false：不开任何串口、不加载 SDK。
 #include <string>
+#include <fstream>
+#include "libs/measurement_limits.hpp"
 
 #include "check.hpp"
 #include "libs/business/app/runtime.hpp"
 #include "libs/business/app/facade.hpp"
+#include "libs/business/measurement/capture_plan.hpp"
 
 using namespace business;
 using libs::ErrorKind;
@@ -50,6 +53,25 @@ const char* error_kind_of(const app::Response& response) {
 }  // namespace
 
 TEST_MAIN_BEGIN()
+
+CASE(stopped_runtime_rejects_device_commands_and_supports_restart); {
+    Fixture f("lifecycle");
+    CHECK(f.runtime.stop());
+    CHECK(f.runtime.stop()); // explicit stop followed by destructor must also be safe
+    CHECK(!f.runtime.running());
+    const auto precheck = f.facade.dispatch(R"({"command":"precheck","args":{}})");
+    CHECK(!precheck.ok);
+    CHECK_EQ(precheck.payload["error"]["code"].as_string(), std::string("precheck_not_ready"));
+    const auto measurement = f.facade.dispatch(R"({"command":"measurement_start","args":{}})");
+    CHECK(!measurement.ok);
+    app::Runtime::Options options;
+    options.open_devices = false;
+    options.data_dir = f.data_dir;
+    CHECK(f.runtime.start(template_config(), options));
+    CHECK(f.runtime.running());
+    CHECK(f.facade.dispatch(R"({"command":"ping","args":{}})").ok);
+    CHECK(f.runtime.stop());
+}
 
 CASE(facade_ping_reports_running_and_command_list); {
     Fixture f("ping");
@@ -181,6 +203,117 @@ CASE(fresh_store_is_seeded_with_the_real_device_parameters); {
         CHECK(r.as_string() != std::string("parameters_incomplete"));
         CHECK(r.as_string() != std::string("laser_not_commissioned"));
     }
+}
+
+CASE(partial_persisted_parameters_keep_priority_over_defaults_and_request_overrides); {
+    const char* tag = "partial_defaults";
+    const std::string dir = ::testing::scratch("build/tmp_facade_partial_defaults");
+    std::filesystem::create_directories(dir);
+    {
+        config::FileParameterStore store(dir + "/parameters.json",
+            app::ParameterService::required_groups(), app::ParameterService::required_fields());
+        CHECK(store.apply("laser", {{"discharge_current_a", 75.0}}).completed());
+        CHECK(store.apply("spectrometer", {{"integration_ms", 7.5}}).completed());
+    }
+    {
+        Fixture f(tag);
+        const auto measurement = f.runtime.parameter_service().spectrometer_measurement();
+        CHECK_EQ(measurement.integration_ms, 7.5);
+        CHECK_EQ(measurement.timeout_ms, 10000u);
+        CHECK_EQ(measurement.integration_delay_ns, 1280.0);
+        const auto request = measurement::build_capture_request(template_config(), measurement);
+        CHECK_EQ(request.integration_ms, 7.5);
+        CHECK_EQ(request.timeout_ms, 10000u);
+        CHECK_EQ(request.integration_delay_ns, 1280.0);
+        CHECK(request.wait_for_laser_trigger);
+
+        json::Value args = json::object();
+        json::Value spectral_override = json::object();
+        spectral_override.set("integration_ms", json::Value(9.5));
+        args.set("spectrometer", std::move(spectral_override));
+        const auto overridden = f.runtime.parameter_service().fire_parameters(args);
+        CHECK(overridden);
+        if (overridden) {
+            CHECK_EQ(overridden.value().integration_ms, 9.5);
+            CHECK_EQ(overridden.value().capture_timeout_ms, 10000u);
+            CHECK_EQ(overridden.value().integration_delay_ns, 1280.0);
+            CHECK_EQ(overridden.value().laser.discharge_current_a, 75u);
+            CHECK_EQ(overridden.value().laser.pulse_width_us, 200u);
+            CHECK(overridden.value().override_integration);
+        }
+    }
+    // 重启继续使用保存值，本次请求覆盖值不写回；seed 只补缺失字段。
+    Fixture restarted(tag);
+    const auto params = restarted.runtime.parameter_service().fire_parameters(json::object());
+    CHECK(params);
+    if (params) {
+        CHECK_EQ(params.value().integration_ms, 7.5);
+        CHECK_EQ(params.value().laser.discharge_current_a, 75u);
+        CHECK_EQ(params.value().integration_delay_ns, 1280.0);
+        CHECK(!params.value().override_integration);
+    }
+}
+
+CASE(parameter_limits_apply_to_saving_and_request_overrides_without_partial_updates); {
+    Fixture f("limits");
+    for (const auto& range : libs::measurement_limits::kRanges) {
+        const std::string group(range.group), field(range.field);
+        for (double value : {range.lo, range.hi, range.lo - 1.0, range.hi + 1.0}) {
+            json::Value values = json::object(); values.set(field, json::Value(value));
+            json::Value args = json::object();
+            args.set("group", json::Value(group)); args.set("values", values);
+            json::Value command = json::object();
+            command.set("command", json::Value("param_set")); command.set("args", args);
+            const auto saved = f.facade.dispatch(json::stringify(command));
+            CHECK_EQ(saved.ok, range.contains(value));
+            if (!saved.ok) {
+                CHECK_EQ(saved.error.code, std::string("param_out_of_range"));
+                CHECK_EQ(saved.payload["report"]["failed_fields"].as_array().size(), std::size_t(1));
+            }
+            // 再单独验证本次覆盖；越界保存已拒绝，参数库仍保持合法值。
+            args = json::object(); args.set(group, values);
+            const auto overridden = f.runtime.parameter_service().fire_parameters(args);
+            CHECK_EQ(overridden.ok(), range.contains(value));
+        }
+        if (range.integer) {
+            json::Value values = json::object(); values.set(field, json::Value(range.lo + 0.5));
+            json::Value args = json::object(); args.set(group, values);
+            CHECK(!f.runtime.parameter_service().fire_parameters(args));
+            // 绕过门面直接写参数库，也必须拒绝小数。
+            CHECK(!f.runtime.parameters()->apply(group, {{field, range.lo + 0.5}}).completed());
+        }
+    }
+    // 大整数不能先截成 unsigned 再通过量程检查。
+    json::Value laser = json::object(); laser.set("discharge_current_a", json::Value(4294967376.0));
+    json::Value args = json::object(); args.set("laser", laser);
+    CHECK(!f.runtime.parameter_service().fire_parameters(args));
+    const auto before = f.runtime.parameter_service().spectrometer_measurement();
+    const auto rejected = f.facade.dispatch(R"({"command":"param_set","args":{"group":"spectrometer","values":{"integration_ms":12,"capture_timeout_ms":600001}}})");
+    CHECK(!rejected.ok);
+    CHECK_EQ(f.runtime.parameter_service().spectrometer_measurement().integration_ms, before.integration_ms);
+    CHECK(!f.runtime.parameters()->apply("spectrometer", {{"integration_ms", 12},
+        {"integration_delay_ns", 1000001}}).completed());
+    CHECK_EQ(f.runtime.parameter_service().spectrometer_measurement().integration_ms, before.integration_ms);
+}
+
+CASE(historical_out_of_range_parameters_are_preserved_but_block_measurement); {
+    const char* tag = "invalid_saved_limits";
+    { Fixture f(tag); }
+    const std::string path = "build/tmp_facade_invalid_saved_limits/parameters.json";
+    std::ifstream in(path); std::string text((std::istreambuf_iterator<char>(in)), {}); in.close();
+    json::Value root;
+    CHECK(json::parse(text, root).ok);
+    root.as_object()["groups"].as_object()["spectrometer"].as_object()["values"]
+        .set("capture_timeout_ms", json::Value(4294967376.0));
+    std::ofstream out(path); out << json::stringify(root); out.close();
+    Fixture restarted(tag);
+    CHECK(!restarted.runtime.parameter_service().readiness().ready);
+    CHECK(!restarted.runtime.parameter_service().fire_parameters(json::object()));
+    CHECK_EQ(restarted.runtime.parameter_service().spectrometer_measurement().timeout_ms, 0u);
+    const auto get = restarted.facade.dispatch(R"({"command":"param_get","args":{}})");
+    CHECK_EQ(get.payload["groups"]["spectrometer"]["values"]["capture_timeout_ms"].as_number(), 4294967376.0);
+    CHECK(restarted.facade.dispatch(R"({"command":"param_set","args":{"group":"spectrometer","values":{"capture_timeout_ms":10000}}})").ok);
+    CHECK(restarted.runtime.parameter_service().readiness().ready);
 }
 
 CASE(param_set_of_an_unused_group_does_not_affect_measurement_readiness); {
@@ -594,5 +727,20 @@ CASE(capture_refuses_active_measurement_and_shutdown_is_explicit); {
     f.runtime.end_laser_session();
     const auto shutdown = f.facade.dispatch(R"({"command":"shutdown"})");
     CHECK(shutdown.ok); CHECK(f.runtime.shutdown_requested());
+}
+CASE(prediction_routes_are_independent_of_device_readiness); {
+    Fixture f("prediction_routes");
+    const auto status = f.facade.dispatch(R"({"command":"prediction","args":{"action":"status"}})");
+    CHECK(status.ok); CHECK(status.payload["available"].as_bool());
+    CHECK(!status.payload["enabled"].as_bool()); CHECK(status.payload["latest"].is_null());
+    const auto snapshot = f.facade.dispatch(R"({"command":"status"})");
+    CHECK(snapshot.payload["prediction"].is_object());
+    const auto contract = f.facade.dispatch(R"({"command":"prediction","args":{"action":"contract"}})");
+    CHECK(contract.ok); CHECK_EQ(contract.payload["schema_version"].as_string(), std::string("libs.algorithm.v1"));
+    CHECK(!f.facade.dispatch(R"({"command":"prediction","args":{"action":"configure","enabled":true,"branch":"auto"}})").ok);
+    CHECK(!f.facade.dispatch(R"({"command":"prediction","args":{"action":"configure","enabled":"true"}})").ok);
+    CHECK(!f.facade.dispatch(R"({"command":"prediction","args":{"action":"analyze","input":{}}})").ok);
+    const auto disabled = f.facade.dispatch(R"({"command":"prediction","args":{"action":"configure","enabled":false}})");
+    CHECK(disabled.ok); CHECK(!f.runtime.laser_session_active());
 }
 TEST_MAIN_RETURN()

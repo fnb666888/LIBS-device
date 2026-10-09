@@ -124,8 +124,6 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     monitor_->set_laser_commissioned(parameters_service_.commissioned_from_store());
     monitor_->set_spectrometer_ready(config_.spectrometer.enabled);
 
-    precheck_ = std::make_unique<readiness::PrecheckService>(*monitor_, devices_.indicator());
-
     // ── shared：数据交付 ────────────────────────────────────────────────
     local_sink_ = std::unique_ptr<data_delivery::DeliverySink>(
         new data_delivery::LocalFileSink(captures_dir));
@@ -149,6 +147,8 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     }
     // 设备开了没有，是一个**事实**，交给判定去解释。
     monitor_->set_devices_opened(devices_.laser() != nullptr);
+    // Bind the indicator after opening devices; beforehand it is always null.
+    precheck_ = std::make_unique<readiness::PrecheckService>(*monitor_, devices_.indicator());
 
     // ── measurement：业务二 ─────────────────────────────────────────────
     //
@@ -168,6 +168,9 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
         return parameters_service_.spectrometer_measurement();
     });
 
+    prediction_ = std::make_unique<measurement::prediction::Service>(frame_bus_, data_dir + "/predictions");
+    prediction_->start();  // No devices or inference in the sampling loop.
+
     // 开机就把灯刷到位：现场看到的第一眼必须是真实结论，不是"上一次的灯色"。
     // 此时还没布防，状态停在 standby -> 黄灯。预检（precheck->run()）会
     // arm() + evaluate() 并再刷一次。
@@ -182,7 +185,18 @@ libs::VoidResult Runtime::stop() {
         // start 中途失败也可能已经建出 measurement_（它是在 devices_.open()
         // 之后构造的）。它没跑起来，析构会兜底，但这里先 stop() 一次是零成本的，
         // 而且能把"设备还没关、作业已经不在了"这个顺序摆正。
-        if (measurement_ != nullptr) measurement_->stop();
+        if (measurement_ != nullptr) {
+            measurement_->stop();
+            measurement_.reset();
+        }
+        if (prediction_ != nullptr) {
+            prediction_->stop();
+            prediction_.reset();
+        }
+        if (precheck_ != nullptr) {
+            precheck_->force_offline();
+            precheck_.reset();
+        }
         devices_.close();   // start 中途打开过也要关
         return libs::VoidResult();
     }
@@ -206,7 +220,12 @@ libs::VoidResult Runtime::stop() {
                             : ("停止测量作业时收光未确认（现场需人工确认光闸）: " +
                                stopped.error().message));
     }
+    // The job destructor also stops the laser. Destroy it while its device
+    // pointers are still valid, before DeviceSession releases those objects.
+    measurement_.reset();
     end_laser_session();
+    if (prediction_ != nullptr) prediction_->stop();
+    prediction_.reset();
 
     // 灯必须**在关设备之前**刷成"全灭"。顺序反了 = 灯色停在最后一个业务状态
     // （比如还绿着），而软件已经关了。下次开机前现场看到的是一片绿的机器，
@@ -215,6 +234,7 @@ libs::VoidResult Runtime::stop() {
     // 退出路径要的是**全灭**，不是撤防后的 standby 黄灯 —— 软件都要关了，
     // 留一圈灯在假装系统还活着。
     if (precheck_ != nullptr) precheck_->force_offline();
+    precheck_.reset();
     const libs::VoidResult closed = devices_.close();
     log_->write(logging::RecordKind::general,
                 closed ? "设备已关闭" : ("设备关闭报错: " + closed.error().message));

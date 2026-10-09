@@ -92,6 +92,7 @@ struct MachineSnapshot {
     QString readiness_summary;
     // {"laser": {"values": {...}, "complete": bool}, ...}
     QJsonObject param_values;
+    QJsonObject prediction;  // Asynchronous model state and correlated result.
 
     // 一次 status 往返的错误（守护进程没起 / 管道错）。有值时 valid=false，
     // 但**上面那些字段仍保留上一帧的好数据**，UI 据此显示"数据已过期"。

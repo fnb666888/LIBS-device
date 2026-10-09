@@ -383,6 +383,34 @@ CASE(evaluate_every_safety_bit_has_its_own_reason); {
     }
 }
 
+CASE(emission_phase_preserves_interlocks_while_accepting_the_commanded_q_gate); {
+    auto facts = armed_facts();
+    facts.laser.q_gate = false;  // B2 physically reports the gate open.
+    CHECK(!readiness::evaluate(facts).allowed);
+    CHECK(blocked_by(readiness::evaluate(facts), readiness::GateReason::q_gate_open));
+    const auto phase = readiness::GateCheckPhase::during_emission;
+    CHECK(readiness::evaluate(facts, phase).allowed);
+    const auto safe = facts;
+    const auto denied = [&](readiness::GateReason reason) {
+        const auto verdict = readiness::evaluate(facts, phase);
+        CHECK(!verdict.allowed);
+        CHECK(blocked_by(verdict, reason));
+        facts = safe;
+    };
+    facts.laser.interlock_1 = false; denied(readiness::GateReason::interlock_open);
+    facts.laser.interlock_2 = false; denied(readiness::GateReason::interlock_open);
+    facts.laser.emergency_stop = false; denied(readiness::GateReason::emergency_stopped);
+    facts.laser.over_temperature = false; denied(readiness::GateReason::over_temperature);
+    facts.laser.fault_bits = 4; denied(readiness::GateReason::laser_fault);
+    facts.laser.available = false; denied(readiness::GateReason::laser_unavailable);
+    facts.parameters_complete = false; denied(readiness::GateReason::parameters_incomplete);
+    facts.laser_commissioned = false; denied(readiness::GateReason::laser_not_commissioned);
+    facts.devices_opened = false; denied(readiness::GateReason::not_enabled);
+    facts.laser_enabled = false; denied(readiness::GateReason::not_enabled);
+    facts.spectrometer_ready = false; denied(readiness::GateReason::not_enabled);
+    facts.armed = false; CHECK(!readiness::evaluate(facts, phase).allowed);
+}
+
 CASE(evaluate_never_returns_empty_blocked_list_when_denied); {
     // 排障需要"到底哪几条不满足"，不能只给一个 bool。
     const readiness::ReadinessFacts f{};   // 全默认：未布防 + 读不到激光 + 未使能

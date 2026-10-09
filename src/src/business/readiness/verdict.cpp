@@ -24,7 +24,7 @@ const char* GateVerdict::primary_reason() const noexcept {
     return blocked_by.empty() ? "ready" : to_string(blocked_by.front());
 }
 
-GateVerdict evaluate(const ReadinessFacts& facts) {
+GateVerdict evaluate(const ReadinessFacts& facts, GateCheckPhase phase) {
     GateVerdict v;
 
     // “能不能出光”不只看激光器自己。设备没打开、或者光谱仪不可用时也不能出光：
@@ -57,7 +57,7 @@ GateVerdict evaluate(const ReadinessFacts& facts) {
         if (!facts.laser.emergency_stop) {
             v.blocked_by.push_back(GateReason::emergency_stopped);
         }
-        if (!facts.laser.q_gate) {
+        if (!facts.laser.q_gate && phase == GateCheckPhase::before_emission) {
             v.blocked_by.push_back(GateReason::q_gate_open);
         }
         if (facts.laser.has_fault()) {

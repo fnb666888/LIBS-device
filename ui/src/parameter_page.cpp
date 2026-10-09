@@ -5,6 +5,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QLabel>
+#include <QLocale>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QDoubleSpinBox>
@@ -12,6 +13,7 @@
 
 #include "theme.hpp"
 #include "widgets.hpp"
+#include "libs/measurement_limits.hpp"
 
 namespace libs::ui {
 namespace {
@@ -45,9 +47,17 @@ namespace {
 // 那两个恒 0 的字段曾经放在一个叫 `trigger` 的第三组里，现在整组已删除。
 
 QString fmt_range(double lo, double hi, int decimals, const char* unit) {
-    QString text = QStringLiteral("%1 ~ %2 %3")
-                       .arg(QString::number(lo, 'f', decimals))
-                       .arg(QString::number(hi, 'f', decimals))
+    const auto format = [decimals](double value) {
+        QString result = QLocale(QLocale::English).toString(value, 'f', decimals);
+        if (decimals > 0) {
+            while (result.endsWith(QLatin1Char('0'))) result.chop(1);
+            if (result.endsWith(QLatin1Char('.'))) result.chop(1);
+        }
+        return result;
+    };
+    QString text = QStringLiteral("%1 – %2 %3")
+                       .arg(format(lo))
+                       .arg(format(hi))
                        .arg(QString::fromUtf8(unit));
     return text;
 }
@@ -60,32 +70,32 @@ QString fmt_range(double lo, double hi, int decimals, const char* unit) {
 // 老问题。
 
 const ParameterPage::FieldSpec* ParameterPage::laser_specs(std::size_t& count) {
-    // 量程**逐个抄自后端** `facade.cpp` 的 kRanges 表与
-    // `site_config.cpp` 的 validate_laser_fire()，不是抄自设计文档。
+    // 量程来自共用的 measurement_limits.hpp，不在 UI 复制数值。
+    // 同一份规则用于参数保存、业务校验和驱动。
     // 以前这里下限全是 0.0，于是界面允许输入 0，后端当场拒绝 ——
     // "界面能填但存不进去"比直接禁掉更难查。
     //
     // 上下限收紧还有一层用意：未标定框会被推到本字段下限（见 apply_values），
     // 下限非 0 的字段因此一眼就能看出"这里要填数"，而不会是 0。
     static const FieldSpec kLaserFields[] = {
-        {"discharge_current_a", "放电电流", 15.0, 100.0, 1, "A",
+        {"discharge_current_a", "放电电流", 1, "A",
          "协议 0x11：量程 15~100 A。真机默认 80 A。超过 30 A 属高功率区，提交后二次确认。"},
-        {"pulse_width_us", "放电脉宽", 50.0, 300.0, 0, "μs",
+        {"pulse_width_us", "放电脉宽", 0, "μs",
          "协议 0x12：量程 50~300 μs。真机默认 200 μs。"},
-        {"frequency_hz", "放电频率", 1.0, 10.0, 0, "Hz",
+        {"frequency_hz", "放电频率", 0, "Hz",
          "协议 0x13：量程 1~10 Hz。真机默认 1 Hz。"},
-        {"discharge_delay_us", "放电延时", 0.0, 500.0, 0, "μs",
+        {"discharge_delay_us", "放电延时", 0, "μs",
          "协议 0x14：量程 0~500 μs。真机默认 0 μs。"},
-        {"q_delay_us", "Q 延时", 2.0, 500.0, 0, "μs",
+        {"q_delay_us", "Q 延时", 0, "μs",
          "协议 0x16：量程 2~500 μs。真机默认 210 μs —— Q 开关靠这个值决定巨脉冲，"
          "取量程下限(2 μs)等于不调 Q、不出光。"},
-        {"q_warmup_s", "Q 预热", 0.0, 3600.0, 0, "s",
-         "协议 0x19（未标量程）。真机默认 0 s。Q 开关接通后的等待时间。"},
-        {"settle_timeout_ms", "稳定等待超时", 1.0, 600000.0, 0, "ms",
+        {"q_warmup_s", "Q 预热", 0, "s",
+         "协议 0x19 未标厂家量程，软件允许 0~3600 s。真机默认 0 s。"},
+        {"settle_timeout_ms", "稳定等待超时", 0, "ms",
          "设备从 02「自适应中」走到 01「正在工作」的等待上限。真机默认 20000 ms。"},
-        {"emission_hold_ms", "出光保持", 0.0, 600000.0, 0, "ms",
+        {"emission_hold_ms", "出光保持", 0, "ms",
          "光闸保持打开的时长 = 连续出光窗口。真机默认 3000 ms。"},
-        {"min_discharges", "最小放电次数", 1.0, 100000.0, 0, "次",
+        {"min_discharges", "最小放电次数", 0, "次",
          "至少放这么多次电才算出光。真机默认 1 次。计数器不涨 = 没放电 = 失败。"},
     };
     count = sizeof(kLaserFields) / sizeof(FieldSpec);
@@ -99,11 +109,11 @@ const ParameterPage::FieldSpec* ParameterPage::spectrometer_specs(std::size_t& c
     // 摆到界面上等于给现场准备了一个"一调就永远不出光"的开关。
     // 那两个恒 0 的字段曾经放在一个叫 `trigger` 的第三组里，现在整组已删除。
     static const FieldSpec kSpectrometerFields[] = {
-        {"integration_ms", "积分时间", 0.002, 60000.0, 3, "ms",
-         "驱动硬校验 0.002~60000 ms。超范围后端直接拒绝。真机默认 1.05 ms。"},
-        {"capture_timeout_ms", "采集超时", 1.0, 600000.0, 0, "ms",
+        {"integration_ms", "积分时间", 3, "ms",
+         "软件允许 0.002~60000 ms；具体探测器最小积分时间另由厂家 SDK 校验。真机默认 1.05 ms。"},
+        {"capture_timeout_ms", "采集超时", 0, "ms",
          "等 pin6 触发的超时，必须覆盖整个出光窗口。真机默认 10000 ms。"},
-        {"integration_delay_ns", "积分延时", 0.0, 1000000.0, 0, "ns",
+        {"integration_delay_ns", "积分延时", 0, "ns",
          "收到激光 TTL 后延迟多久开始积分。真机默认 1280 ns；每个样品要重新标定。"},
     };
     count = sizeof(kSpectrometerFields) / sizeof(FieldSpec);
@@ -116,40 +126,47 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
     setObjectName(QStringLiteral("parameterPage"));
 
     auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(12, 12, 12, 12);
-    outer->setSpacing(10);
+    outer->setContentsMargins(24, 22, 24, 22);
+    outer->setSpacing(16);
+    auto* heading = new QLabel(QStringLiteral("仪器参数"), this);
+    heading->setObjectName(QStringLiteral("pageTitle"));
+    outer->addWidget(heading);
+    outer->addWidget(make_hint(QStringLiteral("调整本次测量的激光工作点与光谱采集时序。")));
 
     // 参数齐备状态条。这一条直接决定门禁里的 parameters_incomplete，
     // 所以必须**如实显示**，包括"还不知道"（param_get 这一轮失败）。
     readiness_dot_ = new StatusDot(this);
     readiness_dot_->set_state(Level::Idle, QStringLiteral("参数齐备状态未知"));
     readiness_text_ = make_hint(QStringLiteral("尚未从守护进程读到参数齐备状态。"));
-    outer->addWidget(readiness_dot_);
-    outer->addWidget(readiness_text_);
+    auto* readiness_row = new QHBoxLayout;
+    readiness_row->addWidget(readiness_dot_);
+    readiness_row->addSpacing(14);
+    readiness_row->addWidget(readiness_text_, 1);
+    outer->addLayout(readiness_row);
 
     // 表单放进滚动区：12 个字段 + 两个按钮在 1180x720 的屏上放不下，
     // 而"放不下就得拖窗口"在工控触摸屏上不可接受。
     auto* scroll = new QScrollArea(this);
     scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     scroll->setFrameShape(QFrame::NoFrame);
     auto* host = new QWidget(scroll);
-    auto* form = new QVBoxLayout(host);
-    form->setContentsMargins(0, 0, 8, 0);
-    form->setSpacing(10);
+    auto* form = new QHBoxLayout(host);
+    form->setContentsMargins(0, 0, 4, 0);
+    form->setSpacing(18);
 
     Group laser;
     laser.name = QStringLiteral("laser");
     laser.title = QStringLiteral("激光器参数");
     build_group(laser);
-    form->addWidget(laser.card);
+    form->addWidget(laser.card, 3, Qt::AlignTop);
 
     Group spec;
     spec.name = QStringLiteral("spectrometer");
     spec.title = QStringLiteral("光谱仪参数");
     build_group(spec);
-    form->addWidget(spec.card);
+    form->addWidget(spec.card, 2, Qt::AlignTop);
 
-    form->addStretch(1);
     groups_ = {laser, spec};   // Group 持的是指针，值拷贝安全
 
     scroll->setWidget(host);
@@ -157,8 +174,7 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
 
     // 保存结果行。常驻，不是弹窗：一次改多个字段时，结果要能一直看着。
     save_result_ = make_hint(QStringLiteral(
-        "参数改动立即生效。测量进行中保存，下一帧按新参数采集；"
-        "正在出光的那一次仍用它启动时读到的值。"));
+        "保存后光谱参数用于后续采集；激光会话参数在下次启动测量时使用。"));
     save_result_->setWordWrap(true);
     outer->addWidget(save_result_);
 
@@ -167,7 +183,7 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
 
     // 放弃修改 = 回读。理由：参数可能在别的终端被改过，
     // 界面不能拿自己开窗时的值当真值。
-    discard_btn_ = new QPushButton(QStringLiteral("放弃修改（重新读取）"), this);
+    discard_btn_ = new QPushButton(QStringLiteral("重新读取"), this);
     discard_btn_->setObjectName(QStringLiteral("ghost"));
     discard_btn_->setToolTip(QStringLiteral(
         "丢弃本页未保存的输入，回到守护进程里参数库当前的取值。"));
@@ -176,11 +192,11 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
 
     actions->addStretch(1);
 
-    save_btn_ = new QPushButton(QStringLiteral("保存"), this);
+    save_btn_ = new QPushButton(QStringLiteral("保存参数"), this);
     save_btn_->setObjectName(QStringLiteral("primary"));
     save_btn_->setMinimumWidth(140);
     save_btn_->setToolTip(QStringLiteral(
-        "把本页改动过的字段发给守护进程。改动立即生效。"));
+        "保存本页已修改的参数。光谱参数用于后续采集，激光会话参数在下次启动时使用。"));
     connect(save_btn_, &QPushButton::clicked, this, &ParameterPage::on_save);
     actions->addWidget(save_btn_);
 
@@ -191,76 +207,82 @@ void ParameterPage::build_group(Group& g) {
     g.card = new Card(g.title, this);
     g.dot = new StatusDot(g.card);
     g.dot->set_state(Level::Idle, QStringLiteral("未修改"));
+    g.dot->set_max_width(160);
     g.card->add_header_widget(g.dot);
+    g.card->set_hint(g.name == QLatin1String("laser")
+        ? QStringLiteral("每次测量可设置的六项激光会话参数。")
+        : QStringLiteral("积分时间与触发延时决定光谱采集窗口。"));
 
     std::size_t count = 0;
-    const FieldSpec* specs = (g.name == QLatin1String("laser"))
-                                 ? laser_specs(count)
-                                 : spectrometer_specs(count);
-
+    const FieldSpec* specs = g.name == QLatin1String("laser")
+        ? laser_specs(count) : spectrometer_specs(count);
     auto* grid = new QGridLayout;
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(8);
-    grid->setColumnStretch(0, 0);
-    grid->setColumnStretch(1, 0);
-    grid->setColumnStretch(2, 1);
-
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setSpacing(12);
+    auto* advanced = new QWidget(g.card);
+    advanced->setObjectName(QStringLiteral("advancedFields"));
+    auto* advanced_grid = new QGridLayout(advanced);
+    advanced_grid->setContentsMargins(0, 4, 0, 0);
+    advanced_grid->setSpacing(12);
+    const int columns = g.name == QLatin1String("laser") ? 2 : 1;
+    int primary_index = 0, advanced_index = 0;
     for (std::size_t i = 0; i < count; ++i) {
         const FieldSpec& spec = specs[i];
-
-        // 中文裸字面量必须按 UTF-8 解码。用 QLatin1String 会按 latin1 逐字节
-        // 取值，一个汉字的 3 个字节变成 3 个孤立字符 —— 界面上就是"锟斤拷"式乱码。
-        // key/unit 是纯 ASCII，UTF-8 解码结果与原串相同，所以一并换掉。
-        auto* label = new QLabel(QString::fromUtf8(spec.label), g.card);
-        label->setObjectName(QStringLiteral("dim"));
+        const auto* range = libs::measurement_limits::find(g.name.toStdString(), spec.key);
+        Q_ASSERT(range);
+        const bool is_advanced = g.name == QLatin1String("laser") ? i >= 6
+            : QString::fromLatin1(spec.key) == QLatin1String("capture_timeout_ms");
+        const int decimals = range->integer ? 0 : spec.decimals;
+        auto* tile = new QFrame(is_advanced ? advanced : g.card);
+        tile->setObjectName(QStringLiteral("parameterTile"));
+        auto* layout = new QVBoxLayout(tile);
+        layout->setContentsMargins(14, 12, 14, 12);
+        layout->setSpacing(7);
+        auto* label = new QLabel(QString::fromUtf8(spec.label), tile);
+        label->setObjectName(QStringLiteral("parameterLabel"));
+        layout->addWidget(label);
 
         Field f;
         f.key = QString::fromUtf8(spec.key);
-        f.range_text = fmt_range(spec.lo, spec.hi, spec.decimals, spec.unit);
-
-        f.box = new QDoubleSpinBox(g.card);
-        f.box->setDecimals(spec.decimals);
-        f.box->setRange(spec.lo, spec.hi);
-        // 不用 setSingleStep 的缺省 1：量程小到 0.002 ms 的字段
-        // （积分时间）点一下就跳 1 ms，等于一步跳出量程。
-        const double span = spec.hi - spec.lo;
-        f.box->setSingleStep(span <= 10.0 ? 0.001 : 1.0);
-        f.box->setKeyboardTracking(false);   // 输入中途不去后端查，回车/失焦才生效
+        f.range_text = fmt_range(range->lo, range->hi, decimals, spec.unit);
+        f.box = new QDoubleSpinBox(tile);
+        f.box->setObjectName(f.key);
+        f.box->setDecimals(decimals);
+        f.box->setRange(range->lo, range->hi);
+        f.box->setSuffix(QStringLiteral(" ") + QString::fromUtf8(spec.unit));
+        f.box->setSingleStep(range->integer ? 1.0 : 0.001);
+        f.box->setKeyboardTracking(false);
         f.box->setToolTip(QString::fromUtf8(spec.tooltip));
-        f.box->setMinimumWidth(150);
-
-        f.error = new QLabel(g.card);
-        f.error->setObjectName(QStringLiteral("dim"));
-        f.error->setStyleSheet(QStringLiteral("color:%1;").arg(theme::color::danger().name()));
-        f.error->hide();   // 有错才出现
-
-        // 量程提示挂在标签下方（两行标签）。**不是**塞进第三列 ——
-        // 那一列归 f.error（后端拒绝原因）所有，两个提示抢一列会互相顶掉。
-        // range_text 以前只写不读，是死数据，于是界面上从来没显示过量程，
-        // 而卡片说明还在承诺"右侧显示该字段的可输入范围"。
-        auto* label_box = new QWidget(g.card);
-        auto* label_layout = new QVBoxLayout(label_box);
-        label_layout->setContentsMargins(0, 0, 0, 0);
-        label_layout->setSpacing(1);
-        label->setParent(label_box);
-        label_layout->addWidget(label);
-        auto* range_label = new QLabel(f.range_text, label_box);
-        range_label->setObjectName(QStringLiteral("caption"));
-        range_label->setToolTip(QStringLiteral("可输入范围，取自协议量程"));
-        label_layout->addWidget(range_label);
-        grid->addWidget(label_box, static_cast<int>(i), 0);
-        grid->addWidget(f.box, static_cast<int>(i), 1);
-        grid->addWidget(f.error, static_cast<int>(i), 2);
-
+        f.box->setMinimumWidth(140);
+        layout->addWidget(f.box);
+        auto* caption = new QLabel(QStringLiteral("范围 ") + f.range_text, tile);
+        caption->setObjectName(QStringLiteral("caption"));
+        caption->setToolTip(QString::fromUtf8(range->source));
+        layout->addWidget(caption);
+        f.error = new QLabel(tile);
+        f.error->setObjectName(QStringLiteral("parameterError"));
+        f.error->setWordWrap(true);
+        f.error->hide();
+        layout->addWidget(f.error);
+        int& index = is_advanced ? advanced_index : primary_index;
+        auto* target = is_advanced ? advanced_grid : grid;
+        target->addWidget(tile, index / columns, index % columns);
+        ++index;
         connect(f.box, &QDoubleSpinBox::valueChanged, this, &ParameterPage::on_field_changed);
         g.fields.push_back(f);
     }
-
-    // 字段右侧写死量程提示：现场最常见的事是把值改到协议量程外，
-    // 然后困惑于"为什么后端说 parameter_field_bad"。提示写在旁边，
-    // 就不必去翻协议手册。
     g.card->body()->addLayout(grid);
-    g.card->set_hint(QStringLiteral("改动立即生效。字段名下方的范围即该字段的可输入范围。"));
+    auto* toggle = new QPushButton(QStringLiteral("高级设置  +"), g.card);
+    toggle->setObjectName(QStringLiteral("advancedToggle"));
+    toggle->setCheckable(true);
+    toggle->setToolTip(QStringLiteral("展开等待超时、出光窗口或采集判据等设置。"));
+    advanced->hide();
+    connect(toggle, &QPushButton::toggled, advanced, [advanced, toggle](bool visible) {
+        advanced->setVisible(visible);
+        toggle->setText(visible ? QStringLiteral("收起高级设置  −") : QStringLiteral("高级设置  +"));
+    });
+    g.card->body()->addWidget(toggle);
+    g.card->body()->addWidget(advanced);
 }
 
 void ParameterPage::apply_snapshot(const MachineSnapshot& s) {
@@ -486,7 +508,7 @@ void ParameterPage::render_summary(const MachineSnapshot& s) {
     if (s.readiness_ready) {
         readiness_dot_->set_state(Level::Ok, QStringLiteral("参数齐备"));
         readiness_text_->setText(QStringLiteral(
-            "必填测量参数已全部就位，可以发起检测。（是否真的出光由业务层判定，界面不预判。）"));
+            "测量参数已齐备，可在实时光谱页启动检测。"));
         return;
     }
     readiness_dot_->set_state(Level::Warn, QStringLiteral("参数未齐备"));

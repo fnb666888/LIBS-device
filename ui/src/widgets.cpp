@@ -101,20 +101,18 @@ StatusDot::StatusDot(QWidget* parent) : QWidget(parent) {
     detail_->setWordWrap(false);
     detail_->setToolTip(QString());   // 原文只在真被截断时才填
 
-    auto* col = new QVBoxLayout;
-    col->setContentsMargins(0, 0, 0, 0);
-    col->setSpacing(0);
-    col->addWidget(text_);
-    col->addWidget(detail_);
-
-    auto* row = new QHBoxLayout(this);
+    auto* row = new QHBoxLayout;
     row->setContentsMargins(0, 0, 0, 0);
     row->setSpacing(7);
-    row->addWidget(dot_, 0, Qt::AlignTop);
-    row->addLayout(col, 1);
-    // 圆点跟首行文字顶对齐（AlignTop + 底部留 2px），
-    // 比 AlignVCenter 更像"这是这行字的标记"而不是漂浮的图标。
-    dot_->setContentsMargins(0, 2, 0, 0);
+    row->addWidget(dot_, 0, Qt::AlignVCenter);
+    row->addWidget(text_, 1);
+    auto* col = new QVBoxLayout(this);
+    col->setContentsMargins(0, 0, 0, 0);
+    col->setSpacing(1);
+    col->setAlignment(Qt::AlignVCenter);
+    col->addLayout(row);
+    detail_->setContentsMargins(21, 0, 0, 0);
+    col->addWidget(detail_);
 
     pulse_timer_ = new QTimer(this);
     pulse_timer_->setInterval(45);   // ~22fps：够看出在闪，又不跟帧率抢 CPU
@@ -194,8 +192,8 @@ Card::Card(const QString& title, QWidget* parent) : QFrame(parent) {
     header_->addStretch(1);   // add_header_widget 靠这个把控件推到最右
 
     outer_ = new QVBoxLayout(this);
-    outer_->setContentsMargins(14, 12, 14, 13);
-    outer_->setSpacing(10);
+    outer_->setContentsMargins(20, 18, 20, 18);
+    outer_->setSpacing(14);
     outer_->addLayout(header_);
 
     body_ = new QVBoxLayout;

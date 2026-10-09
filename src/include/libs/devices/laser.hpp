@@ -11,14 +11,20 @@
 
 namespace libs::devices {
 
-// 会话参数。只含每次检测允许改变的量；整机标定 0x15/0x17/0x18 不在其中。
+// 会话参数必须全部显式传入，由业务层选择工作点。
+// 只含每次检测允许改变的量；整机标定 0x15/0x17/0x18 不在其中。
 struct LaserSessionSettings {
-    unsigned discharge_current_a = 0;
-    unsigned pulse_width_us = 0;
-    unsigned frequency_hz = 0;
-    unsigned discharge_delay_us = 0;
-    unsigned q_delay_us = 0;
-    unsigned q_warmup_s = 0;
+    LaserSessionSettings(unsigned current, unsigned pulse_width, unsigned frequency,
+                         unsigned discharge_delay, unsigned q_delay, unsigned q_warmup)
+        : discharge_current_a(current), pulse_width_us(pulse_width), frequency_hz(frequency),
+          discharge_delay_us(discharge_delay), q_delay_us(q_delay), q_warmup_s(q_warmup) {}
+
+    unsigned discharge_current_a;
+    unsigned pulse_width_us;
+    unsigned frequency_hz;
+    unsigned discharge_delay_us;
+    unsigned q_delay_us;
+    unsigned q_warmup_s;
 };
 
 // 0xB2 的结构化事实。字段保留设备原始极性，不做门禁换算：

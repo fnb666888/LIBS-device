@@ -72,6 +72,9 @@ $layers = [ordered]@{
         "src/business/measurement/writer.cpp",
         "src/business/measurement/capture_plan.cpp",
         "src/business/measurement/job.cpp",
+        "src/business/measurement/prediction/algorithm_contract.cpp",
+        "src/business/measurement/prediction/model_inference.cpp",
+        "src/business/measurement/prediction/service.cpp",
         # app/：进程边界与装配。ParameterService 放这儿而不是 shared/，
         # 因为它要引用 measurement::FireParameters / SpectrumMeasurement ——
         # 放 shared 会直接违反下面的依赖方向检查。
@@ -186,6 +189,9 @@ $tests = [ordered]@{
     # 帧队列零设备依赖：故意**不链** business 库，让 build 强制保证这一点。
     "test_frame_queue"       = @("tests/test_frame_queue.cpp",      $frameQueueOrder)
     "test_measurement_job"   = @("tests/test_measurement_job.cpp",  $businessOrder)
+    "test_algorithm_contract" = @("tests/test_algorithm_contract.cpp", $businessOrder)
+    "test_model_inference" = @("tests/test_model_inference.cpp", $businessOrder)
+    "test_prediction_service" = @("tests/test_prediction_service.cpp", $businessOrder)
 }
 foreach ($name in $tests.Keys) {
     $source = $tests[$name][0]

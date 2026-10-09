@@ -4,6 +4,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <type_traits>
 
 #include "check.hpp"
 #include "libs/devices/air_conditioner.hpp"
@@ -11,10 +12,14 @@
 #include "libs/devices/laser.hpp"
 #include "libs/devices/rangefinder.hpp"
 #include "libs/hex.hpp"
+#include "libs/measurement_limits.hpp"
 #include "libs/protocols/laser.hpp"
 #include "libs/protocols/modbus_rtu.hpp"
 
 using libs::Bytes;
+
+static_assert(!std::is_default_constructible_v<libs::devices::LaserSessionSettings>,
+              "laser callers must provide all session parameters");
 
 namespace {
 
@@ -100,6 +105,39 @@ Bytes modbus_reply(std::uint8_t address, std::uint8_t function,
 TEST_MAIN_BEGIN()
 
 {
+    CASE(laser_rejects_out_of_range_session_settings_before_any_transaction);
+    struct InvalidField { unsigned libs::devices::LaserSessionSettings::* member; unsigned value; };
+    const InvalidField invalid[] = {
+        {&libs::devices::LaserSessionSettings::discharge_current_a, 0},
+        {&libs::devices::LaserSessionSettings::pulse_width_us, 301},
+        {&libs::devices::LaserSessionSettings::frequency_hz, 11},
+        {&libs::devices::LaserSessionSettings::discharge_delay_us, 501},
+        {&libs::devices::LaserSessionSettings::q_delay_us, 501},
+        {&libs::devices::LaserSessionSettings::q_warmup_s, 3601},
+    };
+    for (const auto& field : invalid) {
+        FakeLink link;
+        libs::devices::Laser laser(link);
+        libs::devices::LaserOperationTrace trace;
+        libs::devices::LaserSessionSettings settings{80, 200, 1, 0, 210, 0};
+        settings.*(field.member) = field.value;
+        const auto prepared = laser.prepareContinuous(settings, 20000, trace);
+        CHECK(!prepared);
+        if (!prepared) CHECK_EQ(prepared.error().code, std::string("bad_laser_parameter"));
+        CHECK(link.sent.empty());
+        CHECK(!laser.fireOnce(settings, 20000, 3000, trace));
+        CHECK(link.sent.empty());
+    }
+    FakeLink link;
+    libs::devices::Laser laser(link);
+    libs::devices::LaserOperationTrace trace;
+    libs::devices::LaserSessionSettings settings{80, 200, 1, 0, 210, 0};
+    CHECK(!laser.prepareContinuous(settings, 600001, trace));
+    CHECK(!laser.fireOnce(settings, 20000, 600001, trace));
+    CHECK(link.sent.empty());
+}
+
+{
     CASE(laser_prepare_open_stop_uses_the_verified_continuous_sequence);
     FakeLink link;
     link.queue(laser_b2(100, false, false));
@@ -109,11 +147,7 @@ TEST_MAIN_BEGIN()
 
     libs::devices::Laser laser(link);
     libs::devices::LaserOperationTrace trace;
-    libs::devices::LaserSessionSettings settings;
-    settings.discharge_current_a = 80;
-    settings.pulse_width_us = 200;
-    settings.frequency_hz = 1;
-    settings.q_delay_us = 210;
+    libs::devices::LaserSessionSettings settings{80, 200, 1, 0, 210, 0};
 
     CHECK(laser.prepareContinuous(settings, 600, trace, 1));
     CHECK(laser.openQGate(trace));
@@ -147,11 +181,7 @@ TEST_MAIN_BEGIN()
 
     libs::devices::Laser laser(link);
     libs::devices::LaserOperationTrace trace;
-    libs::devices::LaserSessionSettings settings;
-    settings.discharge_current_a = 80;
-    settings.pulse_width_us = 200;
-    settings.frequency_hz = 1;
-    settings.q_delay_us = 210;
+    libs::devices::LaserSessionSettings settings{80, 200, 1, 0, 210, 0};
 
     CHECK(laser.fireOnce(settings, 100, 1, trace, 1));
     CHECK_EQ(trace.discharges, std::uint32_t(1));
@@ -207,7 +237,17 @@ TEST_MAIN_BEGIN()
     green_reply.push_back(static_cast<std::uint8_t>(green_crc & 0xFF));
     green_reply.push_back(static_cast<std::uint8_t>(green_crc >> 8));
     link.queue(red_reply);
+    Bytes yellow_reply{0x01, 0x01, 0x00, 0x04, 0x00, 0x00};
+    const auto yellow_crc = libs::modbus::crc16(yellow_reply.data(), yellow_reply.size());
+    yellow_reply.push_back(static_cast<std::uint8_t>(yellow_crc));
+    yellow_reply.push_back(static_cast<std::uint8_t>(yellow_crc >> 8));
+    link.queue(yellow_reply);
     link.queue(green_reply);
+    Bytes buzzer_reply{0x01, 0x01, 0x00, 0x06, 0x00, 0x00};
+    const auto buzzer_crc = libs::modbus::crc16(buzzer_reply.data(), buzzer_reply.size());
+    buzzer_reply.push_back(static_cast<std::uint8_t>(buzzer_crc));
+    buzzer_reply.push_back(static_cast<std::uint8_t>(buzzer_crc >> 8));
+    link.queue(buzzer_reply);
 
     libs::devices::Indicator device(link, 1, "TL50-485", 650, 0);
     std::map<libs::indicator::Channel, libs::indicator::State> states;
@@ -216,8 +256,9 @@ TEST_MAIN_BEGIN()
     const auto report = device.applyAll(states, true);
     CHECK(report);
     if (report) {
-        CHECK_EQ(report.value().writes.size(), std::size_t(2));
-        CHECK_EQ(report.value().queries.size(), std::size_t(2));
+        CHECK_EQ(report.value().writes.size(), std::size_t(1));
+        CHECK_EQ(report.value().queries.size(), std::size_t(4));
+        CHECK(report.value().reset_request == (Bytes{1, 5, 0, 0, 0, 0, 0xCD, 0xCA}));
     }
 }
 

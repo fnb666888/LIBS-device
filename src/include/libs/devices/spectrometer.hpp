@@ -75,14 +75,20 @@ struct FpgaTime {
         return 125.0 * (static_cast<double>(cycles) - 1.0) / 6.0;
     }
 };
-// 单次采集的参数。全部是显式给出的，没有隐式默认值。
+// 工作参数必须显式传入；本机默认值由上层 ParameterService 提供。
+// 接线/通道等可选项仍保留通用初始值，不隐式选择自由触发或本机工作点。
 struct CaptureRequest {
+    CaptureRequest(double integration, std::uint32_t timeout,
+                   double integration_delay, bool laser_trigger)
+        : integration_ms(integration), timeout_ms(timeout),
+          wait_for_laser_trigger(laser_trigger), integration_delay_ns(integration_delay) {}
+
     std::vector<std::string> serials;   // 为空表示"当前可用的全部设备"
     std::string master_serial;          // 可选：指定主通道（外触发源 / 出光设备）
     bool synchronized = false;          // 多通道 SYNC 同步
-    double integration_ms = 10.0;
+    double integration_ms;
     std::uint32_t integration_delay_cycles = 0;   // 原始 FPGA 计数，非微秒
-    std::uint32_t timeout_ms = 3000;
+    std::uint32_t timeout_ms;
     std::uint32_t scans = 1;            // 本驱动做有界多次采集
     std::uint32_t laser_delay_cycles = 0;
     std::uint32_t laser_width_cycles = 0;
@@ -95,15 +101,15 @@ struct CaptureRequest {
     // 抖动 21 ns；不同型号有最小积分延时（AvaSpec-3648-USB2 为 0.28 us，
     // AvaSpec-2048-USB2 为 1.28 us）。
     //
-    // 默认 false = 自由触发，采集随时可开始，不需要外部信号。
+    // 调用方传 false = 自由触发，采集随时可开始，不需要外部信号。
     // 置 true 后没有外触发信号就永远等不到数据，采集会超时。
-    bool wait_for_laser_trigger = false;
+    bool wait_for_laser_trigger;
 
     // 收到触发后延迟多久开始积分。**纳秒**，非 FPGA 计数。
     // 典型 LIBS 场景是"等激光烧蚀产生的等离子体冷却发光"，
     // 需要比激光脉冲本身（几十 us）更长，所以给 0 表示"立刻积分"是可以的，
     // 但通常要配一个几十到几百微秒的值。
-    double integration_delay_ns = 0.0;
+    double integration_delay_ns;
 };
 
 struct Spectrum {

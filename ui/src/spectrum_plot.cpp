@@ -14,8 +14,8 @@ namespace libs::ui {
 namespace {
 constexpr int kLeftMargin = 62;    // 留给纵轴刻度（五位数，整数）
 constexpr int kRightMargin = 10;
-constexpr int kTopMargin = 26;     // 留给图例
-constexpr int kBottomMargin = 26;  // 留给横轴刻度
+constexpr int kTopMargin = 32;     // 留给图例
+constexpr int kBottomMargin = 42;  // 留给横轴刻度与单位
 
 // 纵轴固定 5 条刻度线：0 / 16000 / 32000 / 48000 / 64000。
 // 与厂家参考实现一致：**纵轴不自动缩放**，这样峰高在帧与帧之间可比。
@@ -70,7 +70,7 @@ void SpectrumPlot::set_y_max(double hi) { y_hi_ = std::clamp(hi, 1.0, kYMax); up
 void SpectrumPlot::paintEvent(QPaintEvent*) {
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing, true);
-    p.fillRect(rect(), QColor(0x0A, 0x0E, 0x13));
+    p.fillRect(rect(), theme::color::surface());
 
     const QRectF r(kLeftMargin, kTopMargin,
                    std::max(10, width() - kLeftMargin - kRightMargin),
@@ -82,7 +82,7 @@ void SpectrumPlot::paintEvent(QPaintEvent*) {
 
     // ── 网格 + 纵轴刻度（整数） ──────────────────────────────────────────
     const double yspan = (y_hi_ > y_lo_) ? (y_hi_ - y_lo_) : 1.0;
-    p.setPen(QPen(QColor(0x22, 0x2B, 0x35), 1));
+    p.setPen(QPen(theme::color::border(), 1, Qt::DotLine));
     for (int i = 0; i <= kYTicks; ++i) {
         const double v = y_lo_ + yspan * i / kYTicks;
         const double y = r.bottom() - r.height() * i / kYTicks;
@@ -91,7 +91,7 @@ void SpectrumPlot::paintEvent(QPaintEvent*) {
         p.setPen(theme::color::textFaint());
         p.drawText(QRectF(0, y - 8, kLeftMargin - 6, 16),
                    Qt::AlignRight | Qt::AlignVCenter, label);
-        p.setPen(QPen(QColor(0x22, 0x2B, 0x35), 1));
+        p.setPen(QPen(theme::color::border(), 1, Qt::DotLine));
     }
 
     // ── 横轴刻度（波长）──────────────────────────────────────────────────
@@ -104,10 +104,28 @@ void SpectrumPlot::paintEvent(QPaintEvent*) {
         p.drawText(QRectF(x - 40, r.bottom() + 3, 80, 18),
                    Qt::AlignHCenter | Qt::AlignTop,
                    QString::number(static_cast<qint64>(std::lround(v))));
-        p.setPen(QPen(QColor(0x22, 0x2B, 0x35), 1));
+        p.setPen(QPen(theme::color::border(), 1, Qt::DotLine));
     }
     p.setPen(theme::color::border());
     p.drawRect(r);
+    p.setPen(theme::color::textFaint());
+    p.drawText(QRectF(r.left(), 0, 130, 20), Qt::AlignLeft, QStringLiteral("强度 / counts"));
+    p.drawText(QRectF(r.right() - 110, r.bottom() + 22, 110, 18), Qt::AlignRight, QStringLiteral("波长 / nm"));
+    if (segments_.isEmpty()) {
+        const QRectF box(r.center().x() - 180, r.center().y() - 46, 360, 92);
+        p.setPen(Qt::NoPen);
+        p.setBrush(theme::color::surface());
+        p.drawRoundedRect(box, 12, 12);
+        QFont title = small;
+        title.setPointSize(14);
+        title.setWeight(QFont::DemiBold);
+        p.setFont(title);
+        p.setPen(theme::color::textDim());
+        p.drawText(box.adjusted(0, 13, 0, -42), Qt::AlignCenter, QStringLiteral("等待光谱数据"));
+        p.setFont(small);
+        p.setPen(theme::color::textFaint());
+        p.drawText(box.adjusted(0, 48, 0, -8), Qt::AlignCenter, QStringLiteral("开始测量后，各通道光谱将在此显示"));
+    }
 
     // ── 曲线：QPainter::drawPolyline 直接画，一笔一段 ─────────────────────
     //
@@ -132,7 +150,7 @@ void SpectrumPlot::paintEvent(QPaintEvent*) {
     }
 
     // ── 图例：四路的序列号，按各自颜色 ───────────────────────────────────
-    int lx = r.left() + 4;
+    int lx = r.left() + 150;  // 给左上角的强度单位留出空间。
     for (const Segment& s : segments_) {
         const QColor c = dimmed_ ? theme::color::idle() : s.color;
         p.setPen(QPen(c, 2));

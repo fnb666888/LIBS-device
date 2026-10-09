@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #include "libs/protocols/laser.hpp"
+#include "libs/measurement_limits.hpp"
 
 namespace libs::devices {
 namespace {
@@ -276,9 +278,21 @@ VoidResult Laser::prepareContinuous(const LaserSessionSettings& settings,
                                     LaserOperationTrace& trace,
                                     unsigned poll_interval_ms) {
     std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
-    if (settle_timeout_ms == 0)
+    const std::pair<const char*, unsigned> parameters[] = {
+        {"discharge_current_a", settings.discharge_current_a}, {"pulse_width_us", settings.pulse_width_us},
+        {"frequency_hz", settings.frequency_hz}, {"discharge_delay_us", settings.discharge_delay_us},
+        {"q_delay_us", settings.q_delay_us}, {"q_warmup_s", settings.q_warmup_s},
+    };
+    for (const auto& parameter : parameters) {
+        if (!libs::measurement_limits::accepts("laser", parameter.first, parameter.second)) {
+            trace.failed_step = parameter.first;
+            return op_error(ErrorKind::invalid_argument, "bad_laser_parameter",
+                            std::string(parameter.first) + " 超出允许范围");
+        }
+    }
+    if (!libs::measurement_limits::accepts("laser", "settle_timeout_ms", settle_timeout_ms))
         return op_error(ErrorKind::invalid_argument, "bad_settle_timeout",
-                        "settle_timeout_ms must be positive");
+                        "settle_timeout_ms must be in 1..600000 ms");
     if (poll_interval_ms == 0 && settle_timeout_ms > 1)
         return op_error(ErrorKind::invalid_argument, "bad_poll_interval",
                         "poll_interval_ms must be positive");
@@ -420,8 +434,12 @@ VoidResult Laser::fireOnce(const LaserSessionSettings& settings,
                            LaserOperationTrace& trace,
                            unsigned poll_interval_ms) {
     std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
+    if (!libs::measurement_limits::accepts("laser", "emission_hold_ms", hold_ms))
+        return op_error(ErrorKind::invalid_argument, "bad_emission_hold", "hold_ms 超出允许范围");
     const VoidResult started = startContinuous(settings, settle_timeout_ms,
                                                trace, poll_interval_ms);
+    // 入参校验在任何设备事务前完成，此类拒绝不进入出光/收光时序。
+    if (!started && started.error().kind == ErrorKind::invalid_argument) return started.error();
     const std::string started_failed_step = trace.failed_step;
     if (started) {
         std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));

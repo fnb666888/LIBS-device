@@ -4,7 +4,7 @@
 //   1. 判定只在业务二这一条调用栈里发生（不放行时一条写指令都不发）
 //   2. 运行期重判：中途失锁自己收光
 //   3. wait_for_laser_trigger 恒为 true
-//   4. 失败不伪造、也不因偶发失败终止循环
+//   4. 失败不伪造；偶发失败可恢复，掉线及连续失败自动收光
 //   5. 落盘异步且有界，绝不反压采集
 //   6. 停止随时可调、无条件执行（关串口不会让激光停下来）
 //
@@ -648,6 +648,56 @@ CASE(capture_failure_does_not_stop_the_loop); {
     (void)f.job->stop();
 }
 
+CASE(disconnected_spectrometer_stops_after_one_failure); {
+    for (const auto* code : {"serial_not_found", "spectrometer_disconnected"}) {
+        Fixture f;
+        std::atomic<unsigned> calls{0};
+        f.job->set_capture_hook_for_test([&]() -> Result<libs::devices::CaptureResult> {
+            if (++calls == 1) return ok_capture();
+            return Error::make(ErrorKind::device, code, "1706100U4 disconnected");
+        });
+        CHECK(f.job->start(make_params()));
+        CHECK(wait_for([&] { return !f.job->running(); }));
+        CHECK_EQ(calls.load(), 2u);
+        CHECK_EQ(f.job->status().shots_captured, 1u);
+        CHECK_EQ(f.job->status().shots_failed, 1u);
+        CHECK_EQ(f.job->status().last_error_code, std::string(code));
+        CHECK(!f.link.work_state); CHECK(!f.link.q_gate_open);
+        CHECK(f.job->stop());
+    }
+}
+CASE(repeated_immediate_capture_errors_are_bounded_and_stop_laser); {
+    Fixture f;
+    std::atomic<unsigned> calls{0};
+    f.job->set_capture_hook_for_test([&]() -> Result<libs::devices::CaptureResult> {
+        if (++calls == 1) return ok_capture();
+        return Error::make(ErrorKind::device, "poll_failed", "SDK polling failure");
+    });
+    const auto begin = std::chrono::steady_clock::now();
+    CHECK(f.job->start(make_params()));
+    CHECK(wait_for([&] { return !f.job->running(); }));
+    CHECK_EQ(calls.load(), 4u);
+    CHECK_EQ(f.job->status().shots_failed, 3u);
+    CHECK(std::chrono::steady_clock::now() - begin >= std::chrono::milliseconds(180));
+    CHECK(!f.link.work_state); CHECK(!f.link.q_gate_open);
+    CHECK(f.job->stop());
+}
+CASE(successful_capture_resets_the_consecutive_error_budget); {
+    Fixture f;
+    std::atomic<unsigned> calls{0};
+    f.job->set_capture_hook_for_test([&]() -> Result<libs::devices::CaptureResult> {
+        const unsigned n = ++calls;
+        if (n == 2 || n == 3 || n == 5 || n == 6)
+            return Error::make(ErrorKind::timeout, "capture_timeout", "missed trigger");
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return ok_capture();
+    });
+    CHECK(f.job->start(make_params()));
+    CHECK(wait_for([&] { return f.job->status().shots_captured >= 3; }));
+    CHECK_EQ(f.job->status().shots_failed, 4u);
+    CHECK(f.job->running());
+    CHECK(f.job->stop());
+}
 CASE(missing_measurement_provider_is_reported_honestly); {
     // 没有参数来源时**如实报错**，而不是用默认值凑一帧 ——
     // 默认积分时间采出来的谱，操作员会当成正确参数下的测量值。
@@ -668,6 +718,43 @@ CASE(missing_measurement_provider_is_reported_honestly); {
 // 中间有人打开了安全门 —— 事实变了，但没人再问，光就一直在打。
 // 所以 loop() 周期性重判，且判定的执行方与收光的执行方必须是同一个对象：
 // 不能靠 UI（可能崩/被关/卡住）。
+CASE(real_b2_gate_readback_does_not_cancel_an_armed_emission); {
+    // Existing fixtures returned a permanently "closed" Q safety fact, hiding
+    // the hardware failure after the first periodic recheck. Decode the actual
+    // stateful laser transport here, exactly as Runtime does on the instrument.
+    const auto site = make_site();
+    FakeLink link;
+    libs::devices::Laser laser(link);
+    measurement::FrameQueue queue;
+    RecordingSink sink;
+    measurement::Writer writer(sink, site.station_id);
+    readiness::ReadinessMonitor monitor([&](readiness::ReadinessFacts& facts) {
+        facts = safe_readiness_facts();
+        const auto actual = laser.readActual();
+        if (!actual) { facts.laser.available = false; return false; }
+        facts.laser = readiness::parse_actual(actual.value());
+        return true;
+    });
+    monitor.arm();
+    measurement::MeasurementJob job(&laser, nullptr, monitor, queue, writer);
+    CaptureStub capture;
+    capture.hold_ms = 80;
+    job.configure(site, [] { return make_measurement(); });
+    job.set_capture_hook_for_test(capture.hook());
+    const auto started = job.start(make_params());
+    CHECK(started);
+    if (started) {
+        CHECK(wait_for([&] { return job.status().shots_captured >= 16; }, 3000));
+        CHECK(job.running());
+        CHECK(job.status().last_error_code.empty());
+        CHECK(monitor.latest().allowed);
+    }
+    CHECK(job.stop());
+    const auto stopped = laser.readActual();
+    CHECK(stopped);
+    if (stopped) { CHECK_EQ(stopped.value().q_gate, 0); CHECK_EQ(stopped.value().work_state, 0); }
+}
+
 CASE(gate_lost_mid_run_shuts_the_laser_off_by_itself); {
     // 采集代质放慢一点（每帧 60 ms）。不然的话一秒内就会堆满落盘队列（64 帧），
     // 落盘拥堵会把 last_error_code 覆盖成 disk_backlog_dropped，
@@ -1066,6 +1153,8 @@ CASE(stop_cancels_pending_sdk_capture_without_waiting_for_ttl_timeout); {
                         std::chrono::steady_clock::now() - begin).count();
                     CHECK(elapsed < 500);
                     CHECK(!f.link.q_gate_open); CHECK(!f.link.work_state);
+                    CHECK(f.job->status().last_error_code.empty());
+                    CHECK_EQ(f.job->status().shots_failed, 0u);
                     CHECK(spec.value()->close());
                     f.job->bind_devices(f.laser.get(), nullptr);
                 }
@@ -1094,6 +1183,16 @@ CASE(invalid_rate_is_rejected_before_device_writes); {
     CHECK(!started);
     if (!started) CHECK_EQ(started.error().code, std::string("laser_spectrometer_rate_mismatch"));
     CHECK(f.link.write_commands().empty());
+}
+CASE(unconfigured_spectral_parameters_are_rejected_before_device_writes); {
+    Fixture f;
+    measurement::FireParameters params;
+    params.laser = make_params().laser;
+    const auto started = f.job->start(params);
+    CHECK(!started);
+    if (!started) CHECK_EQ(started.error().code, std::string("capture_parameters_invalid"));
+    CHECK(f.link.write_commands().empty());
+    CHECK(!f.job->running());
 }
 CASE(worker_exception_closes_gate_and_allows_stop); {
     Fixture f;

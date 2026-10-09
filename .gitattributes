@@ -1,0 +1,2 @@
+# Feature windows are a hash-verified model asset; preserve exact bytes.
+src/algorithms/iron_ore/model/current/feature_windows.csv -text

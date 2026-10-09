@@ -1,0 +1,69 @@
+{
+  "format": "current_mixed_v2",
+  "method": "mixed_training",
+  "targets": [
+    "TFe",
+    "SiO2",
+    "Al2O3",
+    "TiO2",
+    "CaO",
+    "MgO",
+    "MnO",
+    "P",
+    "S",
+    "FeO"
+  ],
+  "unit": "mass_fraction_percent",
+  "wavelength_range_nm": [
+    200.0,
+    565.0
+  ],
+  "wavelength_step_nm": 0.05,
+  "n_grid_points": 7301,
+  "n_windows": 120,
+  "n_features": 240,
+  "component_heads_retrained": true,
+  "real_training_spectra": 320,
+  "real_holdout_spectra": 80,
+  "real_training_weight": 0.99,
+  "real_train_batch_ids": [
+    "HEMATITE_14-43-50",
+    "HEMATITE_14-46-42",
+    "HEMATITE_14-55-32",
+    "HEMATITE_14-58-23",
+    "LIMONITE_15-06-07",
+    "LIMONITE_15-08-49",
+    "LIMONITE_15-11-42",
+    "LIMONITE_15-15-57",
+    "MAGCONC_14-24-10",
+    "MAGCONC_14-27-18",
+    "MAGCONC_14-30-19",
+    "MAGCONC_14-33-30",
+    "VTMAGNETITE_15-23-32",
+    "VTMAGNETITE_15-26-23",
+    "VTMAGNETITE_15-29-24",
+    "VTMAGNETITE_15-32-43"
+  ],
+  "real_holdout_batch_ids": [
+    "HEMATITE_14-37-18",
+    "LIMONITE_15-02-58",
+    "MAGCONC_14-20-46",
+    "VTMAGNETITE_15-20-08"
+  ],
+  "holdout_FeO_mae_pp": 0.3430672310833578,
+  "holdout_FeO_max_error_pp": 3.049881479437359,
+  "validation_relative_dir": "validation",
+  "validation_is_four_known_compositions": true,
+  "FeO_iron_already_in_TFe": true,
+  "validated_for_unknown_ores": false,
+  "data_generator_sha256": "8d64691990b65547e10af330ac130d43254a1219c449588902c48dd660a0c87a",
+  "data_asset_hashes_sha256": "4e724825a7cf1f89b6c1b609b3d6191ad4a0be651f1ec72c2ab81613d5aff6ac",
+  "asset_sha256": {
+    "feature_windows.csv": "7feea2c7ac639d5dd67209d42621b3e3195a6c77b236e40bf79ee49bfcddb3cf",
+    "FeO_mixed.joblib": "082fa16dd55269be7902ea712fdeb503c057b3cbacd83c66e32e895ec0b38db8",
+    "oxide_added.joblib": "f65a835b3943d69e702d70b128f9404cffdb64213ca8baf9e2f377fcc6df3f69",
+    "oxide_main.joblib": "bb3f0872b6a5ee6dd165298fe9ce2eb3798ec0eb7008aeeaba62b0837b8078a3",
+    "sulfide_added.joblib": "25e6f85f5018471f3bd884fb7772b90fd74062b984388ad0995699e5a63b3e63",
+    "sulfide_main.joblib": "5825c7514c3494e9c5aaf1d49796ce4cc7f3a46cc8c174cd047fe503bb1b5875"
+  }
+}

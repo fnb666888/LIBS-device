@@ -8,6 +8,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <type_traits>
+#include <limits>
 
 #if !defined(_WIN32)
 int main() { (void)"the spectrometer driver is Windows-only in this build"; return 0; }
@@ -20,6 +22,15 @@ int main() { (void)"the spectrometer driver is Windows-only in this build"; retu
 
 namespace {
 
+static_assert(!std::is_default_constructible_v<libs::devices::CaptureRequest>,
+              "capture callers must choose measurement parameters and trigger mode");
+static_assert(!std::is_constructible_v<libs::devices::CaptureRequest, double, unsigned>,
+              "integration delay and trigger mode must not be omitted");
+
+// 替身 SDK 的测试工作点，与本机业务默认表无关。
+libs::devices::CaptureRequest test_request() {
+    return {10.0, 3000, 0.0, false};
+}
 
 // argv/env 是当前 ANSI 代码页的字节，不是 UTF-8。先按 ANSI 把源 DLL 复制到
 // 一个纯 ASCII 的临时目录，再把那条临时路径转成 UTF-8 交给驱动。
@@ -180,7 +191,7 @@ TEST_MAIN_BEGIN_ARGV()
           CHECK(list);
           if (list) CHECK_EQ(list.value().size(), std::size_t(3));
 
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
           request.integration_ms = 5.0;
           request.scans = 1;
@@ -214,7 +225,7 @@ TEST_MAIN_BEGIN_ARGV()
               CHECK_EQ(again.value().groups.size(), std::size_t(1));
               if (!again.value().groups.empty())
                   CHECK_EQ(again.value().groups[0].spectra.size(), std::size_t(3));
-              check_counters({3, 3, 3, 0, 0});
+              check_counters({0, 3, 0, 0, 0});
           }
           CHECK(session.close());
       }
@@ -235,7 +246,7 @@ TEST_MAIN_BEGIN_ARGV()
           if (list) CHECK_EQ(list.value().size(), std::size_t(3));
           snapshot_counters();   // 丢掉 enumerate 产生的计数
 
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1"};
           request.integration_ms = 5.0;
           request.scans = 1;
@@ -275,7 +286,7 @@ TEST_MAIN_BEGIN_ARGV()
           CHECK(list);
           if (list) CHECK_EQ(list.value().size(), std::size_t(3));
 
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
           request.integration_ms = 5.0;
           request.scans = 1;
@@ -300,7 +311,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
           request.integration_ms = 5.0;
           request.scans = 1;
@@ -338,7 +349,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1", "MASTER", "SLAVE2"};
           request.master_serial = "MASTER";
           request.synchronized = true;
@@ -364,7 +375,7 @@ TEST_MAIN_BEGIN_ARGV()
               // 写反了现场表现是主通道收不到激光、或从通道永远等不到触发。
               //
               // 主通道的 Trigger.Mode 取决于**这次有没有外部硬件触发源**：
-              // 本用例没设 wait_for_laser_trigger，即软件/自由触发，所以主通道
+              // 本用例显式选择软件/自由触发，所以主通道
               // 是 0（软件触发），由它产生 SYNC 去带从通道 —— 与厂家示例里
               // "chkHardwareTriggered 没勾就是 Mode=0" 一致。
               // 替身通道号 = 器件下标：0=MASTER 1=SLAVE1 2=SLAVE2。
@@ -390,7 +401,7 @@ TEST_MAIN_BEGIN_ARGV()
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened);
       if (opened) {
-        libs::devices::CaptureRequest request;
+        auto request = test_request();
         request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
         request.master_serial = "MASTER";
         request.synchronized = true;
@@ -415,7 +426,7 @@ TEST_MAIN_BEGIN_ARGV()
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened);
       if (opened) {
-        libs::devices::CaptureRequest request;
+        auto request = test_request();
         request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
         request.master_serial = "MASTER"; request.synchronized = true;
         const auto result = opened.value()->capture(request, []() -> libs::VoidResult {
@@ -433,7 +444,7 @@ TEST_MAIN_BEGIN_ARGV()
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened);
       if (opened) {
-        libs::devices::CaptureRequest request;
+        auto request = test_request();
         request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
         request.master_serial = "MASTER"; request.synchronized = true;
         request.scans = 2; request.timeout_ms = 20;
@@ -455,7 +466,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1"};
           request.scans = 1;
           const auto result = session.capture(request);
@@ -487,7 +498,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1"};
           request.master_serial = "MASTER";         // 配了主通道
           request.synchronized = false;             // 但明确不同步
@@ -511,7 +522,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1"};
           request.scans = 3;
           const auto result = session.capture(request);
@@ -522,12 +533,37 @@ TEST_MAIN_BEGIN_ARGV()
       fake_reset(0);
     }
 
+    { CASE(capture_rejects_upper_limits_and_nonfinite_delay_before_touching_the_sdk);
+      fake_reset(0);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+          auto request = test_request();
+          request.integration_ms = 60000.001;
+          CHECK(!opened.value()->capture(request));
+          request.integration_ms = 10.0;
+          request.timeout_ms = 600001;
+          CHECK(!opened.value()->capture(request));
+          request.timeout_ms = 3000;
+          request.wait_for_laser_trigger = true;
+          for (double delay : {1000001.0, std::numeric_limits<double>::infinity(),
+                               std::numeric_limits<double>::quiet_NaN()}) {
+              request.integration_delay_ns = delay;
+              const auto captured = opened.value()->capture(request);
+              CHECK(!captured);
+              if (!captured) CHECK_EQ(captured.error().code, std::string("bad_integration_delay"));
+          }
+          check_counters({0, 0, 0, 0, 0});
+          CHECK(opened.value()->close());
+      }
+      fake_reset(0);
+    }
     { CASE(capture_rejects_bad_arguments_without_touching_the_sdk);
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.integration_ms = 0.0001;
           CHECK(!session.capture(request));
           request.integration_ms = 10.0;
@@ -552,7 +588,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"NOT_THERE"};
           const auto result = session.capture(request);
           CHECK(!result);
@@ -567,7 +603,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1"};
           const auto result = session.capture(request);
           CHECK(!result);
@@ -587,7 +623,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1"};
           request.master_serial = "MASTER";
           const auto result = session.capture(request);
@@ -598,13 +634,30 @@ TEST_MAIN_BEGIN_ARGV()
       fake_reset(0);
     }
 
+    { CASE(capture_identifies_an_sdk_device_disconnect);
+      fake_reset(8);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+          auto request = test_request();
+          request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+          const auto result = opened.value()->capture(request);
+          CHECK(!result);
+          if (!result) {
+              CHECK_EQ(result.error().code, std::string("spectrometer_disconnected"));
+              CHECK(result.error().message.find("SLAVE2") != std::string::npos);
+          }
+          CHECK(opened.value()->close());
+      }
+      fake_reset(0);
+    }
     { CASE(capture_surfaces_a_scope_failure);
       fake_reset(3);
       auto opened = libs::devices::Spectrometer::open(dll);
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1"};
           const auto result = session.capture(request);
           CHECK(!result);
@@ -620,7 +673,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER", "SLAVE1"};
           request.master_serial = "MASTER";
           const auto result = session.capture(request);
@@ -673,7 +726,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER"};
           request.master_serial = "MASTER";
           request.wait_for_laser_trigger = true;      // 手册 4.9 节接法二
@@ -700,7 +753,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           // 不给 master：单通道自由触发，是"不等任何外部信号"的形态。
           // 给了 master 时驱动会按多通道 SYNC 的老规矩把主通道也设成外触发，
           // 那是同步链的事，与"激光器触不触发"无关，所以这里不混在一起测。
@@ -726,7 +779,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER"};
           request.master_serial = "MASTER";
           request.wait_for_laser_trigger = false;
@@ -748,7 +801,7 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"MASTER"};
           request.master_serial = "MASTER";
           request.wait_for_laser_trigger = true;
@@ -767,12 +820,59 @@ TEST_MAIN_BEGIN_ARGV()
       CHECK(opened); if(!opened) show("open", opened.error());
       if (opened) {
           auto& session = *opened.value();
-          libs::devices::CaptureRequest request;
+          auto request = test_request();
           request.serials = {"SLAVE1"};
           request.timeout_ms = 120;
           const auto result = session.capture(request);
           CHECK(!result);
           if (!result) CHECK_EQ(result.error().code, std::string("capture_timeout"));
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(stable_capture_reuses_preparation_but_changes_and_errors_reprepare);
+      fake_reset(0);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+          auto& session = *opened.value();
+          auto request = test_request();
+          request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+          request.master_serial = "MASTER";
+          request.synchronized = true;
+          request.wait_for_laser_trigger = true;
+          for (int frame = 0; frame < 120; ++frame) {
+              const auto result = session.capture(request);
+              CHECK(result);
+              if (result) CHECK_EQ(result.value().groups.front().spectra.size(), std::size_t(3));
+          }
+          CHECK_EQ(fake_counter(0), 3); // Prepare once, not once per frame.
+          CHECK_EQ(fake_counter(7), 3); // SYNC unchanged during stable acquisition.
+          CHECK_EQ(fake_counter(2), 3);
+          CHECK_EQ(fake_counter(1), 360); // Every channel is still armed for every shot.
+
+          request.integration_ms = 2.0;
+          CHECK(session.capture(request));
+          CHECK_EQ(fake_counter(0), 6);
+          CHECK_EQ(fake_counter(7), 6);
+
+          fake_export<void (*)(int)>("FakeSetMode")(2);
+          CHECK(!session.capture(request));
+          fake_export<void (*)(int)>("FakeSetMode")(0);
+          CHECK(session.capture(request));
+          CHECK_EQ(fake_counter(0), 9);
+          CHECK_EQ(fake_counter(7), 9);
+
+          CHECK(!session.capture(request, {}, [] { return true; }));
+          CHECK(session.capture(request));
+          CHECK_EQ(fake_counter(0), 12);
+
+          request.synchronized = false;
+          CHECK(session.capture(request));
+          CHECK_EQ(fake_counter(0), 15);
+          CHECK_EQ(fake_sync_mode(0), 0);
+          CHECK_EQ(fake_config_u8(1, 23), 0);
           CHECK(session.close());
       }
       fake_reset(0);

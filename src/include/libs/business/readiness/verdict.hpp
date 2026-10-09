@@ -53,10 +53,15 @@ struct GateVerdict {
     const char* primary_reason() const noexcept;
 };
 
+// Startup requires a closed Q gate. An already armed measurement intentionally
+// opens it; only that job may select the emission phase for its periodic checks.
+enum class GateCheckPhase { before_emission, during_emission };
+
 // **唯一的判定入口。纯函数**：输入一份 facts，输出一份结论。
 //
 // 不放行时 blocked_by **逐条列出全部原因**。
-GateVerdict evaluate(const ReadinessFacts& facts);
+GateVerdict evaluate(const ReadinessFacts& facts,
+                     GateCheckPhase phase = GateCheckPhase::before_emission);
 
 // 判定结果 -> 机器状态。**纯函数**，供灯映射与 UI 复用同一份映射逻辑。
 //

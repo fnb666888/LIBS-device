@@ -59,6 +59,7 @@ EXPORT void FakeReset(int failure_mode) {
     std::memset(last_config, 0, sizeof(last_config));
 }
 EXPORT int FakeCounter(int i) { return (i >= 0 && i < 32) ? counters[i] : -1; }
+EXPORT void FakeSetMode(int value) { mode = value; }
 
 EXPORT void FakeLastConfig(int channel, unsigned char* out) {
     if (channel < 0 || channel >= 32 || !out) return;
@@ -121,6 +122,7 @@ EXPORT int __stdcall AVS_GetVersionInfo(int, char* fpga, char* firmware, char* l
 }
 EXPORT int __stdcall AVS_GetDeviceType(int, int* t) { *t = 1; return 0; }
 EXPORT int __stdcall AVS_SetSyncMode(int h, unsigned char enable) {
+    ++counters[7];
     if (h >= 1 && h <= 3) sync_mode[h - 1] = enable;
     return 0;
 }
@@ -130,7 +132,9 @@ EXPORT int __stdcall AVS_PrepareMeasure(int h, unsigned char* p) {
     ++counters[0];
     std::memcpy(trigger[h - 1], p + 22, 3);
     // 留档整份配置，供测试断言触发模式与积分延时。
-    std::memcpy(last_config[h - 1], p, kConfigBytes);
+    // Vendor measurement ABI is 41 bytes; the larger inspection buffer is ours.
+    std::memset(last_config[h - 1], 0, kConfigBytes);
+    std::memcpy(last_config[h - 1], p, 41);
     if (mode == 1 && h == 2) return -1;
     if (mode == 6 && pending[h - 1]) return -5;   // ERR_OPERATION_PENDING
     return 0;
@@ -144,6 +148,7 @@ EXPORT int __stdcall AVS_Measure(int h, void*, short n) {
     return 0;
 }
 EXPORT int __stdcall AVS_PollScan(int h) {
+    if (mode == 8 && h == 3) return -3;  // ERR_DEVICE_NOT_FOUND during acquisition.
     if (h < 1 || h > 3) return -1;
     if (mode == 2 && h == 2) return -4;
     if (mode == 7 && counters[1] > 3) return 0;

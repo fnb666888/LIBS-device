@@ -1,4 +1,5 @@
 #include "libs/business/app/facade.hpp"
+#include "libs/measurement_limits.hpp"
 
 #include <cmath>
 #include <sstream>
@@ -6,6 +7,7 @@
 
 #include "libs/business/measurement/frame.hpp"
 #include "libs/business/measurement/frame_bus.hpp"
+#include "libs/business/measurement/prediction/algorithm_contract.hpp"
 #include "libs/business/measurement/job.hpp"
 #include "libs/business/readiness/monitor.hpp"
 #include "libs/business/readiness/precheck.hpp"
@@ -164,6 +166,7 @@ std::vector<std::string> BusinessFacade::commands() {
         // 采集与显示，于是 UI 以为"点开始 = 开工"，实际可能拍出一堆
         // 背景谱而操作员以为是测量值。
         "spectrum_stream",
+        "prediction",
     };
 }
 
@@ -219,6 +222,7 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "capture")         return cmd_capture(args);
 
     if (command == "spectrum_stream") return cmd_spectrum_stream(args);
+    if (command == "prediction") return cmd_prediction(args);
     if (command == "measurement_start")  return cmd_measurement_start(args);
     if (command == "measurement_stop")   return cmd_measurement_stop(args);
     if (command == "measurement_status") return cmd_measurement_status(args);
@@ -229,6 +233,34 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
         libs::ErrorKind::unsupported, "unknown_command",
         "未知命令: " + command + "；可用命令见 commands 字段。" +
          "注意：出光只有 measurement_start 一条路径（原 laser_fire / laser_run / laser_stop 已删除）"));
+}
+
+Response BusinessFacade::cmd_prediction(const json::Value& args) {
+    namespace algorithm = measurement::prediction::algorithm;
+    const std::string action = args.has("action") ? args["action"].as_string() : "status";
+    if (action == "contract") return Response::success(algorithm::contract());
+    if (action == "validate") {
+        const auto result = algorithm::validate_input(args["input"]);
+        return result ? Response::success(result.value()) : Response::failure(result.error());
+    }
+    auto* service = runtime_.prediction();
+    if (!service) return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+        "prediction_not_ready", "预测服务尚未装配"));
+    if (action == "status") return Response::success(service->status());
+    if (action == "latest") return Response::success(service->status()["latest"]);
+    if (action == "configure") {
+        if (!args["enabled"].is_bool()) return Response::failure(libs::Error::make(
+            libs::ErrorKind::invalid_argument, "prediction_enabled_required", "enabled 必须为布尔值"));
+        const auto result = service->configure(args["enabled"].as_bool(), args["branch"].as_string());
+        return result ? Response::success(service->status()) : Response::failure(result.error());
+    }
+    if (action == "analyze") {
+        // Queue only; model execution never holds an IPC/device thread.
+        const auto result = service->submit(args["input"]);
+        return result ? Response::success(result.value()) : Response::failure(result.error());
+    }
+    return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+        "prediction_action_invalid", "action 只能是 status/latest/configure/contract/validate/analyze"));
 }
 
 Response BusinessFacade::cmd_ping(const json::Value& args) {
@@ -266,6 +298,7 @@ Response BusinessFacade::cmd_status(const json::Value& args) {
     // 出光会话是否在进行。界面靠它决定「开始检测 / 停止」哪个可点。
     v.set("laser_running", json::Value(runtime_.laser_running()));
     v.set("health", runtime_.health_json());
+    v.set("prediction", runtime_.prediction() ? runtime_.prediction()->status() : json::Value());
     v.set("log_records", json::Value(static_cast<double>(runtime_.log().count())));
 
     // 状态灯：灯色意图与上次下发结果。
@@ -429,85 +462,25 @@ Response BusinessFacade::cmd_param_set(const json::Value& args) {
 
 
 
-    // ── 量程校验：写入前先判，不合格的值根本不该落盘 ───────────────────
-    //
-    // 参数库此前只拦 NaN/Inf，**不拦越界**。方案 B 把 commissioned 改成
-    // "按参数库内容算"之后这就成了真破口：操作员把电流填成 9999，
-    // 界面回显"参数设置已完成"，但 commissioned_from_store() 判 false，
-    // 门禁报"出光参数未标定" —— **一个字都不告诉操作员错在哪**。
-    // 填了值却查不出原因，比直接报错难查得多。
-    //
-    // 逐字段判（见下）：只判本次传入的字段，缺失的字段不参与判定。
-    //
+    // UI、保存、请求覆盖与驱动共用同一张范围表；只校验本次提交的字段。
     const std::string group = args["group"].as_string();
-    if (group == "laser") {
-        // 量程判据只有一份：下面这张表与 config::validate_laser_fire() 一一对应，
-        // 数字改了要两处一起改（它们就在同一个仓库里，同一次构建）。
-        // 不用 validate_laser_fire() 的原因有二：它在 commissioned=false 时
-        // 整段放行（未标定是合法中间态），而这里正是"还没标定"；而且它按
-        // **整组**判，会把还没填的框按 0 一起判掉 —— 操作员一个框一个框填，
-        // 第二个框的合法值被第一个空框的 0 判成越界，报的还是别人的错。
-        // 所以这里**只判本次传入的字段**：填哪个就校哪个，缺的不管。
-        struct Range { const char* field; double lo; double hi; const char* unit; };
-        static const Range kRanges[] = {
-            {"discharge_current_a",  15,  100, "A"},
-            {"pulse_width_us",       50,  300, "us"},
-            {"frequency_hz",          1,   10, "Hz"},
-            {"discharge_delay_us",    0,  500, "us"},
-            {"q_delay_us",            2,  500, "us"},
-            {"q_warmup_s",            0, 3600, "s"},
-            {"settle_timeout_ms",     1, 600000, "ms"},
-            {"emission_hold_ms",      0, 600000, "ms"},
-            {"min_discharges",        1, 100000, ""},
-        };
-        for (const Range& r : kRanges) {
-            const auto it = values.find(r.field);
-            if (it == values.end()) continue;   // 本次没填这个字段，不判
-            const double v = it->second;
-            std::string reason;
-            if (v < 0.0 || v != std::floor(v)) {
-                reason = std::string("必须是 0 或正整数");
-            } else if (v < r.lo || v > r.hi) {
-                reason = std::to_string(static_cast<int>(r.lo)) + "~" +
-                         std::to_string(static_cast<int>(r.hi)) + " " + r.unit;
-            }
-            if (reason.empty()) continue;
-            const std::string message =
-                "参数被拒绝：" + std::string(r.field) + " " + reason +
-                "（协议 §3.1 量程）";
-            json::Value rep = json::object();
-            rep.set("state", json::Value(config::to_string(config::ApplyState::rejected)));
-            rep.set("completed", json::Value(false));
-            rep.set("group", json::Value(group));
-            rep.set("message", json::Value(message));
-            json::Array ff;
-            ff.emplace_back(std::string(r.field));
-            rep.set("failed_fields", json::Value(std::move(ff)));
-            return Response::failure_with_payload(
-                libs::Error::make(libs::ErrorKind::invalid_argument, "param_out_of_range", message),
-                std::move(rep));
-        }
-    }
-    if (group == "spectrometer") {
-        // 光谱侧同理：积分时间/超时越界现在就拒，不让操作员存进去
-        // 再在采集时才看到"驱动拒绝"。驱动自己的硬校验是 [0.002, 60000] ms
-        //（见 spectrometer.cpp），这里与它保持一致。
-        const auto it_i = values.find("integration_ms");
-        if (it_i != values.end() &&
-            !(it_i->second >= 0.002 && it_i->second <= 60000.0)) {
-            json::Value v = json::object();
-            v.set("state", json::Value(config::to_string(config::ApplyState::rejected)));
-            v.set("completed", json::Value(false));
-            v.set("group", json::Value(group));
-            v.set("message", json::Value("参数被拒绝：integration_ms 必须在 0.002~60000 ms 之间"));
-            json::Array failed;
-            failed.emplace_back(std::string("integration_ms"));
-            v.set("failed_fields", json::Value(std::move(failed)));
-            return Response::failure_with_payload(
-                libs::Error::make(libs::ErrorKind::invalid_argument, "param_out_of_range",
-                                  "参数被拒绝：integration_ms 必须在 0.002~60000 ms 之间"),
-                std::move(v));
-        }
+    for (const auto& value : values) {
+        const auto* range = libs::measurement_limits::find(group, value.first);
+        if (!range || range->contains(value.second)) continue;
+        const std::string message = "参数被拒绝：" + value.first + " 必须在 " +
+            std::to_string(range->lo) + "~" + std::to_string(range->hi) + " " + range->unit +
+            (range->integer ? "，且必须为整数" : "") + "（" + range->source + "）";
+        json::Value rep = json::object();
+        rep.set("state", json::Value(config::to_string(config::ApplyState::rejected)));
+        rep.set("completed", json::Value(false));
+        rep.set("group", json::Value(group));
+        rep.set("message", json::Value(message));
+        json::Array failed;
+        failed.emplace_back(value.first);
+        rep.set("failed_fields", json::Value(std::move(failed)));
+        return Response::failure_with_payload(
+            libs::Error::make(libs::ErrorKind::invalid_argument, "param_out_of_range", message),
+            std::move(rep));
     }
     const config::ApplyResult result = store->apply(group, values);
     json::Value v = json::object();
@@ -613,15 +586,13 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
     // 请求就地构造（原 CaptureCoordinator 已删）：通道/主从/SYNC/是否等触发
     // 是**装机配置**（接法事实），积分时间/超时/积分延时是**测量参数**（参数库）。
     const config::SiteConfig& site = runtime_.config();
-    libs::devices::CaptureRequest request;
+    libs::devices::CaptureRequest request{measurement.integration_ms, measurement.timeout_ms,
+                                         measurement.integration_delay_ns,
+                                         site.spectrometer.wait_for_laser_trigger};
     request.serials = site.spectrometer.serials;
     request.master_serial = site.spectrometer.master_serial;
     request.synchronized = site.spectrometer.synchronized;
-    request.integration_ms = measurement.integration_ms;
-    request.timeout_ms = measurement.timeout_ms;
-    request.integration_delay_ns = measurement.integration_delay_ns;
     request.scans = 1;
-    request.wait_for_laser_trigger = site.spectrometer.wait_for_laser_trigger;
     const libs::Result<libs::devices::CaptureResult> result = device->captureOnce(request);
     if (!result) {
         return Response::failure(result.error());

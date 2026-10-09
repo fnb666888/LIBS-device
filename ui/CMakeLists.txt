@@ -37,6 +37,7 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Charts)
 
 add_executable(libs-spectrum-ui WIN32
+    resources.qrc
     src/main.cpp
     src/main_window.cpp
     src/parameter_page.cpp
@@ -44,6 +45,7 @@ add_executable(libs-spectrum-ui WIN32
     src/widgets.cpp
     src/machine_state.cpp
     src/status_poller.cpp
+    src/prediction_poller.cpp
     src/stream_poller.cpp
     src/frame_model.cpp
     src/spectrum_plot.cpp
@@ -57,6 +59,7 @@ target_link_libraries(libs-spectrum-ui PRIVATE
     Qt6::Widgets
     Qt6::Charts
 )
+target_include_directories(libs-spectrum-ui PRIVATE ../src/include)
 
 # 与业务层同样的告警档位（-Wall -Wextra -Wpedantic）。
 target_compile_options(libs-spectrum-ui PRIVATE -Wall -Wextra -Wpedantic)
