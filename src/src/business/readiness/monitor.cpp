@@ -135,7 +135,7 @@ bool ReadinessMonitor::laser_readable() const {
     return laser_readable_;
 }
 
-const GateVerdict& ReadinessMonitor::latest() const {
+GateVerdict ReadinessMonitor::latest() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return latest_;
 }

@@ -6,7 +6,8 @@
 #   原因不是洁癖：C++ 里 `libs_business` 对 `libs_devices` 是 PUBLIC 依赖，
 #   PUBLIC 会传染到下游的链接命令行——链接 libs_business 就等于把设备层
 #   拖进来，UI 就"能"直接碰设备了。判定权一旦漏到 UI，分层就名存实亡。
-#   与业务层的唯一接口是**命名管道上的 JSON 行**（`ui/src/pipe_client.cpp`）。
+#   与业务层的唯一接口是**命名管道上的 JSON 行**（`ui/src/ui_log.cpp
+    src/pipe_client.cpp`）。
 #
 # 编译：控制端编译 + 拷贝部署（与业务层同一条路径，见 docs §10.5）。
 #   pwsh -File build.ps1
@@ -46,6 +47,7 @@ add_executable(libs-spectrum-ui WIN32
     src/stream_poller.cpp
     src/frame_model.cpp
     src/spectrum_plot.cpp
+    src/ui_log.cpp
     src/pipe_client.cpp
 )
 

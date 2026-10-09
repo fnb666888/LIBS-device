@@ -19,7 +19,7 @@
 //   激光按设定频率自己打 → 每打一发出一个 TTL → 光谱仪在 pin 6 收到就采一次
 //
 // 于是**每一帧天然对应一次出光**，不会错配、不需要软件数拍子，
-// 频率调快也不会漏（`capture` 是阻塞的，来不及就等下一个 TTL）。
+// 每次采集等待可用 TTL；速率检查用于发现明显不匹配，逐发不丢仍须真机验证。
 //
 // ── 七条纪律 ────────────────────────────────────────────────────────────
 //
@@ -91,6 +91,9 @@ struct FireParameters {
     // 收到 pin6 脉冲后再等多久才开始积分。**测量参数**，由参数管理服务供给。
     // 曾经从 SpectrometerConfig 读，与参数库形成两份来源，已归并到参数库。
     double integration_delay_ns = 0.0;
+    bool override_integration = false;
+    bool override_timeout = false;
+    bool override_delay = false;
 };
 
 // 一次测量作业的启动记录。**任何失败都要有记录** —— 现场排障靠它，
@@ -143,7 +146,7 @@ public:
                    libs::devices::Spectrometer* spectrometer,
                    readiness::ReadinessMonitor& readiness,
                    FrameQueue& frame_bus,
-                   Writer& writer);
+                   Writer& writer, std::mutex* acquisition_mutex = nullptr);
 
     ~MeasurementJob();
     MeasurementJob(const MeasurementJob&) = delete;
@@ -154,9 +157,10 @@ public:
     // 流程（任一步失败立即中止，**未放行时不发任何写指令**）：
     //   1. 门禁判定（出光参数是否已标定、联锁、急停…）—— 不放行就中止
     //   2. 取测量参数（积分时间 / 超时 / 积分延时）—— 唯一来源是参数库
-    //   3. `startContinuous()`：写会话参数 → 0x21=1 → 轮询到「正在工作且放电」
-    //      → 0x24=1 开光闸。**内部含 5~6 秒的 settle，所以是阻塞的。**
-    //   4. 起采集循环线程，**立即返回**（不阻塞调用方 6 秒）
+    //   3. prepareContinuous(): configure laser and wait for discharge, gate closed.
+    //   4. Arm all spectrometer channels; SDK completion callback opens the Q gate.
+    //      No fixed sleep is used to guess whether the spectrometer is ready.
+    //   5. Continue acquiring and fan out full frames to UI and writer.
     //
     // 重复调用是安全的：已在跑则返回失败 `laser_already_running`，
     // 而不是又发一遍 0x21=1/0x24=1。
@@ -197,9 +201,12 @@ public:
 
 private:
     // 采集循环线程主循环。**唯一碰光谱仪的地方**。
-    void loop();
+    void loop(std::function<libs::VoidResult()> on_armed,
+              std::function<void(const SpectrumFrame&)> on_first,
+              SpectrumMeasurement initial);
     // 做一次采集并组装成帧。设备为 null / 参数未配置都如实报错。
-    SpectrumFrame capture_once();
+    SpectrumFrame capture_once(const std::function<libs::VoidResult()>& on_armed = {},
+                               const SpectrumMeasurement* initial = nullptr);
     // 运行期重判：中途失锁就自己收光。返回 false = 已因失锁而中止循环。
     bool recheck_gate();
 
@@ -207,6 +214,10 @@ private:
     void log_record(logging::RecordKind kind, const std::string& message,
                     std::function<json::Value()> payload);
 
+    std::mutex lifecycle_mutex_;
+    std::mutex* acquisition_mutex_ = nullptr;
+    unsigned laser_frequency_hz_ = 0;
+    FireParameters active_params_;
     mutable std::mutex mutex_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};

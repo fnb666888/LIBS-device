@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     编译并运行 libs_core 的全部离线测试。不需要 CMake，一条命令搞定。
 
@@ -42,7 +42,7 @@ $flags = @("-std=c++17", "-Wall", "-Wextra", "-Iinclude", "-Itests")
 
 # 列表顺序即依赖顺序：transport <- devices <- business
 $layers = [ordered]@{
-    "libs_transport" = @("src/error.cpp", "src/hex.cpp", "src/transport/serial.cpp")
+    "libs_transport" = @("src/error.cpp", "src/hex.cpp", "src/transport/serial.cpp", "src/transport/serial_timing.cpp")
     "libs_devices"   = @(
         "src/protocols/modbus_rtu.cpp", "src/protocols/laser.cpp",
         "src/protocols/rangefinder.cpp", "src/protocols/indicator.cpp",
@@ -171,6 +171,7 @@ $testSupport = Join-Path $outDir "check.o"
 Invoke-Checked "compiling tests/check.cpp" { & $Compiler @flags -c "tests/check.cpp" -o $testSupport }
 
 $tests = [ordered]@{
+    "test_serial_timing" = @("tests/test_serial_timing.cpp", $linkOrder)
     "test_protocols"    = @("tests/test_protocols.cpp",    $linkOrder)
     "test_devices"      = @("tests/test_devices.cpp",      $linkOrder)
     "test_air_conditioner_protocol" = @("tests/test_air_conditioner_protocol.cpp", $linkOrder)
@@ -205,6 +206,7 @@ Write-Host "==> running tests"
 $failed = @()
 foreach ($name in $tests.Keys) {
     $exe = Join-Path $outDir "$name.exe"
+    if ($name -eq "test_measurement_job") { $env:LIBS_FAKE_AVASPEC_DLL = $fakeDll }
     if ($name -eq "test_spectrometer") { & $exe $fakeDll } else { & $exe }
     if ($LASTEXITCODE -ne 0) { $failed += $name }
 }

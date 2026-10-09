@@ -164,10 +164,12 @@ Result<LaserActual> Laser::appendReadActual(LaserOperationTrace* trace) {
 }
 
 Result<LaserActual> Laser::readActual(LaserOperationTrace* trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     return appendReadActual(trace);
 }
 
 Result<LaserSettings> Laser::readSettings(LaserOperationTrace* trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     LaserOperationTrace local;
     LaserOperationTrace& target = trace != nullptr ? *trace : local;
     const auto tx = readTransaction(cmd::kLdSettings);
@@ -192,6 +194,7 @@ Result<LaserSettings> Laser::readSettings(LaserOperationTrace* trace) {
 }
 
 Result<LaserTec> Laser::readTec(LaserOperationTrace* trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     LaserOperationTrace local;
     LaserOperationTrace& target = trace != nullptr ? *trace : local;
     const auto tx = readTransaction(cmd::kTec);
@@ -231,12 +234,14 @@ VoidResult Laser::writeChecked(std::uint8_t command,
 }
 
 VoidResult Laser::resetFault(LaserOperationTrace* trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     LaserOperationTrace local;
     LaserOperationTrace& target = trace != nullptr ? *trace : local;
     return writeChecked(cmd::kResetFault, {}, "reset_fault", target);
 }
 
 VoidResult Laser::clearCounter(LaserOperationTrace* trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     LaserOperationTrace local;
     LaserOperationTrace& target = trace != nullptr ? *trace : local;
     return writeChecked(cmd::kClearCounter, {}, "clear_counter", target);
@@ -270,6 +275,7 @@ VoidResult Laser::prepareContinuous(const LaserSessionSettings& settings,
                                     unsigned settle_timeout_ms,
                                     LaserOperationTrace& trace,
                                     unsigned poll_interval_ms) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     if (settle_timeout_ms == 0)
         return op_error(ErrorKind::invalid_argument, "bad_settle_timeout",
                         "settle_timeout_ms must be positive");
@@ -290,6 +296,9 @@ VoidResult Laser::prepareContinuous(const LaserSessionSettings& settings,
 
     const VoidResult params = writeSession(settings, trace);
     if (!params) return params.error();
+
+    const VoidResult clock = writeChecked(cmd::kClockMode, {0x00}, "set_internal_clock_mode", trace);
+    if (!clock) return clock.error();
 
     const VoidResult work_on = writeChecked(cmd::kWorkState, {0x01},
                                              "set_work_state_1", trace);
@@ -340,6 +349,7 @@ VoidResult Laser::prepareContinuous(const LaserSessionSettings& settings,
 }
 
 VoidResult Laser::openQGate(LaserOperationTrace& trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     const VoidResult opened = writeChecked(cmd::kQGate, {0x01}, "set_q_gate_1", trace);
     if (!opened) {
         const std::string failed_step = trace.failed_step;
@@ -355,6 +365,7 @@ VoidResult Laser::startContinuous(const LaserSessionSettings& settings,
                                   unsigned settle_timeout_ms,
                                   LaserOperationTrace& trace,
                                   unsigned poll_interval_ms) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     const VoidResult prepared = prepareContinuous(settings, settle_timeout_ms,
                                                   trace, poll_interval_ms);
     if (!prepared) return prepared.error();
@@ -362,6 +373,7 @@ VoidResult Laser::startContinuous(const LaserSessionSettings& settings,
 }
 
 VoidResult Laser::stopContinuous(LaserOperationTrace& trace) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     std::string first_error;
 
     const auto gate_off = writeTransaction(cmd::kQGate, {0x00});
@@ -407,6 +419,7 @@ VoidResult Laser::fireOnce(const LaserSessionSettings& settings,
                            unsigned hold_ms,
                            LaserOperationTrace& trace,
                            unsigned poll_interval_ms) {
+    std::lock_guard<std::recursive_mutex> operation(operation_mutex_);
     const VoidResult started = startContinuous(settings, settle_timeout_ms,
                                                trace, poll_interval_ms);
     const std::string started_failed_step = trace.failed_step;

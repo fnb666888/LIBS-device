@@ -1,6 +1,18 @@
 #include "libs/business/measurement/capture_plan.hpp"
+#include <cmath>
 
 namespace business::measurement {
+libs::VoidResult validate_capture_rate(unsigned hz, const SpectrumMeasurement& m) {
+    if (hz == 0 || !std::isfinite(m.integration_ms) || m.integration_ms < 0.002 ||
+        m.integration_ms > 60000.0 || !std::isfinite(m.integration_delay_ns) ||
+        m.integration_delay_ns < 0 || m.timeout_ms == 0)
+        return libs::Error::make(libs::ErrorKind::invalid_argument, "capture_parameters_invalid", "采集参数无效");
+    if (m.integration_ms + m.integration_delay_ns / 1.0e6 >= 1000.0 / hz)
+        return libs::Error::make(libs::ErrorKind::invalid_argument,
+            "laser_spectrometer_rate_mismatch", "积分延时与积分时间超过激光周期");
+    return libs::VoidResult();
+}
+
 
 libs::devices::CaptureRequest build_capture_request(const config::SiteConfig& site,
                                                      const SpectrumMeasurement& measurement) {

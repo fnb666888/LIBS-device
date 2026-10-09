@@ -56,7 +56,7 @@ public:
     void stop_continuous();
 
     // UI 只读这个，不自己判。
-    const GateVerdict& latest() const;
+    GateVerdict latest() const;
 
     // 最近一次判定对应的机器状态（灯映射与 UI 共用同一份）。
     MachineState latest_state() const;

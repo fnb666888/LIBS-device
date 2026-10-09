@@ -31,6 +31,7 @@ add_library(libs_transport STATIC
   src/error.cpp
   src/hex.cpp
   src/transport/serial.cpp
+  src/transport/serial_timing.cpp
 )
 target_include_directories(libs_transport PUBLIC include)
 target_link_libraries(libs_transport PRIVATE libs_warnings)
@@ -63,6 +64,10 @@ enable_testing()
 add_library(libs_test_support STATIC tests/check.cpp)
 target_include_directories(libs_test_support PUBLIC tests)
 target_link_libraries(libs_test_support PUBLIC libs_devices)
+
+add_executable(test_serial_timing tests/test_serial_timing.cpp)
+target_link_libraries(test_serial_timing PRIVATE libs_test_support libs_transport libs_warnings)
+add_test(NAME serial_timing COMMAND test_serial_timing)
 
 add_executable(test_protocols tests/test_protocols.cpp)
 target_link_libraries(test_protocols PRIVATE libs_test_support libs_devices libs_warnings)
@@ -188,3 +193,7 @@ add_test(NAME frame_queue COMMAND test_frame_queue)
 add_executable(test_measurement_job tests/test_measurement_job.cpp)
 target_link_libraries(test_measurement_job PRIVATE libs_test_support libs_business libs_warnings)
 add_test(NAME measurement_job COMMAND test_measurement_job)
+if(TARGET fake_avaspec)
+  add_dependencies(test_measurement_job fake_avaspec)
+  set_tests_properties(measurement_job PROPERTIES ENVIRONMENT "LIBS_FAKE_AVASPEC_DLL=$<TARGET_FILE:fake_avaspec>")
+endif()

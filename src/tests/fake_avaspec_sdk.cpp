@@ -146,6 +146,7 @@ EXPORT int __stdcall AVS_Measure(int h, void*, short n) {
 EXPORT int __stdcall AVS_PollScan(int h) {
     if (h < 1 || h > 3) return -1;
     if (mode == 2 && h == 2) return -4;
+    if (mode == 7 && counters[1] > 3) return 0;
     if (mode == 4) return 0;                 // 永远不 ready
     if (!armed[h - 1]) return 0;
     return 1;                                // armed 即视为可取

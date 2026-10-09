@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     编译实时光谱 UI（Qt6 Widgets + Qt6 Charts）。不需要 CMake，一条命令搞定。
 
@@ -74,6 +74,7 @@ $sources = @(
     "src/status_poller.cpp",
     "src/stream_poller.cpp",
     "src/frame_model.cpp",
+    "src/ui_log.cpp",
     "src/pipe_client.cpp"
 )
 

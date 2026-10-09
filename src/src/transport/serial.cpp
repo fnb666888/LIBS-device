@@ -5,6 +5,8 @@
 #include <stdexcept>
 #include <thread>
 
+#include "libs/transport/serial_timing.hpp"
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -106,7 +108,18 @@ public:
         for (;;) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start).count();
-            if (elapsed >= static_cast<long long>(timeout_ms)) { reply.timed_out = true; break; }
+
+            // 帧结束判定：收到字节之后空闲满 idle_ms 就收工，不再白等到 timeout_ms。
+            // 修复前这里只判超时，于是每一次串口事务都耗满整份时间预算
+            // （实测 elapsed_ms=655、timed_out=true，而回包是一帧完整合法应答）。
+            const std::uint64_t now_tick = GetTickCount64();
+            const unsigned long long idle_gap_ms =
+                reply.last_receive_tick == 0 ? 0 : (now_tick - reply.last_receive_tick);
+            const ReadStep step =
+                next_read_step(!reply.bytes.empty(), idle_gap_ms,
+                               static_cast<unsigned long long>(elapsed), idle_ms, timeout_ms);
+            if (step == ReadStep::frame_complete) break;
+            if (step == ReadStep::timed_out) { reply.timed_out = true; break; }
 
             DWORD errors = 0;
             COMSTAT status{};

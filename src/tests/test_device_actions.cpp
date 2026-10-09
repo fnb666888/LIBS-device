@@ -126,14 +126,14 @@ TEST_MAIN_BEGIN()
 
     const auto commands = laser_write_commands(link);
     const std::vector<std::uint8_t> expected = {
-        0x11, 0x12, 0x13, 0x14, 0x16, 0x19, 0x21, 0x24, 0x24, 0x21,
+        0x11, 0x12, 0x13, 0x14, 0x16, 0x19, 0x22, 0x21, 0x24, 0x24, 0x21,
     };
     CHECK_EQ(commands.size(), expected.size());
     if (commands.size() == expected.size()) {
         for (std::size_t i = 0; i < expected.size(); ++i)
             CHECK_EQ(static_cast<int>(commands[i]), static_cast<int>(expected[i]));
     }
-    for (const auto command : {0x15, 0x17, 0x18, 0x22, 0x23, 0x31, 0x34}) {
+    for (const auto command : {0x15, 0x17, 0x18, 0x23, 0x31, 0x34}) {
         CHECK(std::find(commands.begin(), commands.end(), command) == commands.end());
     }
 }

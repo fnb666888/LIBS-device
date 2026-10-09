@@ -31,6 +31,7 @@
 #include "libs/devices/spectrometer.hpp"
 
 namespace business::measurement {
+libs::VoidResult validate_capture_rate(unsigned frequency_hz, const SpectrumMeasurement& measurement);
 
 // 按上面两条归属构造一次采集请求。**纯函数。**
 libs::devices::CaptureRequest build_capture_request(const config::SiteConfig& site,

@@ -2,6 +2,7 @@
 
 #include "machine_state.hpp"
 
+#include <exception>
 #include <QMutexLocker>
 #include <QWaitCondition>
 
@@ -96,6 +97,16 @@ private:
             next = previous;
             next.valid = false;
             next.error = e;
+        } catch (const std::exception& e) {
+            QMutexLocker lock(&owner_->mutex_);
+            next = owner_->snapshot_;
+            next.valid = false;
+            next.error = QString::fromUtf8(e.what());
+        } catch (...) {
+            QMutexLocker lock(&owner_->mutex_);
+            next = owner_->snapshot_;
+            next.valid = false;
+            next.error = QStringLiteral("状态线程发生未知异常");
         }
         {
             QMutexLocker lock(&owner_->mutex_);
@@ -139,12 +150,8 @@ void StatusPoller::stop() {
     running_ = false;
     if (worker_) {
         worker_->request_stop();
-        // 给它 2s：一次 status 往返最坏情况是串口超时（约 650ms），
-        // 两轮足够它退出了。超时就强杀，避免程序退出时卡住。
-        if (!worker_->wait(2000)) {
-            worker_->terminate();
-            worker_->wait(200);
-        }
+        // PipeClient bounds each transaction; let pending I/O finish normally.
+        worker_->wait();
     }
 }
 

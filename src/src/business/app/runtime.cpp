@@ -51,6 +51,7 @@ Runtime::~Runtime() { stop(); }
 // ── 生命周期 ──────────────────────────────────────────────────────────────
 
 libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options& options) {
+    shutdown_requested_.store(false);
     config_ = config;
     options_ = options;
 
@@ -83,8 +84,8 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     store->load();
     parameters_ = std::move(store);
 
-    // 出厂默认只覆盖光谱侧三个字段（只补缺失的）。顺序必须是先 load 再 seed：
-    // 反了会拿默认值盖掉操作员已经调好的参数。激光侧不播种，见 seed_defaults()。
+    // Load persisted values first, then seed missing laser and spectrum defaults.
+    // Persisted operator values always take priority.
     const libs::VoidResult seeded = parameters_service_.seed_defaults();
     if (!seeded) {
         json::Value f = json::object();
@@ -156,7 +157,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     // 不随守护进程起来就自动出光（那就成了开机即打光）。
     writer_ = std::make_unique<measurement::Writer>(*local_sink_, config_.station_id);
     measurement_ = std::make_unique<measurement::MeasurementJob>(
-        devices_.laser(), devices_.spectrometer(), *monitor_, frame_bus_, *writer_);
+        devices_.laser(), devices_.spectrometer(), *monitor_, frame_bus_, *writer_, &acquisition_mutex_);
     measurement_->set_log(log_.get());
     // 测量参数同样来自参数库 —— 与出光读同一份，
     // 否则采集的积分时间和出光参数各走各的。

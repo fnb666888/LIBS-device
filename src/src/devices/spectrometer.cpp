@@ -405,7 +405,9 @@ Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
     }
 }
 
-Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
+Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
+                                           const std::function<VoidResult()>& on_armed,
+                                           const std::function<bool()>& cancelled) {
     if (!impl_) return Error::make(ErrorKind::internal, "not_open", "the session is not open");
     if (request.integration_ms < 0.002 || request.integration_ms > 60000.0 ||
         !std::isfinite(request.integration_ms))
@@ -421,6 +423,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
                            "master_serial must appear in the explicit serials list");
 
     CaptureResult result;
+    result.expected_groups = request.scans;
     try {
         impl_->initialize();
         const auto identities = impl_->identities();
@@ -488,6 +491,16 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
         for (std::size_t i : active)
             if (impl_->devices[i].serial == request.master_serial) order.push_back(i);
 
+        struct PendingCleanup {
+            Impl* impl;
+            const std::vector<std::size_t>& order;
+            bool active = true;
+            ~PendingCleanup() {
+                if (!active) return;
+                for (auto i : order) (void)impl->api.stop(impl->devices[i].handle);
+            }
+        } cleanup{impl_.get(), order};
+
         // ── 触发方向：激光器触发光谱仪（AvaSoft 手册 §4.9 接法二）──────────
         //
         // 手册把 LIBS 分成两种接法：
@@ -536,6 +549,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
             // 每帧 capture_timeout：现场表现就是"点了开始检测，一条谱都没有"。
             // 调用方说"不等 trigger"，就该真的不等。
             d.config.trigger.mode = laser_fires ? 1 : 0;
+            d.config.trigger.source_type = 0;
             if (request.synchronized && !master) { d.config.trigger.mode = 1; d.config.trigger.source = 1; }
 
             // 走接法二时**不设** laser_width/laser_delay：
@@ -569,7 +583,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
         for (std::uint32_t shot = 0; shot < request.scans; ++shot) {
             ScanGroup group;
             group.shot_id = shot + 1;
-            group.hardware_synchronized = request.synchronized;
+            group.hardware_synchronized = false; // Setting SYNC mode does not prove physical alignment.
             const auto deadline = Clock::now() + std::chrono::milliseconds(request.timeout_ms);
 
             for (auto i : order) {
@@ -583,21 +597,27 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
                 group.arm_order.push_back(impl_->devices[i].serial);
             }
 
+            if (shot == 0 && on_armed) {
+                const VoidResult armed = on_armed();
+                if (!armed) return armed.error();
+            }
+
             // 同样是"只等本次选中的通道"：ready 的长度取 active，索引是 impl_->devices 的下标。
             std::vector<bool> ready(active.size(), false);
             std::size_t remaining = ready.size();
             while (remaining) {
+                if (cancelled && cancelled())
+                    return Error::make(ErrorKind::device, "capture_cancelled", "capture stopped by owner");
                 if (Clock::now() >= deadline) {
                     // 超时必须先把已 arm 的通道停掉再返回。否则它们留在 pending，
                     // 下一次采集的第一条 PrepareMeasure 就会拿到 -5。
-                    for (auto i : order) (void)impl_->api.stop(impl_->devices[i].handle);
                     std::string missing;
                     for (std::size_t k = 0; k < ready.size(); ++k)
                         if (!ready[k]) { if (!missing.empty()) missing += ", "; missing += impl_->devices[active[k]].serial; }
-                    result.groups.push_back(std::move(group));
+                    result.received_groups = static_cast<std::uint32_t>(result.groups.size());
+                    if (result.received_groups != 0) return result;
                     return Error::make(ErrorKind::timeout, "capture_timeout",
-                                       "timed out waiting for " + missing + "; the partial group is kept "
-                                       "in the result and no shot is retried");
+                                       "timed out waiting for " + missing + "; no complete group received");
                 }
                 for (std::size_t k = 0; k < active.size(); ++k) {
                     if (ready[k]) continue;
@@ -634,6 +654,8 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
             group.complete = true;
             result.groups.push_back(std::move(group));
         }
+        result.received_groups = static_cast<std::uint32_t>(result.groups.size());
+        cleanup.active = false;
         return result;
     } catch (const std::exception& e) {
         return Error::make(ErrorKind::transport, "capture_failed", e.what());
@@ -665,7 +687,9 @@ Result<std::unique_ptr<Spectrometer>> Spectrometer::open(const std::string& sdk_
 Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
     return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
 }
-Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request) {
+Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
+                                           const std::function<VoidResult()>& on_armed,
+                                           const std::function<bool()>& cancelled) {
     (void)request;
     return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
 }

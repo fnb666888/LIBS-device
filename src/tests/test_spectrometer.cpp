@@ -351,7 +351,7 @@ TEST_MAIN_BEGIN_ARGV()
               CHECK_EQ(value.groups.size(), std::size_t(1));
               if (!value.groups.empty()) {
                   CHECK(value.groups[0].complete);
-                  CHECK(value.groups[0].hardware_synchronized);
+                  CHECK(!value.groups[0].hardware_synchronized);
                   // 主通道必须最后 arm
                   CHECK_EQ(value.groups[0].arm_order.size(), std::size_t(3));
                   if (value.groups[0].arm_order.size() == 3)
@@ -381,6 +381,71 @@ TEST_MAIN_BEGIN_ARGV()
               CHECK_EQ(value.devices.size(), std::size_t(3));
           }
           CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(arming_callback_runs_after_all_channels_before_readout);
+      fake_reset(0);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+        libs::devices::CaptureRequest request;
+        request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+        request.master_serial = "MASTER";
+        request.synchronized = true;
+        request.wait_for_laser_trigger = true;
+        bool called = false;
+        const auto result = opened.value()->capture(request, [&]() {
+          CHECK_EQ(fake_counter(1), 3);
+          called = true;
+          return libs::VoidResult();
+        });
+        CHECK(called); CHECK(result);
+        if (result) {
+          CHECK_EQ(result.value().expected_groups, 1u);
+          CHECK_EQ(result.value().received_groups, 1u);
+          CHECK(!result.value().groups[0].hardware_synchronized);
+        }
+        CHECK(opened.value()->close());
+      }
+    }
+    { CASE(failed_arming_callback_cleans_pending_measurements);
+      fake_reset(0);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+        libs::devices::CaptureRequest request;
+        request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+        request.master_serial = "MASTER"; request.synchronized = true;
+        const auto result = opened.value()->capture(request, []() -> libs::VoidResult {
+          return libs::Error::make(libs::ErrorKind::device, "gate_open_failed", "test");
+        });
+        CHECK(!result);
+        if (!result) CHECK_EQ(result.error().code, std::string("gate_open_failed"));
+        CHECK(fake_counter(2) >= 6);
+        CHECK(opened.value()->capture(request));
+        CHECK(opened.value()->close());
+      }
+    }
+    { CASE(later_timeout_keeps_previously_completed_groups);
+      fake_reset(7);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+        libs::devices::CaptureRequest request;
+        request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+        request.master_serial = "MASTER"; request.synchronized = true;
+        request.scans = 2; request.timeout_ms = 20;
+        const auto result = opened.value()->capture(request);
+        CHECK(result);
+        if (result) {
+          CHECK_EQ(result.value().expected_groups, 2u);
+          CHECK_EQ(result.value().received_groups, 1u);
+          CHECK_EQ(result.value().groups.size(), std::size_t(1));
+          CHECK(result.value().groups[0].complete);
+        }
+        CHECK(opened.value()->close());
       }
       fake_reset(0);
     }

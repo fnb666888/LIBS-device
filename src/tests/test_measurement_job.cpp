@@ -18,6 +18,10 @@
 // 这些只能靠真机发现的问题，可以在桌面上被确定性地复现。
 
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <windows.h>
 #include <chrono>
 #include <deque>
 #include <functional>
@@ -47,6 +51,13 @@ using data_delivery::DeliveryStatus;
 using libs::Result;
 
 namespace {
+template<class T> T fake_export(HMODULE module, const char* name) {
+    T result = nullptr;
+    const FARPROC raw = GetProcAddress(module, name);
+    static_assert(sizeof(result) == sizeof(raw));
+    std::memcpy(&result, &raw, sizeof(result));
+    return result;
+}
 
 // 假串口：**有状态的**激光器模拟器。
 //
@@ -67,7 +78,9 @@ public:
     // 模拟器自己的状态。测试可以直接改，也可以让写指令去改。
     unsigned counter = 100;
     bool work_state = false;
+    std::function<void()> on_work_on;
     bool q_gate_open = false;
+    std::function<void()> on_gate_open;
     bool interlock_ok = true;
     bool estop_ok = true;
     bool ot_ok = true;
@@ -91,10 +104,12 @@ public:
                 case libs::laser::command::kWorkState:
                     // 工作使能/停机。停机立刻断，放电计数也停。
                     work_state = !payload.empty() && payload[0] != 0x00;
+                    if (work_state && on_work_on) on_work_on();
                     if (!work_state) counter = counter;   // 停机不重置计数，只是记录
                     break;
                 case libs::laser::command::kQGate:
                     q_gate_open = !payload.empty() && payload[0] != 0x00;
+                    if (q_gate_open && on_gate_open) on_gate_open();
                     break;
                 case libs::laser::command::kLdActual:
                     return reply(actual_frame());
@@ -963,6 +978,151 @@ CASE(status_is_callable_before_anything_is_configured); {
     measurement::MeasurementJob job(nullptr, nullptr, *monitor, queue, writer);
     (void)job.status();
     (void)job.running();
+}
+
+CASE(sdk_channels_are_armed_before_laser_gate_opens); {
+    const char* path = std::getenv("LIBS_FAKE_AVASPEC_DLL");
+    CHECK(path != nullptr);
+    if (path) {
+        HMODULE module = LoadLibraryA(path);
+        CHECK(module != nullptr);
+        if (module) {
+            const auto reset = fake_export<void (*)(int)>(module, "FakeReset");
+            const auto counter = fake_export<int (*)(int)>(module, "FakeCounter");
+            CHECK(reset && counter);
+            if (reset && counter) {
+                reset(0);
+                {
+                    Fixture f;
+                    auto spec = libs::devices::Spectrometer::open(path);
+                    CHECK(spec);
+                    if (spec) {
+                        f.site.spectrometer.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+                        f.site.spectrometer.master_serial = "MASTER";
+                        f.job->configure(f.site, [] { return make_measurement(); });
+                        f.job->bind_devices(f.laser.get(), spec.value().get());
+                        f.job->set_capture_hook_for_test({});
+                        bool opened_after_arming = false;
+                        f.link.on_gate_open = [&] { opened_after_arming = counter(1) == 3; };
+                        CHECK(f.job->start(make_params()));
+                        CHECK(opened_after_arming);
+                        CHECK(f.job->stop());
+                        CHECK(spec.value()->close());
+                        f.job->bind_devices(f.laser.get(), nullptr);
+                    }
+                }
+                reset(1);
+                {
+                    Fixture f;
+                    auto spec = libs::devices::Spectrometer::open(path);
+                    CHECK(spec);
+                    if (spec) {
+                        f.site.spectrometer.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+                        f.site.spectrometer.master_serial = "MASTER";
+                        f.job->configure(f.site, [] { return make_measurement(); });
+                        f.job->bind_devices(f.laser.get(), spec.value().get());
+                        f.job->set_capture_hook_for_test({});
+                        bool gate_opened = false;
+                        f.link.on_gate_open = [&] { gate_opened = true; };
+                        CHECK(!f.job->start(make_params()));
+                        CHECK(!gate_opened);
+                        CHECK(!f.link.work_state); CHECK(!f.link.q_gate_open);
+                        CHECK(!f.job->running());
+                        CHECK(counter(2) >= 3);
+                        reset(0); // Disable the persistent injected prepare failure before quiet close.
+                        CHECK(spec.value()->close());
+                        f.job->bind_devices(f.laser.get(), nullptr);
+                    }
+                }
+                reset(0);
+            }
+            FreeLibrary(module);
+        }
+    }
+}
+CASE(stop_cancels_pending_sdk_capture_without_waiting_for_ttl_timeout); {
+    const char* path = std::getenv("LIBS_FAKE_AVASPEC_DLL");
+    if (path) {
+        HMODULE module = LoadLibraryA(path);
+        const auto reset = fake_export<void (*)(int)>(module, "FakeReset");
+        CHECK(reset);
+        if (reset) {
+            reset(4);
+            {
+                Fixture f;
+                auto spec = libs::devices::Spectrometer::open(path);
+                CHECK(spec);
+                if (spec) {
+                    f.site.spectrometer.serials = {"MASTER", "SLAVE1", "SLAVE2"};
+                    f.site.spectrometer.master_serial = "MASTER";
+                    f.job->configure(f.site, [] { return make_measurement(); });
+                    f.job->bind_devices(f.laser.get(), spec.value().get());
+                    f.job->set_capture_hook_for_test({});
+                    auto params = make_params(); params.capture_timeout_ms = 1500;
+                    CHECK(f.job->start(params));
+                    const auto begin = std::chrono::steady_clock::now();
+                    CHECK(f.job->stop());
+                    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - begin).count();
+                    CHECK(elapsed < 500);
+                    CHECK(!f.link.q_gate_open); CHECK(!f.link.work_state);
+                    CHECK(spec.value()->close());
+                    f.job->bind_devices(f.laser.get(), nullptr);
+                }
+            }
+            reset(0);
+        }
+        if (module) FreeLibrary(module);
+    }
+}
+CASE(interlock_changed_during_preparation_never_opens_gate); {
+    Fixture f;
+    f.link.on_work_on = [&] { f.facts.laser.interlock_1 = false; };
+    bool opened = false;
+    f.link.on_gate_open = [&] { opened = true; };
+    const auto started = f.job->start(make_params());
+    CHECK(!started);
+    if (!started) CHECK_EQ(started.error().code, std::string("gate_lost_during_startup"));
+    CHECK(!opened); CHECK(!f.link.work_state); CHECK(!f.job->running());
+}
+CASE(invalid_rate_is_rejected_before_device_writes); {
+    Fixture f;
+    auto params = make_params();
+    params.laser.frequency_hz = 10;
+    params.integration_ms = 100;
+    const auto started = f.job->start(params);
+    CHECK(!started);
+    if (!started) CHECK_EQ(started.error().code, std::string("laser_spectrometer_rate_mismatch"));
+    CHECK(f.link.write_commands().empty());
+}
+CASE(worker_exception_closes_gate_and_allows_stop); {
+    Fixture f;
+    f.job->set_capture_hook_for_test([]() -> libs::Result<libs::devices::CaptureResult> {
+        throw std::runtime_error("test capture exception");
+    });
+    (void)f.job->start(make_params());
+    CHECK(f.job->stop());
+    CHECK(!f.link.q_gate_open); CHECK(!f.link.work_state);
+}
+CASE(spectral_request_override_applies_to_following_frames); {
+    Fixture f;
+    const auto subscriber = f.queue.subscribe();
+    auto params = make_params();
+    params.capture_timeout_ms = 777;
+    params.override_timeout = true;
+    CHECK(f.job->start(params));
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    measurement::SpectrumFrame frame;
+    CHECK(f.queue.try_pop(subscriber, frame));
+    CHECK_EQ(frame.timeout_ms, 777u);
+    CHECK(f.queue.try_pop(subscriber, frame));
+    CHECK_EQ(frame.timeout_ms, 777u);
+    CHECK(f.job->stop());
+}
+CASE(measurement_can_stop_and_start_again); {
+    Fixture f;
+    CHECK(f.job->start(make_params())); CHECK(f.job->stop());
+    CHECK(f.job->start(make_params())); CHECK(f.job->stop());
 }
 
 TEST_MAIN_RETURN()

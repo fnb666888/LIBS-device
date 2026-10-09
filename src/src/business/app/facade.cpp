@@ -155,6 +155,7 @@ std::vector<std::string> BusinessFacade::commands() {
         "recovery_list",
         "recovery_write",
         "health",
+        "shutdown",
         "measurement_start",
         "measurement_stop",
         "measurement_status",
@@ -210,6 +211,11 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "precheck")        return cmd_precheck(args);
     if (command == "param_set")       return cmd_param_set(args);
     if (command == "param_get")       return cmd_param_get(args);
+    if (command == "shutdown") {
+        runtime_.request_shutdown();
+        json::Value v = json::object(); v.set("shutdown_requested", json::Value(true));
+        return Response::success(std::move(v));
+    }
     if (command == "capture")         return cmd_capture(args);
 
     if (command == "spectrum_stream") return cmd_spectrum_stream(args);
@@ -578,7 +584,11 @@ Response BusinessFacade::cmd_param_get(const json::Value& args) {
 }
 
 Response BusinessFacade::cmd_capture(const json::Value& args) {
-    (void)args;   // 单次采集不接受覆盖：参数一律来自参数库，不参与推导
+    (void)args;
+    std::unique_lock<std::mutex> acquisition(runtime_.acquisition_mutex(), std::try_to_lock);
+    if (!acquisition.owns_lock() || runtime_.laser_session_active())
+        return Response::failure(libs::Error::make(libs::ErrorKind::device,
+            "acquisition_busy", "测量已占用光谱仪，独立采集被拒绝"));
     std::lock_guard<std::mutex> lock(runtime_.device_mutex());
 
     // 测量参数**一律**来自参数库（参数管理服务），不参与任何推导 ——
@@ -591,13 +601,8 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
     const measurement::SpectrumMeasurement measurement =
         runtime_.parameter_service().spectrometer_measurement();
 
-    // **这里不再需要任何采集租约。**
-    //
-    // 以前要租约，是因为有第二个采集者（SpectrumStream 的后台线程）：
-    // 外触发模式下两条采集路径同时等 pin 6 的 TTL 就是抢触发，测量那次
-    // 永远等不到。现在唯一的采集者是 MeasurementJob 的 worker 线程，
-    // 物理上不存在第二条路径，所以租约没有对象可仲裁 —— 顺带删掉了
-    // "单次采集要向显示服务申请设备权限"这条荒谬的依赖方向。
+    // acquisition_mutex and laser session ownership exclude the measurement worker.
+    // Display subscriptions remain pure memory operations and never acquire this lock.
 
     libs::devices::Spectrometer* device = runtime_.devices().spectrometer();
     if (device == nullptr) {
@@ -622,6 +627,8 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
         return Response::failure(result.error());
     }
     json::Value v = json::object();
+    v.set("expected_groups", json::Value(static_cast<double>(result.value().expected_groups)));
+    v.set("received_groups", json::Value(static_cast<double>(result.value().received_groups)));
     v.set("measurement_source", json::Value("parameters.json"));
     json::Array syncs;
     for (const auto& group : result.value().groups) {

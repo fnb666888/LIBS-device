@@ -24,6 +24,7 @@
 // 反向没有任何引用。设备对象只由 session 持有，别处拿指针。
 
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -79,6 +80,9 @@ public:
     //
     // **锁留在 Runtime**：串口互斥是**进程级**的，不属于任何一个业务。
     std::mutex& device_mutex() noexcept { return device_mutex_; }
+    std::mutex& acquisition_mutex() noexcept { return acquisition_mutex_; }
+    void request_shutdown() noexcept { shutdown_requested_.store(true); }
+    bool shutdown_requested() const noexcept { return shutdown_requested_.load(); }
 
     const config::SiteConfig& config() const noexcept { return config_; }
     session::DeviceSession& devices() noexcept { return devices_; }
@@ -159,6 +163,8 @@ private:
     config::SiteConfig config_;
     Options options_;
     std::mutex device_mutex_;
+    std::mutex acquisition_mutex_;
+    std::atomic<bool> shutdown_requested_{false};
 
     // ── shared：共同底座 ────────────────────────────────────────────────
     session::DeviceSession devices_;

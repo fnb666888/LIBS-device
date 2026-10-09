@@ -49,6 +49,8 @@ json::Value to_json(const SpectrumFrame& frame) {
     v.set("requested_sync", json::Value(frame.requested_sync));
     // 本帧是否由激光触发采集而来。UI 靠它区分"测量谱"与"背景谱"。
     v.set("laser_shot", json::Value(frame.laser_shot));
+    v.set("expected_groups", json::Value(static_cast<double>(frame.expected_groups)));
+    v.set("received_groups", json::Value(static_cast<double>(frame.received_groups)));
     v.set("period_ms", json::Value(frame.period_ms));
     v.set("timeout_ms", json::Value(static_cast<double>(frame.timeout_ms)));
     v.set("ok", json::Value(frame.ok()));

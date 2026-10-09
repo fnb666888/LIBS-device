@@ -131,8 +131,8 @@ int main(int argc, char** argv) {
 
         businessd::NamedPipeServer server(runtime, daemon);
         // stop() 只置位标志，要把它接到 run() 的等待上——所以这里不能只看 stop_flag。
-        std::thread watcher([&server, &stop_flag] {
-            while (!stop_flag.load()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::thread watcher([&server, &stop_flag, &runtime] {
+            while (!stop_flag.load() && !runtime.shutdown_requested()) std::this_thread::sleep_for(std::chrono::milliseconds(100));
             server.stop();
         });
 

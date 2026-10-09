@@ -359,6 +359,12 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
     const libs::VoidResult lf = config::validate_laser_fire(out.laser);
     if (!lf) return lf.error();
 
+    if (args.has("spectrometer")) {
+        const auto& spec = args["spectrometer"];
+        out.override_integration = spec.has("integration_ms");
+        out.override_timeout = spec.has("capture_timeout_ms");
+        out.override_delay = spec.has("integration_delay_ns");
+    }
     return libs::Result<measurement::FireParameters>::success(out);
 }
 

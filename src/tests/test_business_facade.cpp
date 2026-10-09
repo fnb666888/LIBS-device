@@ -585,4 +585,14 @@ CASE(precheck_reaches_the_verdict_when_the_laser_is_configured_but_closed); {
     CHECK(gate.ok);
     CHECK(gate.payload["armed"].as_bool(false));
 }
+CASE(capture_refuses_active_measurement_and_shutdown_is_explicit); {
+    Fixture f("tmp_facade_acquisition_busy");
+    CHECK(f.runtime.begin_laser_session());
+    const auto capture = f.facade.dispatch(R"({"command":"capture"})");
+    CHECK(!capture.ok);
+    CHECK_EQ(capture.error.code, std::string("acquisition_busy"));
+    f.runtime.end_laser_session();
+    const auto shutdown = f.facade.dispatch(R"({"command":"shutdown"})");
+    CHECK(shutdown.ok); CHECK(f.runtime.shutdown_requested());
+}
 TEST_MAIN_RETURN()

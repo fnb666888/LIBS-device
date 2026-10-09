@@ -77,6 +77,8 @@ struct SpectrumFrame {
     // 同步事实：由采集结果原样上送，与 requested_sync 合并不推断。
     bool hardware_synchronized = false;
     bool requested_sync = false;
+    std::uint32_t expected_groups = 0;
+    std::uint32_t received_groups = 0;
 
     // **本帧是否由激光触发采集而来**。
     //

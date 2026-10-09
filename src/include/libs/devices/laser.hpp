@@ -1,4 +1,5 @@
 #pragma once
+#include <mutex>
 
 #include <cstdint>
 #include <string>
@@ -119,7 +120,7 @@ public:
 
     // 只表示本对象的 openQGate 成功且尚未 stopContinuous；
     // 真实状态必须以 readActual() 为准。
-    bool running() const noexcept { return running_; }
+    bool running() const { std::lock_guard<std::recursive_mutex> lock(operation_mutex_); return running_; }
 
 private:
     struct LaserTransaction {
@@ -145,6 +146,7 @@ private:
                             LaserOperationTrace& trace);
     Result<LaserActual> appendReadActual(LaserOperationTrace* trace);
 
+    mutable std::recursive_mutex operation_mutex_;
     transport::Link& link_;
     unsigned timeout_ms_;
     bool running_ = false;
