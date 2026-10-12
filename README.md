@@ -1,5 +1,7 @@
 # LIBS 现场检测系统
 
+Rust 后端重构基于 main `351b17c`，新实现位于 [`backend/`](backend/README.md)，根目录 `build.ps1` 默认构建 Rust 后端。算法包支持完整替换、免定标/定标模式及在线重载，编写规范见 [算法接口规范](backend/ALGORITHM_INTERFACE.md)。下文原 C++ 架构和历史验证记录保留作为基线参考。
+
 主分支已完成经过联调的硬件与通信修复移植，保留统一测量任务架构。变更和验证记录见 [移植说明](docs/main-hardware-migration.md)。
 
 LIBS（激光诱导击穿光谱）现场检测系统的完整控制软件。

@@ -181,3 +181,10 @@ nohup.out
 
 
 
+# Rust migration artifacts
+.tools/
+backend/target/
+backend/data/
+backend/output/
+*.trees.bin
+native_model.json

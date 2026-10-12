@@ -1,0 +1,234 @@
+{
+  "actions": [
+    "contract",
+    "status",
+    "latest",
+    "configure",
+    "validate",
+    "analyze"
+  ],
+  "analyze_execution": "asynchronous; accepted/request_id then poll latest/status",
+  "availability": "runtime_check_required",
+  "fields": [
+    {
+      "description": "固定 libs.algorithm.v1",
+      "path": "input.schema_version",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "调用方提供的非空关联 ID，原样回传",
+      "path": "input.request_id",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "站点、带号、报关单号、采集时间等业务上下文；不推断缺失值",
+      "path": "input.context",
+      "required": false,
+      "type": "object"
+    },
+    {
+      "description": "原始光谱采集 的完整原始 LIBS 载荷；旧 raw_capture 可作别名",
+      "path": "input.spectrum",
+      "required": true,
+      "type": "object"
+    },
+    {
+      "description": "固定 LIBS；不能传近红外原始谱",
+      "path": "input.spectrum.spectrum_source",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "固定 wavelength_nm+counts",
+      "path": "input.spectrum.spectrum_format",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "至少一组，每组至少一个真实采到的通道；缺失通道不补零",
+      "path": "input.spectrum.scan_groups",
+      "required": true,
+      "type": "array"
+    },
+    {
+      "description": "非负且在 JSON 精确整数范围内；采集载荷已有时原样携带",
+      "path": "input.spectrum.scan_groups[].shot_id",
+      "required": false,
+      "type": "integer"
+    },
+    {
+      "description": "原样保留采集完整性；false 不会被改成 true",
+      "path": "input.spectrum.scan_groups[].complete",
+      "required": false,
+      "type": "boolean"
+    },
+    {
+      "description": "原样携带同步标记，不由通道数量推断",
+      "path": "input.spectrum.scan_groups[].hardware_synchronized",
+      "required": false,
+      "type": "boolean"
+    },
+    {
+      "description": "布防顺序，元素须为非空序列号",
+      "path": "input.spectrum.scan_groups[].arm_order",
+      "required": false,
+      "type": "array<string>"
+    },
+    {
+      "description": "同一组内 serial 必须唯一；可接受部分通道并报告缺失元数据",
+      "path": "input.spectrum.scan_groups[].channels",
+      "required": true,
+      "type": "array"
+    },
+    {
+      "description": "非空设备序列号",
+      "path": "input.spectrum.scan_groups[].channels[].serial",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "正整数且等于两个数组长度",
+      "path": "input.spectrum.scan_groups[].channels[].pixels",
+      "required": false,
+      "type": "integer"
+    },
+    {
+      "description": "非负设备时间计数，禁止与墙钟时间混用",
+      "path": "input.spectrum.scan_groups[].channels[].device_time_ticks",
+      "required": false,
+      "type": "integer"
+    },
+    {
+      "description": "非空，正且有限的 nm 数值；不重采样或排序",
+      "path": "input.spectrum.scan_groups[].channels[].wavelength_nm",
+      "required": true,
+      "type": "array<number>"
+    },
+    {
+      "description": "非空且与波长等长，所有强度有限；不转成含量",
+      "path": "input.spectrum.scan_groups[].channels[].counts",
+      "required": true,
+      "type": "array<number>"
+    },
+    {
+      "description": "analyze 必须显式指定 oxide 或 sulfide；不根据文件名推断矿种",
+      "path": "input.parameters.branch",
+      "required": true,
+      "type": "string"
+    },
+    {
+      "description": "须匹配已加载模型的 model_id；当前 iron_ore_current_mixed_v2；固定预处理，不接受调用方覆盖",
+      "path": "input.model.id",
+      "required": false,
+      "type": "string"
+    },
+    {
+      "description": "模型原始十项质量分数%，含元素 P；COMPO_P2O5 保持 null",
+      "path": "output.composition.target_values",
+      "required": true,
+      "type": "object"
+    },
+    {
+      "description": "海科同名十项 COMPO_*，缺结果一律 null；COMPO_P2O5 不由元素 P 自动换算",
+      "path": "output.composition.values",
+      "required": true,
+      "type": "object"
+    },
+    {
+      "description": "标签、置信度为 null，类别数组为空",
+      "path": "output.classification",
+      "required": true,
+      "type": "object"
+    },
+    {
+      "description": "分数、参照 ID 为 null，匹配数组为空",
+      "path": "output.similarity",
+      "required": true,
+      "type": "object"
+    },
+    {
+      "description": "保留低信噪比、域外、铁池约束及同步未确认等状态；结构校验通过不是质量合格",
+      "path": "output.quality",
+      "required": true,
+      "type": "object"
+    }
+  ],
+  "input_template": {
+    "context": {},
+    "model": {},
+    "parameters": {
+      "branch": "oxide"
+    },
+    "request_id": "",
+    "schema_version": "libs.algorithm.v1",
+    "spectrum": {
+      "scan_groups": [],
+      "spectrum_format": "wavelength_nm+counts",
+      "spectrum_source": "LIBS"
+    }
+  },
+  "input_template_valid": false,
+  "minimum_accepted_wavelength_nm": [
+    200,
+    564.7
+  ],
+  "model_id": "iron_ore_current_mixed_v2",
+  "model_status_action": "status",
+  "output_schema_version": "libs.algorithm.result.v1",
+  "output_template": {
+    "availability": "unavailable",
+    "classification": {
+      "classes": [],
+      "confidence": null,
+      "label": null
+    },
+    "composition": {
+      "availability": "unavailable",
+      "phosphorus_definition": "elemental_P; COMPO_P2O5 is not predicted",
+      "target_values": {},
+      "unit": "mass_fraction_percent",
+      "unit_confirmed": true,
+      "values": {
+        "COMPO_AL2O3": null,
+        "COMPO_CAO": null,
+        "COMPO_FEO": null,
+        "COMPO_MGO": null,
+        "COMPO_MNO": null,
+        "COMPO_P2O5": null,
+        "COMPO_S": null,
+        "COMPO_SIO2": null,
+        "COMPO_TFE": null,
+        "COMPO_TIO2": null
+      }
+    },
+    "context": {},
+    "executed": false,
+    "model": null,
+    "quality": {
+      "issues": [],
+      "status": "not_evaluated"
+    },
+    "request_id": "",
+    "results": [],
+    "schema_version": "libs.algorithm.result.v1",
+    "similarity": {
+      "matches": [],
+      "reference_id": null,
+      "score": null
+    },
+    "status": {
+      "message": "输出模板无预测值；调用 analyze 才执行模型，输入校验成功不代表预测成功",
+      "reason": "no_prediction_yet",
+      "state": "not_executed"
+    }
+  },
+  "prediction_note": "当前 v2 为 240 维特征；真机末端可使用固定 564.7 nm 网格，保留适配与域外标记；模型状态为实际加载版本的依据",
+  "required_wavelength_nm": [
+    200,
+    565
+  ],
+  "schema_version": "libs.algorithm.v1",
+  "template_note": "空模板仅描述结构；须填 request_id 与真实采集谱才能校验"
+}
