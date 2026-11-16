@@ -1,5 +1,16 @@
 # LIBS 现场检测系统
 
+## 许可证：仅限非商业用途
+
+本项目原创代码采用 [PolyForm Noncommercial License 1.0.0](LICENSE)
+（SPDX：`PolyForm-Noncommercial-1.0.0`）。允许在许可证规定的非商业用途下使用、复制、修改和分发；
+未经著作权人另行授权，不得用于商业用途。商业使用请通过
+[GitHub Issues](https://github.com/fnb666888/LIBS-device/issues) 联系维护者申请授权。
+
+分发原始或修改后的代码时，须遵守许可证中的通知和分发要求。
+第三方依赖、厂商 SDK 及其他第三方材料仍适用其各自许可证，不因本项目许可证而改变。
+具体授权范围以 [LICENSE](LICENSE) 全文为准。
+
 主分支已完成经过联调的硬件与通信修复移植，保留统一测量任务架构。变更和验证记录见 [移植说明](docs/main-hardware-migration.md)。
 
 LIBS（激光诱导击穿光谱）现场检测系统的完整控制软件。
