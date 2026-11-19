@@ -1,5 +1,6 @@
 // 空调设备驱动测试：注入假 transport::Link，不碰真实串口。
 #include <deque>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +53,20 @@ public:
     }
     void queue_error(Error e) { replies.push_back(Result<transport::Reply>::failure(std::move(e))); }
 };
+
+Bytes setpoint_reply(std::uint16_t cooling_on = 350) {
+    // 30014..30023, including the intermediate protection registers.
+    const std::uint16_t registers[] = {cooling_on, 290, 0xFF9C, 100, 450, 0, 0, 0, 800, 650};
+    Bytes response{8, 3, 20};
+    for (const auto raw : registers) {
+        response.push_back(static_cast<std::uint8_t>(raw >> 8));
+        response.push_back(static_cast<std::uint8_t>(raw));
+    }
+    const auto crc = modbus::crc16(response.data(), response.size());
+    response.push_back(static_cast<std::uint8_t>(crc));
+    response.push_back(static_cast<std::uint8_t>(crc >> 8));
+    return response;
+}
 
 }  // namespace
 
@@ -264,6 +279,52 @@ TEST_MAIN_BEGIN()
     auto p = ac.readParams(30014, 2);
     // 帧完整时即使 timed_out 标志为真也照常解码，标志本身交给调用方判断。
     CHECK(p.ok());
+}
+
+{
+    CASE(environment_keeps_status_when_parameter_read_fails);
+    FakeLink link;
+    link.queue(from_hex("08 01 03 05 00 00 2C D6"));
+    link.queue_error(Error::make(ErrorKind::transport, "cable_unplugged", "link lost"));
+    devices::AirConditioner ac(link, 8);
+    const auto environment = ac.readEnvironment();
+    CHECK(environment.cooling.value_or(false));
+    CHECK(environment.power_on.has_value());
+    CHECK(!environment.cabinet_temperature_c.has_value());
+    CHECK(environment.status_error.empty());
+    CHECK_EQ(environment.parameters_error, std::string("link lost"));
+}
+
+{
+    CASE(apply_setpoints_writes_only_differences_then_confirms_readback);
+    FakeLink link;
+    link.queue(setpoint_reply());
+    link.queue(modbus::make_request(8, 6, reg::kCoolingOnSetpoint - reg::kIndoorTemp, 360));
+    link.queue(setpoint_reply(360));
+    link.queue(setpoint_reply(360));
+    devices::AirConditioner ac(link, 8);
+    const devices::AirConditionerSetpoints target{36, 29, -10, 10, 80, 65};
+    const auto changed = ac.applySetpoints(target);
+    CHECK(changed);
+    if (changed) CHECK_EQ(changed.value().cooling_on_c, 36.0);
+    CHECK_EQ(link.sent.size(), std::size_t(3));
+    CHECK(ac.applySetpoints(target));
+    CHECK_EQ(link.sent.size(), std::size_t(4));
+}
+
+{
+    CASE(apply_setpoints_validates_every_field_before_writing_and_rejects_echo_without_readback);
+    FakeLink link;
+    devices::AirConditioner ac(link, 8);
+    const auto bad = ac.applySetpoints({36, 29, -10, 10, 80, std::numeric_limits<double>::quiet_NaN()});
+    CHECK(!bad);
+    CHECK(link.sent.empty());
+    link.queue(setpoint_reply());
+    link.queue(modbus::make_request(8, 6, reg::kCoolingOnSetpoint - reg::kIndoorTemp, 360));
+    link.queue(setpoint_reply());
+    const auto mismatch = ac.applySetpoints({36, 29, -10, 10, 80, 65});
+    CHECK(!mismatch);
+    if (!mismatch) CHECK_EQ(mismatch.error().code, std::string("ac_setpoint_mismatch"));
 }
 
 TEST_MAIN_RETURN()

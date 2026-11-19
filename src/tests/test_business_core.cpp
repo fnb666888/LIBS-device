@@ -9,6 +9,7 @@
 #include "libs/business/shared/json/json.hpp"
 #include "libs/business/shared/config/site_config.hpp"
 #include "libs/business/shared/config/parameter_store.hpp"
+#include "libs/business/shared/session/device_session.hpp"
 #include "libs/business/readiness/facts.hpp"
 #include "libs/business/readiness/verdict.hpp"
 #include "libs/business/readiness/lamp.hpp"
@@ -159,7 +160,42 @@ CASE(config_accepts_minimal_valid); {
     if (loaded.ok()) {
         CHECK_EQ(loaded.value().station_id, std::string("s1"));
         CHECK_EQ(loaded.value().laser.port, std::string("COM10"));
+        CHECK(!loaded.value().rangefinder.serial.enabled);
+        CHECK(!loaded.value().air_conditioner.serial.enabled);
     }
+}
+
+CASE(optional_device_configuration_roundtrips_and_reports_connection_failure); {
+    bool ok = false;
+    auto node = parsed(R"({
+        "station_id":"test", "laser":{"enabled":false}, "indicator":{"enabled":false},
+        "spectrometer":{"enabled":false},
+        "rangefinder":{"enabled":true,"port":"COM_NOT_A_REAL_DEVICE","address":7},
+        "air_conditioner":{"address":8}
+    })", ok);
+    const auto loaded = config::from_json(node);
+    CHECK(ok && loaded.ok());
+    if (loaded) {
+        const auto roundtrip = config::from_json(config::to_json(loaded.value()));
+        CHECK(roundtrip);
+        if (roundtrip) {
+            CHECK_EQ(static_cast<int>(roundtrip.value().rangefinder.address), 7);
+            CHECK_EQ(static_cast<int>(roundtrip.value().air_conditioner.address), 8);
+        }
+        session::DeviceSession devices;
+        CHECK(devices.open(loaded.value()));
+        CHECK(devices.rangefinder() == nullptr);
+        CHECK(devices.air_conditioner() == nullptr);
+        const auto health = devices.health();
+        CHECK(health.rangefinder.configured && !health.rangefinder.opened);
+        CHECK(!health.air_conditioner.configured);
+        CHECK(health.all_required_open);
+        CHECK(devices.close());
+    }
+    auto bad_rangefinder = node["rangefinder"];
+    bad_rangefinder.set("address", Value(248));
+    node.set("rangefinder", std::move(bad_rangefinder));
+    CHECK(!config::from_json(node));
 }
 
 CASE(config_default_template_passes_validation); {

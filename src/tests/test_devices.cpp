@@ -231,6 +231,35 @@ TEST_MAIN_BEGIN()
     CHECK_EQ(read.error().code, std::string("modbus_exception"));
 }
 
+{
+    CASE(rangefinder_observation_distinguishes_invalid_from_transport_failure);
+    FakeLink link;
+    link.queue(modbus_read_reply(1, 0x0201, 7, {496, 9999, 1000, 88, 0, 23, 14}));
+    link.queue(modbus_read_reply(1, 0x0201, 7, {0xFFFF, 0, 0, 101, 0, 23, 15}));
+    devices::Rangefinder rf(link);
+    const auto before = std::chrono::steady_clock::now();
+    const auto observation = rf.readObservation();
+    CHECK(observation);
+    if (observation) {
+        CHECK_EQ(observation.value().distance_mm.value_or(0), 496);
+        CHECK_EQ(static_cast<int>(observation.value().confidence_percent.value_or(0)), 88);
+        CHECK_EQ(observation.value().sample_counter, 14);
+        CHECK(observation.value().observed_at >= before);
+        CHECK(observation.value().observed_at <= std::chrono::steady_clock::now());
+    }
+    const auto invalid = rf.readObservation();
+    CHECK(invalid);
+    if (invalid) {
+        CHECK(!invalid.value().distance_mm.has_value());
+        CHECK(!invalid.value().confidence_percent.has_value());
+        CHECK_EQ(invalid.value().sample_counter, 15);
+    }
+    link.fail_next = true;
+    const auto disconnected = rf.readObservation();
+    CHECK(!disconnected);
+    if (!disconnected) CHECK(disconnected.error().kind == ErrorKind::transport);
+}
+
 // -- Indicator ---------------------------------------------------------------
 {
     CASE(indicator_apply_verifies_state);

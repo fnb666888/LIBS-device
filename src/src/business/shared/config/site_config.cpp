@@ -115,6 +115,18 @@ Result<SerialPortConfig> parse_serial(const json::Value& parent, const std::stri
     return cfg;
 }
 
+Result<ModbusDeviceConfig> parse_optional_modbus(const json::Value& parent, const std::string& key) {
+    ModbusDeviceConfig cfg;
+    if (!parent.has(key)) return cfg;
+    const auto serial = parse_serial(parent, key, cfg.serial);
+    if (!serial) return serial.error();
+    const auto address = optional_u8(parent[key], "address", cfg.address);
+    if (!address) return address.error();
+    cfg.serial = serial.value();
+    cfg.address = address.value();
+    return cfg;
+}
+
 Result<SpectrometerConfig> parse_spectrometer(const json::Value& parent) {
     const json::Value& node = parent["spectrometer"];
     if (node.is_null()) return invalid("spectrometer is required");
@@ -263,6 +275,12 @@ Result<SiteConfig> from_json(const json::Value& value) {
     if (!ia) return ia.error();
     cfg.indicator_address = ia.value();
 
+    const auto rangefinder = parse_optional_modbus(value, "rangefinder");
+    if (!rangefinder) return rangefinder.error();
+    cfg.rangefinder = rangefinder.value();
+    const auto air_conditioner = parse_optional_modbus(value, "air_conditioner");
+    if (!air_conditioner) return air_conditioner.error();
+    cfg.air_conditioner = air_conditioner.value();
 
     const VoidResult v = validate(cfg);
     if (!v) return v.error();
@@ -301,6 +319,13 @@ json::Value to_json(const SiteConfig& config) {
 
     v.set("indicator_model", json::Value(config.indicator_model));
     v.set("indicator_address", json::Value(static_cast<double>(config.indicator_address)));
+    const auto modbus_json = [](const ModbusDeviceConfig& device) {
+        auto node = to_json_serial(device.serial);
+        node.set("address", json::Value(static_cast<double>(device.address)));
+        return node;
+    };
+    v.set("rangefinder", modbus_json(config.rangefinder));
+    v.set("air_conditioner", modbus_json(config.air_conditioner));
     return v;
 }
 
@@ -363,6 +388,18 @@ VoidResult validate(const SiteConfig& config) {
     if (!l) return l;
     const VoidResult i = check_serial("indicator", config.indicator);
     if (!i) return i;
+    const auto check_modbus = [&](const char* name, const ModbusDeviceConfig& device) -> VoidResult {
+        if (device.address < 1 || device.address > 247)
+            return invalid(std::string(name) + ".address must be in 1..247");
+        // The serial Link uses an 80 ms end-of-frame idle interval by default.
+        if (device.serial.enabled && (device.serial.timeout_ms < 80 || device.serial.timeout_ms > 10000))
+            return invalid(std::string(name) + ".timeout_ms must be in 80..10000");
+        return check_serial(name, device.serial);
+    };
+    const auto rangefinder = check_modbus("rangefinder", config.rangefinder);
+    if (!rangefinder) return rangefinder;
+    const auto air_conditioner = check_modbus("air_conditioner", config.air_conditioner);
+    if (!air_conditioner) return air_conditioner;
     if (config.spectrometer.enabled) {
         if (config.spectrometer.sdk_dll.empty())
             return invalid("spectrometer is enabled but sdk_dll is empty");

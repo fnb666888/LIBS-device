@@ -42,6 +42,11 @@ struct SerialPortConfig {
     bool enabled = true;
 };
 
+struct ModbusDeviceConfig {
+    SerialPortConfig serial{"", 9600, libs::transport::Parity::none, 8, 650, 80, false};
+    std::uint8_t address = 1;
+};
+
 // 光谱仪配置。通道数量与序列号都来自配置，USB 口没有"端口名"概念。
 struct SpectrometerConfig {
     std::string sdk_dll;                    // 绝对 UTF-8 路径的 avaspecx64.dll
@@ -110,8 +115,6 @@ struct SiteConfig {
     //   indicator      状态灯（COM8）—— 预检结论的唯一物理出口
     //   spectrometer   光谱仪（USB ×N）
     //
-    // 测距仪 / 空调 / 传送带 / 网关四类曾在本文件里有配置项，但全库零消费者
-    // （只被打开、只被 health 回报，没有任何业务读它们），已删除。
     SerialPortConfig laser;                 // 端口表：COM10
     SerialPortConfig indicator;             // 端口表：COM8
     SpectrometerConfig spectrometer;        // 4×光谱 USB
@@ -120,6 +123,8 @@ struct SiteConfig {
     // 状态灯型号：写命令需要型号才能构造（科隆威 K50 等）。留空则不可写。
     std::string indicator_model;
     std::uint8_t indicator_address = 1;
+    ModbusDeviceConfig rangefinder;
+    ModbusDeviceConfig air_conditioner;
 };
 
 // 从 JSON 文本解析。任一字段非法都返回 invalid_argument，不回落默认值。

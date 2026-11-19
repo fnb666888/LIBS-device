@@ -12,8 +12,10 @@
 #include <string>
 
 #include "libs/business/shared/config/site_config.hpp"
+#include "libs/devices/air_conditioner.hpp"
 #include "libs/devices/indicator.hpp"
 #include "libs/devices/laser.hpp"
+#include "libs/devices/rangefinder.hpp"
 #include "libs/devices/spectrometer.hpp"
 #include "libs/error.hpp"
 #include "libs/transport/serial.hpp"
@@ -32,18 +34,17 @@ struct DeviceState {
 
 // 会话健康检查结果。全部设备汇总，不含任何门禁判断——那是能力 4 的事。
 struct HealthReport {
+    // 现有测量所需设备的连接状态；辅助设备各自报告。
     bool all_required_open = true;
     std::string summary;
     DeviceState laser;
     DeviceState indicator;
     DeviceState spectrometer;
+    DeviceState rangefinder;
+    DeviceState air_conditioner;
 };
 
 // 进程内唯一的设备持有者。不可拷贝、不可移动。
-//
-// 本项目只持有三类硬件：**激光器 / 状态灯 / 光谱仪**。
-// 测距仪与空调曾在这里被打开并写进 health 回报，但全库没有任何业务读过它们
-// （空调联锁阈值始终未标定、门禁侧的判定条件已一并删除），属于纯开销，已移除。
 class DeviceSession {
 public:
     DeviceSession() = default;
@@ -54,8 +55,8 @@ public:
     // 按配置打开全部 enabled 的设备。
     //
     // 部分成功是允许的且**如实报告**：某台设备没接不应该让整台机器起不来。
-    // 但 required 的设备（配置里 enabled=true 的串口设备）没打开时，
-    // all_required_open 为 false，由调用方决定是否继续。
+    // 已启用的主测量设备打开失败时，all_required_open 为 false。
+    // 测距仪和空调单独报告，业务层决定如何使用。
     // 绝不做做的事：静默回落、换端口重试、把失败吞掉。
     libs::VoidResult open(const config::SiteConfig& config);
 
@@ -72,25 +73,29 @@ public:
     libs::devices::Laser* laser() noexcept { return laser_.get(); }
     libs::devices::Indicator* indicator() noexcept { return indicator_.get(); }
     libs::devices::Spectrometer* spectrometer() noexcept { return spectrometer_.get(); }
+    libs::devices::Rangefinder* rangefinder() noexcept { return rangefinder_.get(); }
+    libs::devices::AirConditioner* air_conditioner() noexcept { return air_conditioner_.get(); }
 
     const config::SiteConfig& config() const noexcept { return config_; }
 
 private:
-    void reset();
-
     bool open_ = false;
     config::SiteConfig config_;
 
     // 传输层句柄。驱动对象引用它们，所以链接对象必须比驱动活得久：
-    // 声明顺序即析构逆序，links_ 在最后声明 -> 最先析构，这是想要的。
+    // links_ 先声明，因此析构时驱动先于链路销毁。
     std::vector<std::unique_ptr<libs::transport::Link>> links_;
     std::unique_ptr<libs::devices::Laser> laser_;
     std::unique_ptr<libs::devices::Indicator> indicator_;
     std::unique_ptr<libs::devices::Spectrometer> spectrometer_;
+    std::unique_ptr<libs::devices::Rangefinder> rangefinder_;
+    std::unique_ptr<libs::devices::AirConditioner> air_conditioner_;
 
     DeviceState laser_state_;
     DeviceState indicator_state_;
     DeviceState spectrometer_state_;
+    DeviceState rangefinder_state_;
+    DeviceState air_conditioner_state_;
 };
 
 }  // namespace business::session

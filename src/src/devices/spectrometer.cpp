@@ -284,28 +284,25 @@ struct Spectrometer::Impl {
         d.handle = api.activate(&copy);
         if (d.handle == kInvalidHandle || d.handle < 0)
             throw std::runtime_error("AVS_Activate failed for " + d.serial);
+        const auto handle = d.handle;
         try {
+            int rc = api.pixels(handle, &d.pixels);
+            if (rc != 0)
+                throw std::runtime_error("AVS_GetNumPixels " + d.serial + " failed: " + std::to_string(rc));
+            if (!d.pixels || d.pixels > 16384)
+                throw std::runtime_error("invalid pixel count: " + d.serial);
+            d.wavelengths.resize(d.pixels);
+            rc = api.wavelength(handle, d.wavelengths.data());
+            if (rc != 0)
+                throw std::runtime_error("AVS_GetLambda " + d.serial + " failed: " + std::to_string(rc));
+            if (!std::all_of(d.wavelengths.begin(), d.wavelengths.end(),
+                             [](double v) { return std::isfinite(v); }))
+                throw std::runtime_error("non-finite wavelength calibration: " + d.serial);
             devices.push_back(std::move(d));
         } catch (...) {
-            api.deactivate(devices.back().handle);
-            devices.pop_back();
+            api.deactivate(handle);
             throw;
         }
-        auto& device = devices.back();
-        int rc = api.pixels(device.handle, &device.pixels);
-        if (rc != 0)
-            throw std::runtime_error("AVS_GetNumPixels " + device.serial + " failed: " + std::to_string(rc));
-        if (!device.pixels)
-            throw std::runtime_error("zero-pixel device: " + device.serial);
-        if (device.pixels > 16384)
-            throw std::runtime_error("pixel count exceeds the adapter buffer limit: " + device.serial);
-        device.wavelengths.resize(device.pixels);
-        rc = api.wavelength(device.handle, device.wavelengths.data());
-        if (rc != 0)
-            throw std::runtime_error("AVS_GetLambda " + device.serial + " failed: " + std::to_string(rc));
-        if (!std::all_of(device.wavelengths.begin(), device.wavelengths.end(),
-                         [](double v) { return std::isfinite(v); }))
-            throw std::runtime_error("non-finite wavelength calibration: " + device.serial);
         return devices.size() - 1;
     }
 
@@ -418,7 +415,9 @@ Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
 
 Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                                            const std::function<VoidResult()>& on_armed,
-                                           const std::function<bool()>& cancelled) {
+                                           const std::function<bool()>& cancelled,
+                                           std::optional<ScanGroup>* incomplete_group) {
+    if (incomplete_group) incomplete_group->reset();
     if (!impl_) return Error::make(ErrorKind::internal, "not_open", "the session is not open");
     if (!libs::measurement_limits::accepts("spectrometer", "integration_ms", request.integration_ms))
         return Error::make(ErrorKind::invalid_argument, "bad_integration",
@@ -617,6 +616,9 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
             group.shot_id = shot + 1;
             group.hardware_synchronized = false; // Setting SYNC mode does not prove physical alignment.
             const auto deadline = Clock::now() + std::chrono::milliseconds(request.timeout_ms);
+            const auto save_partial = [&]() {
+                if (incomplete_group && !group.spectra.empty()) *incomplete_group = std::move(group);
+            };
 
             for (auto i : order) {
                 if (Clock::now() >= deadline)
@@ -637,8 +639,10 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
             std::vector<bool> ready(active.size(), false);
             std::size_t remaining = ready.size();
             while (remaining) {
-                if (cancelled && cancelled())
+                if (cancelled && cancelled()) {
+                    save_partial();
                     return Error::make(ErrorKind::device, "capture_cancelled", "capture stopped by owner");
+                }
                 if (Clock::now() >= deadline) {
                     // 超时必须先把已 arm 的通道停掉再返回。否则它们留在 pending，
                     // 下一次采集的第一条 PrepareMeasure 就会拿到 -5。
@@ -646,6 +650,7 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                     for (std::size_t k = 0; k < ready.size(); ++k)
                         if (!ready[k]) { if (!missing.empty()) missing += ", "; missing += impl_->devices[active[k]].serial; }
                     result.received_groups = static_cast<std::uint32_t>(result.groups.size());
+                    save_partial();
                     if (result.received_groups != 0) return result;
                     return Error::make(ErrorKind::timeout, "capture_timeout",
                                        "timed out waiting for " + missing + "; no complete group received");
@@ -654,20 +659,28 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                     if (ready[k]) continue;
                     auto& d = impl_->devices[active[k]];
                     const int rc = impl_->api.poll(d.handle);
-                    if (rc < 0)
+                    if (rc < 0) {
+                        save_partial();
                         return capture_sdk_error("AVS_PollScan", d.serial, rc, "poll_failed");
+                    }
                     if (rc == 0) continue;
-                    if (rc != 1)
+                    if (rc != 1) {
+                        save_partial();
                         return Error::make(ErrorKind::device, "poll_unexpected",
                                            "AVS_PollScan " + d.serial + " returned " + std::to_string(rc));
+                    }
                     std::vector<double> counts(d.pixels);
                     unsigned int ticks = 0;
                     const int src = impl_->api.scope(d.handle, &ticks, counts.data());
-                    if (src != 0)
+                    if (src != 0) {
+                        save_partial();
                         return capture_sdk_error("AVS_GetScopeData", d.serial, src, "scope_failed");
-                    if (!std::all_of(counts.begin(), counts.end(), [](double v) { return std::isfinite(v); }))
+                    }
+                    if (!std::all_of(counts.begin(), counts.end(), [](double v) { return std::isfinite(v); })) {
+                        save_partial();
                         return Error::make(ErrorKind::device, "non_finite_spectrum",
                                            "the spectrum from " + d.serial + " contains non-finite values");
+                    }
                     Spectrum spectrum;
                     spectrum.serial = d.serial;
                     spectrum.pixels = d.pixels;
@@ -692,18 +705,6 @@ Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
     }
 }
 
-Result<CaptureResult> Spectrometer::stream(
-        const CaptureRequest& request,
-        const std::function<VoidResult(const ScanGroup&)>& on_group) {
-    const auto result = capture(request);
-    if (!result) return result.error();
-    for (const auto& group : result.value().groups) {
-        const VoidResult consumed = on_group(group);
-        if (!consumed) return consumed.error();
-    }
-    return result;
-}
-
 #else  // !_WIN32
 
 struct Spectrometer::Impl {};
@@ -719,15 +720,12 @@ Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
 }
 Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                                            const std::function<VoidResult()>& on_armed,
-                                           const std::function<bool()>& cancelled) {
+                                           const std::function<bool()>& cancelled,
+                                           std::optional<ScanGroup>* incomplete_group) {
     (void)request;
-    return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
-}
-Result<CaptureResult> Spectrometer::stream(
-        const CaptureRequest& request,
-        const std::function<VoidResult(const ScanGroup&)>& on_group) {
-    (void)request;
-    (void)on_group;
+    (void)on_armed;
+    (void)cancelled;
+    if (incomplete_group) incomplete_group->reset();
     return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
 }
 VoidResult Spectrometer::close() { return VoidResult::success(std::monostate{}); }

@@ -60,6 +60,27 @@ struct AirConditionerPoll {
     libs::air_conditioner::ParameterReading params;
 };
 
+struct AirConditionerEnvironment {
+    std::optional<double> cabinet_temperature_c;
+    std::optional<double> humidity_percent;
+    std::optional<std::uint16_t> mode_code;
+    std::optional<bool> power_on;
+    std::optional<bool> cooling;
+    std::optional<bool> heating;
+    std::vector<std::string> active_alarms;
+    std::string status_error;
+    std::string parameters_error;
+};
+
+struct AirConditionerSetpoints {
+    double cooling_on_c;
+    double cooling_off_c;
+    double heating_on_c;
+    double heating_off_c;
+    double dehumidify_on_percent;
+    double dehumidify_off_percent;
+};
+
 class AirConditioner {
 public:
     // link 必须已打开，驱动不拥有它。timeout_ms 沿用其他设备驱动的默认值。
@@ -75,6 +96,12 @@ public:
         std::uint16_t count = 26);
     Result<libs::air_conditioner::ParamRegister> readParam(std::uint16_t reg);
     Result<AirConditionerPoll> poll();
+
+    AirConditionerEnvironment readEnvironment();
+    Result<AirConditionerSetpoints> readSetpoints();
+    // 写前校验全部目标，只写有差异的设定。成功时返回设备实际值。
+    // 写入是逐项事务。失败时调用方可以重新读取，再重试或显示差异。
+    Result<AirConditionerSetpoints> applySetpoints(const AirConditionerSetpoints& target);
 
     Result<ParamWrite> setMode(libs::air_conditioner::Mode mode);
     Result<ControlWrite> setPower(bool on);

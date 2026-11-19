@@ -1,7 +1,9 @@
 #include "libs/devices/air_conditioner.hpp"
 
+#include <array>
 #include <cmath>
 #include <exception>
+#include <limits>
 
 namespace libs::devices {
 namespace {
@@ -26,6 +28,55 @@ bool find_range(std::uint16_t reg, std::uint16_t& lo, std::uint16_t& hi) {
         if (e.reg == reg) { lo = e.lo; hi = e.hi; return true; }
     }
     return false;
+}
+
+namespace reg = libs::air_conditioner::reg;
+struct SetpointField {
+    std::uint16_t address;
+    double AirConditionerSetpoints::*member;
+};
+constexpr std::array<SetpointField, 6> kSetpointFields{{
+    {reg::kCoolingOnSetpoint, &AirConditionerSetpoints::cooling_on_c},
+    {reg::kCoolingOffSetpoint, &AirConditionerSetpoints::cooling_off_c},
+    {reg::kHeatingOnSetpoint, &AirConditionerSetpoints::heating_on_c},
+    {reg::kHeatingOffSetpoint, &AirConditionerSetpoints::heating_off_c},
+    {reg::kDehumidifyOnHumidity, &AirConditionerSetpoints::dehumidify_on_percent},
+    {reg::kDehumidifyOffHumidity, &AirConditionerSetpoints::dehumidify_off_percent},
+}};
+constexpr auto kFirstSetpoint = kSetpointFields.front().address;
+constexpr auto kSetpointSpan = kSetpointFields.back().address - kFirstSetpoint + 1;
+
+Result<libs::air_conditioner::ParamWrite> encode_setpoint(std::uint16_t address, double value) {
+    const auto def = libs::air_conditioner::describe_param(address, 0);
+    if (def.name == "unknown_raw")
+        return Error::make(ErrorKind::invalid_argument, "unknown_register", "unknown setpoint register");
+    if (!def.writable)
+        return Error::make(ErrorKind::invalid_argument, "not_writable", def.name + " is read-only");
+
+    const double scaled = value / def.scale;
+    const auto lo = def.is_signed ? std::numeric_limits<std::int16_t>::min() : 0;
+    const auto hi = def.is_signed ? std::numeric_limits<std::int16_t>::max()
+                                  : std::numeric_limits<std::uint16_t>::max();
+    if (!std::isfinite(scaled) || scaled < lo || scaled > hi)
+        return Error::make(ErrorKind::invalid_argument, "out_of_range", def.name + " is outside the register range");
+
+    libs::air_conditioner::ParamWrite write{};
+    write.reg = address;
+    write.raw = static_cast<std::uint16_t>(std::llround(scaled));
+    if (find_range(address, write.range_min, write.range_max)) {
+        const double minimum = static_cast<std::int16_t>(write.range_min) * def.scale;
+        const double maximum = static_cast<std::int16_t>(write.range_max) * def.scale;
+        if (value < minimum || value > maximum)
+            return Error::make(ErrorKind::invalid_argument, "out_of_range", def.name + " is outside the documented range");
+    }
+    return write;
+}
+
+AirConditionerSetpoints decode_setpoints(const libs::air_conditioner::ParameterReading& reading) {
+    AirConditionerSetpoints values{};
+    for (const auto& field : kSetpointFields)
+        values.*field.member = reading.registers[field.address - kFirstSetpoint].value;
+    return values;
 }
 
 }  // namespace
@@ -78,6 +129,73 @@ Result<AirConditionerPoll> AirConditioner::poll() {
         out.params_error = params.error().message;
     }
     return out;
+}
+
+AirConditionerEnvironment AirConditioner::readEnvironment() {
+    const auto polled = poll();
+    AirConditionerEnvironment environment;
+    if (!polled) {
+        environment.status_error = polled.error().message;
+        environment.parameters_error = polled.error().message;
+        return environment;
+    }
+    const auto& reading = polled.value();
+    environment.status_error = reading.status_error;
+    environment.parameters_error = reading.params_error;
+    for (const auto& bit : reading.status.bits) {
+        if (bit.address == reg::kPowerState) environment.power_on = bit.active;
+        if (bit.address == reg::kCoolingOn) environment.cooling = bit.active;
+        if (bit.address == reg::kHeaterOn) environment.heating = bit.active;
+        if (bit.is_alarm && bit.active) environment.active_alarms.push_back(bit.name);
+    }
+    for (const auto& field : reading.params.registers) {
+        if (field.address == reg::kIndoorTemp) environment.cabinet_temperature_c = field.value;
+        if (field.address == reg::kHumidity) environment.humidity_percent = field.value;
+        if (field.address == reg::kMode) environment.mode_code = field.raw;
+    }
+    return environment;
+}
+
+Result<AirConditionerSetpoints> AirConditioner::readSetpoints() {
+    const auto reading = readParams(kFirstSetpoint, kSetpointSpan);
+    if (!reading) return reading.error();
+    return decode_setpoints(reading.value());
+}
+
+Result<AirConditionerSetpoints> AirConditioner::applySetpoints(const AirConditionerSetpoints& target) {
+    std::array<libs::air_conditioner::ParamWrite, kSetpointFields.size()> writes{};
+    for (std::size_t i = 0; i < writes.size(); ++i) {
+        const auto& field = kSetpointFields[i];
+        const auto encoded = encode_setpoint(field.address, target.*field.member);
+        if (!encoded) return encoded.error();
+        writes[i] = encoded.value();
+    }
+
+    const auto before = readParams(kFirstSetpoint, kSetpointSpan);
+    if (!before) return before.error();
+    bool changed = false;
+    for (const auto& write : writes) {
+        if (before.value().registers[write.reg - kFirstSetpoint].raw == write.raw) continue;
+        const auto written = writeParam(write);
+        if (!written) {
+            auto error = written.error();
+            error.message = libs::air_conditioner::describe_param(write.reg, 0).name +
+                            ": " + error.message + "; some setpoints may already have changed";
+            return error;
+        }
+        changed = true;
+    }
+    if (!changed) return decode_setpoints(before.value());
+
+    const auto after = readParams(kFirstSetpoint, kSetpointSpan);
+    if (!after) return after.error();
+    for (const auto& write : writes) {
+        const auto& actual = after.value().registers[write.reg - kFirstSetpoint];
+        if (actual.raw != write.raw)
+            return Error::make(ErrorKind::device, "ac_setpoint_mismatch", actual.name +
+                               " readback does not match the requested value");
+    }
+    return decode_setpoints(after.value());
 }
 
 Result<ParamWrite> AirConditioner::setMode(libs::air_conditioner::Mode mode) {
@@ -225,34 +343,9 @@ Result<ParamWrite> AirConditioner::write_param(std::uint8_t address, const libs:
 }
 
 Result<ParamWrite> AirConditioner::set_setpoint(std::uint8_t address, std::uint16_t reg, double value) {
-    const auto def = libs::air_conditioner::describe_param(reg, 0);
-    if (def.name == "unknown_raw")
-        return Error::make(ErrorKind::invalid_argument, "unknown_register",
-                           "register " + std::to_string(reg) + " is not in the parameter table");
-    if (!def.writable)
-        return Error::make(ErrorKind::invalid_argument, "not_writable",
-                           "register " + std::to_string(reg) + " is read-only");
-    if (def.scale == 0.0)
-        return Error::make(ErrorKind::internal, "bad_scale", "register has no scale");
-
-    const double scaled = value / def.scale;
-    if (std::fabs(scaled) > 65535.0)
-        return Error::make(ErrorKind::invalid_argument, "out_of_range",
-                           "value does not fit a 16-bit register after scaling");
-    libs::air_conditioner::ParamWrite w;
-    w.reg = reg;
-    w.raw = static_cast<std::uint16_t>(static_cast<std::int32_t>(std::llround(scaled)));
-    if (find_range(reg, w.range_min, w.range_max)) {
-        // 有符号区间（如 -30~15）换算后要用有符号比较，raw 仍按补码存。
-        const std::int32_t signed_raw = static_cast<std::int16_t>(w.raw);
-        const std::int32_t lo = static_cast<std::int16_t>(w.range_min);
-        const std::int32_t hi = static_cast<std::int16_t>(w.range_max);
-        if (signed_raw < lo || signed_raw > hi)
-            return Error::make(ErrorKind::invalid_argument, "out_of_range",
-                               "value " + std::to_string(value) + " " + def.unit +
-                                   " is outside the documented range");
-    }
-    return write_param(address, w);
+    const auto write = encode_setpoint(reg, value);
+    if (!write) return write.error();
+    return write_param(address, write.value());
 }
 
 Result<ParamWrite> AirConditioner::set_mode(std::uint8_t address, libs::air_conditioner::Mode mode) {

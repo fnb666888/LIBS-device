@@ -575,7 +575,6 @@ TEST_MAIN_BEGIN_ARGV()
           request.timeout_ms = 3000;
           request.master_serial = "MASTER";
           CHECK(!session.capture(request));       // master 不在 serials 里
-          request.timeout_ms_override = 1;       // 字段保留但驱动不用它
           fake_reset(0);
           check_counters({0, 0, 0, 0, 0});
           CHECK(session.close());
@@ -826,6 +825,62 @@ TEST_MAIN_BEGIN_ARGV()
           const auto result = session.capture(request);
           CHECK(!result);
           if (!result) CHECK_EQ(result.error().code, std::string("capture_timeout"));
+          CHECK(session.close());
+      }
+      fake_reset(0);
+    }
+
+    { CASE(failed_device_metadata_is_not_cached_and_can_be_retried);
+      fake_reset(9);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+          auto& session = *opened.value();
+          auto request = test_request();
+          request.serials = {"MASTER", "SLAVE1"};
+          CHECK(!session.capture(request));
+          CHECK_EQ(fake_counter(3), 1);
+          fake_export<void (*)(int)>("FakeSetMode")(0);
+          const auto retried = session.capture(request);
+          CHECK(retried);
+          if (retried) {
+              CHECK_EQ(retried.value().groups.front().spectra.size(), std::size_t(2));
+              CHECK_EQ(retried.value().groups.front().spectra.back().counts.size(), std::size_t(7));
+          }
+          CHECK(session.close());
+          CHECK_EQ(fake_counter(3), 3);
+      }
+      fake_reset(0);
+    }
+
+    { CASE(incomplete_group_keeps_actual_channels_while_returning_timeout);
+      fake_reset(10);
+      auto opened = libs::devices::Spectrometer::open(dll);
+      CHECK(opened);
+      if (opened) {
+          auto& session = *opened.value();
+          auto request = test_request();
+          request.serials = {"MASTER", "SLAVE1"};
+          request.timeout_ms = 120;
+          std::optional<libs::devices::ScanGroup> partial;
+          const auto captured = session.captureOnce(request, {}, {}, &partial);
+          CHECK(!captured);
+          if (!captured) CHECK_EQ(captured.error().code, std::string("capture_timeout"));
+          CHECK(partial.has_value());
+          if (partial) {
+              CHECK(!partial->complete);
+              CHECK_EQ(partial->spectra.size(), std::size_t(1));
+              CHECK_EQ(partial->spectra.front().serial, std::string("MASTER"));
+          }
+          int cancel_polls = 0;
+          const auto cancelled = session.captureOnce(request, {}, [&] { return ++cancel_polls == 2; }, &partial);
+          CHECK(!cancelled);
+          if (!cancelled) CHECK_EQ(cancelled.error().code, std::string("capture_cancelled"));
+          CHECK(partial.has_value());
+          if (partial) CHECK_EQ(partial->spectra.size(), std::size_t(1));
+          fake_export<void (*)(int)>("FakeSetMode")(0);
+          CHECK(session.captureOnce(request, {}, {}, &partial));
+          CHECK(!partial.has_value());
           CHECK(session.close());
       }
       fake_reset(0);

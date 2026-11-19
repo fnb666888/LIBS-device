@@ -73,9 +73,7 @@ public:
         return r;
     }
     static Result failure(Error error) {
-        Result r;
-        r.error_ = std::move(error);
-        return r;
+        return Result(std::move(error));
     }
     // 允许 `return Error::make(...)` 和 `return value;` 两种直接返回写法。
     Result(T value) : value_(std::move(value)) {}       // NOLINT(google-explicit-constructor)

@@ -29,7 +29,7 @@ bool open_serial_device(const config::SerialPortConfig& cfg, const char* name,
 
     // configured 的含义是"配置里 enabled=true"，与打开成败无关。
     // 漏掉这一行会让**打开成功**的设备在 health 里被报成"未启用"。
-    state.configured = true;
+    state = DeviceState{true, false, cfg.port, "", ""};
 
     Result<std::unique_ptr<libs::transport::Link>> link =
         libs::transport::open_serial(cfg.port, cfg.baud, cfg.parity, cfg.data_bits);
@@ -54,14 +54,6 @@ DeviceSession::~DeviceSession() {
         const VoidResult r = close();
         (void)r;   // 析构里不能报错，错误在显式 close() 时已经报过了
     }
-}
-
-void DeviceSession::reset() {
-    laser_.reset();
-    indicator_.reset();
-    spectrometer_.reset();
-    links_.clear();
-    open_ = false;
 }
 
 VoidResult DeviceSession::open(const config::SiteConfig& config) {
@@ -91,6 +83,19 @@ VoidResult DeviceSession::open(const config::SiteConfig& config) {
                                config_.indicator.timeout_ms, gap);
                        },
                        indicator_state_);
+
+    const auto& range = config_.rangefinder;
+    open_serial_device(range.serial, "测距仪", links_,
+                       [&](libs::transport::Link* link) {
+                           rangefinder_ = std::make_unique<libs::devices::Rangefinder>(
+                               *link, range.address, range.serial.timeout_ms);
+                       }, rangefinder_state_);
+    const auto& air = config_.air_conditioner;
+    open_serial_device(air.serial, "空调", links_,
+                       [&](libs::transport::Link* link) {
+                           air_conditioner_ = std::make_unique<libs::devices::AirConditioner>(
+                               *link, air.address, air.serial.timeout_ms);
+                       }, air_conditioner_state_);
 
     // 光谱仪走厂商 DLL，不走串口。命名互斥体由驱动自己管。
     if (!config_.spectrometer.enabled) {
@@ -139,7 +144,16 @@ VoidResult DeviceSession::close() {
     // 串口设备：驱动对象先析构（它们持有 Link 的引用），再关 Link。
     laser_.reset();
     indicator_.reset();
+    rangefinder_.reset();
+    air_conditioner_.reset();
     links_.clear();
+    for (auto* state : {&laser_state_, &indicator_state_, &spectrometer_state_,
+                        &rangefinder_state_, &air_conditioner_state_}) {
+        if (state->opened) {
+            state->opened = false;
+            state->note = "会话已关闭";
+        }
+    }
 
     open_ = false;
 
@@ -154,6 +168,8 @@ HealthReport DeviceSession::health() const {
     report.laser = laser_state_;
     report.indicator = indicator_state_;
     report.spectrometer = spectrometer_state_;
+    report.rangefinder = rangefinder_state_;
+    report.air_conditioner = air_conditioner_state_;
 
     std::ostringstream os;
     bool all = true;
@@ -173,11 +189,11 @@ HealthReport DeviceSession::health() const {
         }
     };
 
-    // required 的判定：配置里 enabled=true 就是 required。
-    // 这就是 all_required_open 的含义——"你让我接的，我有没有接上"。
     account("激光器", laser_state_, true);
     account("状态灯", indicator_state_, true);
     account("光谱仪", spectrometer_state_, true);
+    account("测距仪", rangefinder_state_, false);
+    account("空调", air_conditioner_state_, false);
 
     report.all_required_open = all;
     report.summary = os.str();

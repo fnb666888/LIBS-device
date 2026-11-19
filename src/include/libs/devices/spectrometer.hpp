@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -87,12 +88,8 @@ struct CaptureRequest {
     std::string master_serial;          // 可选：指定主通道（外触发源 / 出光设备）
     bool synchronized = false;          // 多通道 SYNC 同步
     double integration_ms;
-    std::uint32_t integration_delay_cycles = 0;   // 原始 FPGA 计数，非微秒
     std::uint32_t timeout_ms;
     std::uint32_t scans = 1;            // 本驱动做有界多次采集
-    std::uint32_t laser_delay_cycles = 0;
-    std::uint32_t laser_width_cycles = 0;
-    unsigned timeout_ms_override = 0;   // 0 表示用 CaptureRequest::timeout_ms
 
     // ── 激光触发光谱仪（AvaSoft 手册 §4.9 的第二种硬件接法）───────────────
     //
@@ -151,23 +148,22 @@ public:
     // 只读枚举。不 prepare、不 measure、不改持久参数。
     Result<std::vector<SpectrometerInfo>> enumerate();
 
-    // 有界采集。设备异常帧与超时都通过 Error 返回；已取到的部分结果保留在 error.raw 之外，
-    // 调用方若需要部分结果应检查 groups。
+    // 可选的 incomplete_group 保留失败组中已实际取到的数据。它不计为完整组，
+    // 调用方仍须处理采集错误和 expected_groups / received_groups。
     // Called after every selected channel is armed for the first group.
     // A failed callback cancels the pending measurements before returning.
     Result<CaptureResult> capture(const CaptureRequest& request,
                                 const std::function<VoidResult()>& on_armed = {},
-                                const std::function<bool()>& cancelled = {});
+                                const std::function<bool()>& cancelled = {},
+                                std::optional<ScanGroup>* incomplete_group = nullptr);
 
     Result<std::vector<SpectrometerInfo>> probeChannels() { return enumerate(); }
     Result<CaptureResult> captureOnce(const CaptureRequest& request,
                                     const std::function<VoidResult()>& on_armed = {},
-                                    const std::function<bool()>& cancelled = {}) {
-        return capture(request, on_armed, cancelled);
+                                    const std::function<bool()>& cancelled = {},
+                                    std::optional<ScanGroup>* incomplete_group = nullptr) {
+        return capture(request, on_armed, cancelled, incomplete_group);
     }
-    Result<CaptureResult> stream(
-        const CaptureRequest& request,
-        const std::function<VoidResult(const ScanGroup&)>& on_group);
 
     // 释放全部句柄并执行清理。重复调用是安全的。
     VoidResult close();

@@ -20,6 +20,8 @@ json::Value to_json(const session::HealthReport& report) {
     v.set("laser", device(report.laser));
     v.set("indicator", device(report.indicator));
     v.set("spectrometer", device(report.spectrometer));
+    v.set("rangefinder", device(report.rangefinder));
+    v.set("air_conditioner", device(report.air_conditioner));
     return v;
 }
 
@@ -133,7 +135,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
         if (opened) {
             json::Value f = json::object();
             f.set("health", health_json());
-            log_->write(logging::RecordKind::general, "全部已启用设备打开成功", f);
+            log_->write(logging::RecordKind::general, "设备会话已建立", f);
         } else {
             // 部分失败允许，但要如实记录：这台机器可能处于"降级可用"。
             json::Value f = json::object();

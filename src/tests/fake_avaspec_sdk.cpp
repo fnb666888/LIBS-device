@@ -106,6 +106,7 @@ EXPORT bool __stdcall AVS_Deactivate(int h) {
 }
 EXPORT int __stdcall AVS_GetNumPixels(int h, unsigned short* n) {
     if (h < 1 || h > 3) return -1;
+    if (mode == 9 && h == 2) return -1;
     *n = pixel_counts[h - 1];
     return 0;
 }
@@ -153,6 +154,7 @@ EXPORT int __stdcall AVS_PollScan(int h) {
     if (mode == 2 && h == 2) return -4;
     if (mode == 7 && counters[1] > 3) return 0;
     if (mode == 4) return 0;                 // 永远不 ready
+    if (mode == 10 && h == 2) return 0;      // 同组只缺一个通道
     if (!armed[h - 1]) return 0;
     return 1;                                // armed 即视为可取
 }
