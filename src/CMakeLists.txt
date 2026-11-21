@@ -131,7 +131,6 @@ add_library(libs_business STATIC
   src/business/readiness/verdict.cpp
   src/business/readiness/lamp.cpp
   src/business/readiness/monitor.cpp
-  src/business/readiness/precheck.cpp
   # measurement/：业务二，激光触发光谱检测。
   src/business/measurement/frame.cpp
   src/business/measurement/frame_bus.cpp
@@ -144,6 +143,7 @@ add_library(libs_business STATIC
   # app/：进程边界与装配。ParameterService 在这儿而不是 shared/，
   # 因为它要引用 measurement 的参数类型。
   src/business/app/parameter_service.cpp
+  src/business/app/device_monitoring.cpp
   src/business/app/runtime.cpp
   src/business/app/facade.cpp
 )

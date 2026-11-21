@@ -374,6 +374,14 @@ VoidResult Spectrometer::close() {
     }
 }
 
+VoidResult Spectrometer::resetChannels() {
+    if (!impl_) return VoidResult();
+    const auto result = close();
+    impl_->devices.clear();
+    impl_->closed = false;
+    return result;
+}
+
 Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
     if (!impl_) return Error::make(ErrorKind::internal, "not_open", "the session is not open");
     try {
@@ -385,7 +393,7 @@ Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
             info.friendly_name = bounded_string(identity.friendly_name, sizeof(identity.friendly_name));
             info.status = identity.status;
             info.status_name = status_name(identity.status);
-            if (identity.status != 1) {          // 只有 usb_available 才激活
+            if (identity.status != 1 && !(identity.status == 2 && impl_->owns(info.serial))) {
                 out.push_back(std::move(info));
                 continue;
             }
@@ -717,6 +725,10 @@ Result<std::unique_ptr<Spectrometer>> Spectrometer::open(const std::string& sdk_
 }
 Result<std::vector<SpectrometerInfo>> Spectrometer::enumerate() {
     return Error::make(ErrorKind::unsupported, "no_sdk", "not available on this platform");
+}
+
+VoidResult Spectrometer::resetChannels() {
+    return close();
 }
 Result<CaptureResult> Spectrometer::capture(const CaptureRequest& request,
                                            const std::function<VoidResult()>& on_armed,

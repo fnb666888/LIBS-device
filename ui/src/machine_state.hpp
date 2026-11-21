@@ -12,13 +12,7 @@
 //      UI 只把 allowed/blocked_by 原样翻译成人话，不自己判断"应该可以"。
 //   3. **不缓存到磁盘。** 断电重开要重新问守护进程，因为现场参数可能
 //      在别的终端改过。
-//   4. **只投影后端真的返回的字段。** 空调、测距仪、传送带、选矿这些
-//      业务已随重构全部删除，`DeviceSession::health()` 现在只账户
-//      laser / indicator / spectrometer 三台。曾经这里留着
-//      `AcState` / `OreState` / `MotionState` 和一串 belt 字段，
-//      它们解析的 JSON 键后端早就没有了 —— 于是界面上常年挂着一排
-//      "空调 未配置 / 测距 未配置"的假状态点，而真正的三台设备挤在里面。
-//      这就是"UI 还停留在旧架构"的典型症状。
+//   4. **只投影后端真的返回的字段。** 连接状态与设备读数分别展示。
 
 #include <optional>
 
@@ -36,6 +30,7 @@ struct DeviceHealth {
     bool configured = false;
     bool opened = false;
     QString endpoint;    // "COM10" / "avaspecx64.dll: SN1234"
+    QString model;
     QString note;        // 失败原因 / 补充说明
 
     // 三态判定（UI 底部设备条直接用，别自己再判一遍）：
@@ -54,6 +49,7 @@ struct GateState {
     bool allowed = false;        // **唯一的许可来源**
     bool laser_readable = false; // false = 没读到激光状态，按不安全处理
     QString detail;              // 业务层给的中文说明
+    QStringList warnings;
     QStringList blocked_by;      // blocked_by 原因码
 };
 
@@ -71,12 +67,18 @@ struct MachineSnapshot {
     // **这是按钮可用性的唯一来源**：界面不靠"我刚才点过开始所以应该在跑"
     // 这种本地推理去猜。
     bool laser_running = false;
+    QString stop_confirmation;
+    QString stop_error;
+    QString lamp_intent;
+    QString lamp_error;
+    bool lamp_applied = false;
 
     // 测量作业的计数。**它才是"落盘成功了没有"的唯一凭证**：
     // 曾经有过那种"屏幕上有曲线 = 数据保存了"的情况。显示是内存里的事，
     // 落盘是另一条线程的事实 —— 两者可以不一致，屏幕必须如实分开说。
     bool measurement_known = false;
     bool measurement_running = false;
+    bool measurement_faulted = false;
     qint64 shots_captured = 0;
     qint64 shots_failed = 0;
     qint64 disk_writes_ok = 0;
@@ -90,6 +92,7 @@ struct MachineSnapshot {
     bool readiness_known = false;
     bool readiness_ready = false;
     QString readiness_summary;
+    qint64 params_requested_at_ms = 0;
     // {"laser": {"values": {...}, "complete": bool}, ...}
     QJsonObject param_values;
     QJsonObject prediction;  // Asynchronous model state and correlated result.

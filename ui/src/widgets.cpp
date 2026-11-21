@@ -133,6 +133,16 @@ void StatusDot::set_state(Level level, const QString& text, const QString& detai
     set_detail(detail);
 }
 
+void StatusDot::set_indicator(Level level, const QString& status, const QString& detail) {
+    set_level(level);
+    text_->hide();
+    detail_->hide();
+    setAccessibleName(status);
+    const auto tip = detail.isEmpty() ? status : status + QLatin1Char('\n') + detail;
+    dot_->setToolTip(tip.toHtmlEscaped().replace(QLatin1Char('\n'), QStringLiteral("<br>")));
+    setFixedWidth(dot_->width());
+}
+
 void StatusDot::set_level(Level level) {
     level_ = level;
     dot_->set_color(color_for(level));

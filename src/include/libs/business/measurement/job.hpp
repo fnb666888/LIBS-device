@@ -75,8 +75,7 @@ namespace business::measurement {
 // 运行期重判的周期。
 //
 // **为什么不是 0（每帧都判）**：判定不是免费的，每帧都判会拖慢采集节奏。
-// 500 ms 的含义是"操作员打开安全门后，最多半秒光就收掉了"。
-// 更短没有额外价值 —— 联锁断开到光真正灭掉还有机械与放电时间。
+// 这是采集循环复查的最小间隔，实际间隔也受设备调用耗时影响。
 inline constexpr std::uint64_t kGateRecheckIntervalMs = 500;
 
 // 一次出光作业的入参。
@@ -116,9 +115,14 @@ struct MeasurementStartRecord {
     std::string note;                       // 中文小结，可直接写日志
 };
 
+enum class StopConfirmation { unknown, pending, confirmed, unconfirmed };
+
 // 作业的运行期状态。给 `measurement status` 与 UI 用。
 struct MeasurementStatus {
     bool running = false;
+    StopConfirmation stop_confirmation = StopConfirmation::unknown;
+    std::string stop_error;
+    bool faulted = false;
     std::uint64_t shots_captured = 0;      // 成功采集并投递的帧数
     std::uint64_t shots_failed = 0;        // 采集失败次数（掉线/连续失败会终止循环）
     std::uint64_t disk_writes_ok = 0;
@@ -148,7 +152,8 @@ public:
                    libs::devices::Spectrometer* spectrometer,
                    readiness::ReadinessMonitor& readiness,
                    FrameQueue& frame_bus,
-                   Writer& writer, std::mutex* acquisition_mutex = nullptr);
+                   Writer& writer, std::mutex* acquisition_mutex = nullptr,
+                   std::mutex* spectrometer_poll_mutex = nullptr);
 
     ~MeasurementJob();
     MeasurementJob(const MeasurementJob&) = delete;
@@ -174,14 +179,19 @@ public:
     libs::VoidResult stop();
 
     MeasurementStatus status() const;
+    readiness::GateVerdict refresh_gate(bool force = true);
+    void on_device_status_changed();
 
     bool running() const noexcept { return running_.load(); }
+    bool stop_unconfirmed() const noexcept { return stop_confirmation_.load() == StopConfirmation::unconfirmed; }
+    bool take_spectrometer_reset_request() noexcept { return spectrometer_reset_requested_.exchange(false); }
 
     // ── 供 Runtime 装配与测试 ────────────────────────────────────────────
 
     // 绑定设备句柄。DeviceSession 按配置独占打开句柄，Runtime 在 start() 里
     // 才知道实际拿到了哪些设备，所以这里提供运行期绑定入口。
     void bind_devices(libs::devices::Laser* laser, libs::devices::Spectrometer* spectrometer);
+    void set_laser_source(std::function<libs::devices::Laser*()> source) { laser_source_ = std::move(source); }
 
     // 装配期设置：站点接线事实 + 测量参数取值函数。
     //
@@ -193,6 +203,7 @@ public:
     // 日志出口。作业的每一次状态变化都该留痕，但日志不该是它能否运行的
     // 前提 —— 所以它是可选的（nullptr = 不写）。
     void set_log(logging::RunLog* log) noexcept { log_ = log; }
+    void configure_gate_sampling(std::function<void()> sample, std::function<void()> phase_changed);
 
     // 供离线测试注入：把一次"采集"替换成受控行为。
     // 存在的原因：DeviceSession 按配置独占打开，没有注入点就没有离线测试。
@@ -203,29 +214,37 @@ public:
 
 private:
     // 采集循环线程主循环。**唯一碰光谱仪的地方**。
-    void loop(std::function<libs::VoidResult()> on_armed,
+    bool loop(std::function<libs::VoidResult()> on_armed,
               std::function<void(const SpectrumFrame&)> on_first,
               SpectrumMeasurement initial);
     // 做一次采集并组装成帧。设备为 null / 参数未配置都如实报错。
     SpectrumFrame capture_once(const std::function<libs::VoidResult()>& on_armed = {},
                                const SpectrumMeasurement* initial = nullptr);
-    // 运行期重判：中途失锁就自己收光。返回 false = 已因失锁而中止循环。
-    bool recheck_gate(bool emitting);
+    void finish_stop(bool faulted);
 
     // 记录一条运行日志。log_ 为空时什么都不做。
     void log_record(logging::RecordKind kind, const std::string& message,
                     std::function<json::Value()> payload);
 
     std::mutex lifecycle_mutex_;
+    std::mutex gate_mutex_;
+    bool emitting_ = false;
+    std::function<void()> sample_gate_inputs_;
+    std::function<void()> gate_phase_changed_;
+    readiness::GateVerdict evaluate_gate_locked();
     std::mutex* acquisition_mutex_ = nullptr;
+    std::mutex* spectrometer_poll_mutex_ = nullptr;
     unsigned laser_frequency_hz_ = 0;
     FireParameters active_params_;
     mutable std::mutex mutex_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stopping_{false};
+    std::atomic<bool> spectrometer_reset_requested_{false};
+    std::atomic<StopConfirmation> stop_confirmation_{StopConfirmation::unknown};
     std::thread worker_;        // 采集循环
 
     libs::devices::Laser* laser_ = nullptr;
+    std::function<libs::devices::Laser*()> laser_source_;
     libs::devices::Spectrometer* spectrometer_ = nullptr;
 
     readiness::ReadinessMonitor& readiness_;
@@ -244,6 +263,9 @@ private:
     std::atomic<std::uint64_t> shots_failed_{0};
     std::string last_error_code_;
     std::string last_error_message_;
+    libs::Error stop_error_;
+    bool faulted_ = false;
+    bool gate_fault_ = false;
 
     // 运行期重判的时刻。0 = 从没判过。
     std::uint64_t last_gate_check_ms_ = 0;

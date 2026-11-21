@@ -23,6 +23,7 @@ DeviceHealth parse_device(const QString& key, const QString& name, const QJsonOb
     h.configured = bool_of(d, "configured");
     h.opened = bool_of(d, "opened");
     h.endpoint = text_of(d, "endpoint");
+    h.model = text_of(d, "model");
     h.note = text_of(d, "note");
     return h;
 }
@@ -45,17 +46,18 @@ MachineSnapshot parse_status(const QJsonObject& p) {
 
     // ── health ────────────────────────────────────────────────────────
     //
-    // **只有这三台。** DeviceSession::health() 只账户 laser / indicator /
-    // spectrometer；测距仪与空调已随重构删除，界面上不再给它们留位置 ——
-    // 留一个永远"未配置"的状态点，只会让现场以为那台机器坏了。
     const QJsonObject h = p.value("health").toObject();
-    s.devices.reserve(3);
+    s.devices.reserve(5);
     s.devices.push_back(parse_device(QStringLiteral("laser"), QStringLiteral("激光器"),
                                      h.value("laser").toObject()));
     s.devices.push_back(parse_device(QStringLiteral("indicator"), QStringLiteral("状态灯"),
                                      h.value("indicator").toObject()));
     s.devices.push_back(parse_device(QStringLiteral("spectrometer"), QStringLiteral("光谱仪"),
                                      h.value("spectrometer").toObject()));
+    if (h.value("rangefinder").isObject())
+        s.devices.push_back(parse_device(QStringLiteral("rangefinder"), QStringLiteral("测距仪"), h.value("rangefinder").toObject()));
+    if (h.value("air_conditioner").isObject())
+        s.devices.push_back(parse_device(QStringLiteral("air_conditioner"), QStringLiteral("空调"), h.value("air_conditioner").toObject()));
 
     // ── gate ──────────────────────────────────────────────────────────
     const QJsonObject g = p.value("gate").toObject();
@@ -66,11 +68,19 @@ MachineSnapshot parse_status(const QJsonObject& p) {
         s.gate.allowed = bool_of(g, "allowed");
         s.gate.laser_readable = bool_of(g, "laser_readable");
         s.gate.detail = text_of(g, "detail");
+        const auto warnings = g.value("warnings").toArray();
+        for (const auto& v : warnings) s.gate.warnings.push_back(v.toString());
         const QJsonArray blocked = g.value("blocked_by").toArray();
         for (const QJsonValue& v : blocked) s.gate.blocked_by.push_back(v.toString());
     }
 
     s.laser_running = bool_of(p, "laser_running");
+    s.stop_confirmation = text_of(p, "stop_confirmation");
+    s.stop_error = text_of(p, "stop_error");
+    const auto lamp = p.value("indicator").toObject();
+    s.lamp_intent = text_of(lamp, "intent");
+    s.lamp_error = text_of(lamp, "last_error");
+    s.lamp_applied = bool_of(lamp, "applied");
     s.prediction = p.value("prediction").toObject();
     return s;
 }
@@ -96,6 +106,7 @@ void merge_measurement(MachineSnapshot& s, const QJsonObject& p) {
     }
     s.measurement_known = true;
     s.measurement_running = bool_of(p, "running");
+    s.measurement_faulted = bool_of(p, "faulted");
     s.shots_captured = static_cast<qint64>(p.value("shots_captured").toDouble(0));
     s.shots_failed = static_cast<qint64>(p.value("shots_failed").toDouble(0));
     s.disk_writes_ok = static_cast<qint64>(p.value("disk_writes_ok").toDouble(0));

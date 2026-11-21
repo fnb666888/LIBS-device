@@ -6,7 +6,7 @@
 //
 // 整个项目现在只有**两条**业务流程，界面就只做这两件事 + 参数配置：
 //
-//   业务一 设备预检（readiness）  -> 按钮「设备预检」
+//   业务一 安全门禁（readiness）  -> 展示当前门禁结论和原因
 //   业务二 LIBS 全流程（measurement）-> 按钮「开始检测」/「停止检测」
 //   参数管理（ParameterService）  -> 独立页面「测量参数」
 //
@@ -54,6 +54,7 @@ class QTimer;
 namespace libs::ui {
 
 class ParameterPage;
+class DeviceStatusPage;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -76,18 +77,14 @@ private slots:
     void on_snapshot();
     void tick_clock();
 
-    // ── 三个按钮 ─────────────────────────────────────────────────────
-    // ① 设备预检：只读检测。一条激光写指令都不发。
-    void on_precheck();
-    // ② 开始检测：发 `measurement_start`。**成功即已开光**，
+    // ── 检测控制 ─────────────────────────────────────────────────────
+    // 开始检测：发 `measurement_start`。**成功即已开光**，
     //    失败原因看返回码 —— 界面不预先判断，也不预先拦。
     void on_start_detection();
-    // ③ 停止检测：发 `measurement_stop`。**不做确认弹窗** ——
+    // 停止检测：发 `measurement_stop`。**不做确认弹窗** ——
     //    停止是安全方向的动作，让人点两次才能收光是危险设计。
     void on_stop_detection();
 
-    // 预检的返回（跑在工作线程）。
-    void on_precheck_result(const QJsonObject& payload, bool ok, const QString& message);
     // `measurement_start` 的返回。
     void on_start_result(const QJsonObject& payload, bool ok, const QString& message);
     // `measurement_stop` 的返回。
@@ -95,10 +92,10 @@ private slots:
 
     // ── 参数页 ───────────────────────────────────────────────────────
     void on_param_save_requested(const QJsonObject& request);
-    void on_param_reload_requested();
-    void on_param_result(bool ok, const QString& summary);
+    void on_param_reload_requested(const QString& group);
     void show_main_page();
     void show_parameter_page();
+    void show_device_status_page();
 
     void on_auto_y_toggled(bool on);
     void on_lock_y_toggled(bool on);
@@ -124,6 +121,8 @@ private:
     QVector<QLabel*> prediction_values_;
     bool prediction_configuring_ = false;
     void build_device_bar(QVBoxLayout* root);
+    void refresh_device_status();
+    void read_air_parameters();
 
     // ── 状态渲染 ─────────────────────────────────────────────────────
     void render_snapshot(const MachineSnapshot& s);
@@ -149,32 +148,33 @@ private:
     // blocked_by 原因码 -> 人话。**不认识的码原样透传** ——
     // 宁可显示一个后端新加的英文码，也不要静默吞掉一个自己猜错的原因。
     static QString humanize_reason(const QString& code);
-    static QString humanize_state(const QString& s);
-    static Level level_for_state(const MachineSnapshot& s);
 
     PipeClient client_;
     StreamPoller* poller_ = nullptr;
     StatusPoller* state_poller_ = nullptr;
     PredictionPoller* prediction_poller_ = nullptr;
 
-    // ── 顶栏（两页共用）───────────────────────────────────────────────
-    QLabel* title_ = nullptr;
+    // ── 顶栏导航 ──────────────────────────────────────────────────
     QLabel* clock_ = nullptr;
-    StatusDot* daemon_dot_ = nullptr;
-    StatusDot* gate_dot_ = nullptr;
+    StatusDot* readiness_dot_ = nullptr;
     QPushButton* param_page_btn_ = nullptr;
     QPushButton* main_page_btn_ = nullptr;
+    QPushButton* device_status_btn_ = nullptr;
 
     // ── 页面容器 ─────────────────────────────────────────────────────
     QStackedWidget* pages_ = nullptr;
     ParameterPage* param_page_ = nullptr;
+    DeviceStatusPage* device_status_page_ = nullptr;
+    bool device_status_reading_ = false;
+    bool air_read_queued_ = false;
     QLabel* banner_ = nullptr;
+    QWidget* banner_wrap_ = nullptr;
 
     // ── 三按钮 ───────────────────────────────────────────────────────
-    QPushButton* precheck_btn_ = nullptr;
+    StatusDot* gate_status_ = nullptr;
     QPushButton* start_btn_ = nullptr;
     QPushButton* stop_btn_ = nullptr;
-    // 预检/出光期间的后端往返还在飞。用它禁用重复点击：
+    // 测量启停命令尚未返回时禁用重复点击：
     // 两次 measurement_start 会起两个作业，而界面上只看得见一个。
     bool command_in_flight_ = false;
 
@@ -198,6 +198,8 @@ private:
     StatusDot* laser_dot_ = nullptr;
     StatusDot* indicator_dot_ = nullptr;
     StatusDot* spectrometer_dot_ = nullptr;
+    StatusDot* rangefinder_dot_ = nullptr;
+    StatusDot* air_dot_ = nullptr;
     QLabel* measurement_label_ = nullptr;
 
     // ── 导出 ─────────────────────────────────────────────────────────

@@ -34,26 +34,27 @@ bool valid_com_name(const std::string& port) {
 class SerialLink final : public Link {
     HANDLE handle_ = nullptr;
     std::string endpoint_;
+    unsigned baud_;
+    Parity parity_;
+    unsigned data_bits_;
 
-public:
-    SerialLink(const std::string& port, unsigned baud, Parity parity, unsigned data_bits)
-        : endpoint_(port) {
-        const std::string path = "\\\\.\\" + port;
+    void open_handle() {
+        const std::string path = "\\\\.\\" + endpoint_;
         HANDLE h = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
                                OPEN_EXISTING, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE)
-            throw std::runtime_error(win_error("open " + port));
+            throw std::runtime_error(win_error("open " + endpoint_));
         try {
             DCB dcb{};
             dcb.DCBlength = sizeof(dcb);
             if (!GetCommState(h, &dcb)) throw std::runtime_error(win_error("GetCommState"));
-            dcb.BaudRate = baud;
-            dcb.ByteSize = static_cast<BYTE>(data_bits);
+            dcb.BaudRate = baud_;
+            dcb.ByteSize = static_cast<BYTE>(data_bits_);
             dcb.StopBits = ONESTOPBIT;
-            dcb.Parity = parity == Parity::even ? EVENPARITY
-                      : parity == Parity::odd  ? ODDPARITY : NOPARITY;
+            dcb.Parity = parity_ == Parity::even ? EVENPARITY
+                      : parity_ == Parity::odd  ? ODDPARITY : NOPARITY;
             dcb.fBinary = TRUE;
-            dcb.fParity = parity != Parity::none;
+            dcb.fParity = parity_ != Parity::none;
             // 显式关闭所有流控：现场设备常常不接 RTS/CTS，驱动默认行为会静默丢数据。
             dcb.fOutxCtsFlow = FALSE;
             dcb.fOutxDsrFlow = FALSE;
@@ -80,6 +81,20 @@ public:
         }
     }
 
+    Error transport_failure(const char* code, const char* operation, const Bytes& request) {
+        auto error = Error::with_raw(ErrorKind::transport, code, win_error(operation), request);
+        CloseHandle(handle_);
+        handle_ = nullptr;
+        // The next caller will reconnect. Never replay a possibly completed write.
+        return error;
+    }
+
+public:
+    SerialLink(const std::string& port, unsigned baud, Parity parity, unsigned data_bits)
+        : endpoint_(port), baud_(baud), parity_(parity), data_bits_(data_bits) {
+        open_handle();
+    }
+
     ~SerialLink() override {
         if (handle_) CloseHandle(handle_);
     }
@@ -92,17 +107,22 @@ public:
             return Error::make(ErrorKind::invalid_argument, "bad_timing",
                                "require timeout_ms <= 10000 and idle_ms <= timeout_ms");
 
+        if (!handle_) {
+            try { open_handle(); }
+            catch (const std::exception& e) {
+                return Error::with_raw(ErrorKind::transport, "reopen_failed", e.what(), request);
+            }
+        }
+
         // 每次事务先清空缓冲：上一次残留绝不能被当成本次响应。
         if (!PurgeComm(handle_, PURGE_RXCLEAR | PURGE_TXCLEAR))
-            return Error::with_raw(ErrorKind::transport, "purge_failed",
-                                   win_error("PurgeComm"), request);
+            return transport_failure("purge_failed", "PurgeComm", request);
 
         const auto start = std::chrono::steady_clock::now();
         DWORD written = 0;
         if (!WriteFile(handle_, request.data(), static_cast<DWORD>(request.size()), &written, nullptr) ||
             written != request.size())
-            return Error::with_raw(ErrorKind::transport, "write_failed",
-                                   win_error("WriteFile did not send the whole request"), request);
+            return transport_failure("write_failed", "WriteFile did not send the whole request", request);
 
         Reply reply{};
         for (;;) {
@@ -124,8 +144,7 @@ public:
             DWORD errors = 0;
             COMSTAT status{};
             if (!ClearCommError(handle_, &errors, &status))
-                return Error::with_raw(ErrorKind::transport, "status_failed",
-                                       win_error("ClearCommError"), request);
+                return transport_failure("status_failed", "ClearCommError", request);
             reply.receive_errors |= errors;
 
             if (status.cbInQue) {
@@ -133,8 +152,7 @@ public:
                 DWORD received = 0;
                 const DWORD amount = std::min<DWORD>(status.cbInQue, sizeof(buffer));
                 if (!ReadFile(handle_, buffer, amount, &received, nullptr))
-                    return Error::with_raw(ErrorKind::transport, "read_failed",
-                                           win_error("ReadFile"), request);
+                    return transport_failure("read_failed", "ReadFile", request);
                 reply.bytes.insert(reply.bytes.end(), buffer, buffer + received);
                 if (reply.bytes.size() > 8192)
                     return Error::make(ErrorKind::transport, "reply_too_large",

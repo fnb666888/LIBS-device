@@ -21,6 +21,8 @@
 //      不当作"值为真"，也不当作"没事"。
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "libs/devices/laser.hpp"
 
@@ -69,6 +71,15 @@ struct LaserSafetyFacts {
 LaserSafetyFacts parse_actual(const libs::devices::LaserActual& actual,
                               std::uint32_t* discharge_counter = nullptr);
 
+enum class DeviceCondition { unknown, normal, communication_failed, fault };
+
+struct AuxiliaryDeviceFacts {
+    std::string name;
+    DeviceCondition condition = DeviceCondition::unknown;
+    std::string detail;
+    std::vector<std::string> warnings;
+};
+
 // 一次判定的全部输入。**这是 verdict() 的唯一入参**。
 //
 // 之所以把它抽成一个结构体（而不是让 verdict() 一手收五个 bool）：
@@ -89,6 +100,8 @@ struct ReadinessFacts {
     bool armed = false;
 
     std::uint64_t sampled_at_ms = 0;   // 本次采样时刻（进程内单调）
+    std::vector<AuxiliaryDeviceFacts> auxiliary;  // 已启用的辅助设备，供告警展示
+    bool stop_unconfirmed = false;
 };
 
 }  // namespace business::readiness

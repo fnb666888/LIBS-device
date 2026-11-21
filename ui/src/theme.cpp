@@ -42,9 +42,8 @@ QLabel#valueStrong { font-size:23px; font-weight:600; }
 QLabel#valueUnit { color:#53657D; font-size:12px; }
 QLabel#sectionDivider { background:#E2E8F0; min-height:1px; max-height:1px; }
 QWidget#appHeader, QWidget#headerBar { background:#FFFFFF; border-bottom:1px solid #E2E8F0; }
-QLabel#brandMark { background:#2563EB; color:#FFFFFF; border-radius:12px; font-size:15px; font-weight:700; }
 QLabel#appTitle { font-size:19px; font-weight:700; }
-QLabel#appSubtitle, QLabel#appClock { color:#78889D; font-size:12px; }
+QLabel#appClock { color:#78889D; font-size:12px; }
 QPushButton { background:#FFFFFF; color:#40536C; border:1px solid #D7E0EB;
     border-radius:9px; padding:9px 16px; min-height:22px; }
 QPushButton:hover { background:#F3F7FF; border-color:#AAC4F8; color:#2563EB; }
@@ -62,8 +61,6 @@ QPushButton#ghost { background:transparent; }
 QPushButton#navTab { background:transparent; border:none; color:#53657D; font-weight:600; padding:10px 17px; }
 QPushButton#navTab:hover { background:#F1F5FC; }
 QPushButton#navTab:checked { background:#EAF1FF; color:#2563EB; }
-QPushButton#advancedToggle { background:#F7F9FD; color:#667A95; border:none; padding:7px 10px; font-size:12px; }
-QPushButton#advancedToggle:checked { background:#EDF3FF; color:#2563EB; }
 QPushButton#predictionImport { background:#F7F9FD; color:#2563EB; padding:6px 10px; min-height:16px; font-size:12px; }
 QLabel#predictionStatus, QLabel#predictionInfo { color:#53657D; font-size:12px; }
 QLineEdit, QDoubleSpinBox, QSpinBox, QComboBox { background:#FFFFFF; color:#192A42;

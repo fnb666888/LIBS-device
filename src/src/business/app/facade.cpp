@@ -10,7 +10,6 @@
 #include "libs/business/measurement/prediction/algorithm_contract.hpp"
 #include "libs/business/measurement/job.hpp"
 #include "libs/business/readiness/monitor.hpp"
-#include "libs/business/readiness/precheck.hpp"
 #include "libs/business/readiness/verdict.hpp"
 #include "libs/business/shared/data_delivery.hpp"
 #include "libs/business/shared/time_util.hpp"
@@ -67,7 +66,8 @@ json::Value gate_snapshot_json(const readiness::ReadinessMonitor& monitor) {
     //
     // 读不到 B2 的事实也照实报：readiness 已经用它判成 laser_unavailable，
     // 这里只是让面板能区分"是没读到"还是"读到了但不安全"。
-    const readiness::GateVerdict& verdict = monitor.latest();
+    const auto snapshot = monitor.snapshot();
+    const auto& verdict = snapshot.verdict;
     json::Value blocked = json::array();
     for (readiness::GateReason reason : verdict.blocked_by) {
         blocked.push_back(json::Value(readiness::to_string(reason)));
@@ -76,9 +76,12 @@ json::Value gate_snapshot_json(const readiness::ReadinessMonitor& monitor) {
     v.set("allowed", json::Value(verdict.allowed));
     v.set("blocked_by", std::move(blocked));
     v.set("detail", json::Value(verdict.detail));
-    v.set("state", json::Value(readiness::to_string(monitor.latest_state())));
-    v.set("armed", json::Value(monitor.armed()));
-    v.set("laser_readable", json::Value(monitor.laser_readable()));
+    v.set("state", json::Value(readiness::to_string(snapshot.state)));
+    v.set("armed", json::Value(snapshot.armed));
+    v.set("laser_readable", json::Value(snapshot.laser_readable));
+    json::Array warnings;
+    for (const auto& warning : verdict.warnings) warnings.emplace_back(warning);
+    v.set("warnings", json::Value(std::move(warnings)));
     return v;
 }
 
@@ -147,10 +150,6 @@ std::vector<std::string> BusinessFacade::commands() {
         "config_show",
         "status",
         "gate",
-        // 业务一：显式跑一次完整预检（布防 -> 判定 -> 刷灯）。
-        // 与 gate 的分工：gate 只读缓存 / 单独布防撤防，precheck 才是
-        // "按钮按下去立刻判一次"的那条路径。
-        "precheck",
         "param_set",
         "param_get",
         "capture",
@@ -161,6 +160,8 @@ std::vector<std::string> BusinessFacade::commands() {
         "measurement_start",
         "measurement_stop",
         "measurement_status",
+        "device_diagnostics",
+        "device_connection_config",
         // 只剩"显示通道"了。start/stop 动作**故意不再提供** ——
         // 采集只有一个来源，就是 measurement_start。以前这个命令同时管
         // 采集与显示，于是 UI 以为"点开始 = 开工"，实际可能拍出一堆
@@ -211,7 +212,6 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "config_show")     return cmd_config_show(args);
     if (command == "status")          return cmd_status(args);
     if (command == "gate")            return cmd_gate(args);
-    if (command == "precheck")        return cmd_precheck(args);
     if (command == "param_set")       return cmd_param_set(args);
     if (command == "param_get")       return cmd_param_get(args);
     if (command == "shutdown") {
@@ -226,6 +226,8 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "measurement_start")  return cmd_measurement_start(args);
     if (command == "measurement_stop")   return cmd_measurement_stop(args);
     if (command == "measurement_status") return cmd_measurement_status(args);
+    if (command == "device_diagnostics") return cmd_device_diagnostics(args);
+    if (command == "device_connection_config") return cmd_device_connection_config(args);
     if (command == "recovery_list")   return cmd_recovery_list(args);
     if (command == "recovery_write")  return cmd_recovery_write(args);
     if (command == "health")          return cmd_health(args);
@@ -296,29 +298,16 @@ Response BusinessFacade::cmd_status(const json::Value& args) {
     v.set("running", json::Value(runtime_.running()));
     v.set("gate", gate_snapshot_json(*monitor));
     // 出光会话是否在进行。界面靠它决定「开始检测 / 停止」哪个可点。
-    v.set("laser_running", json::Value(runtime_.laser_running()));
+    const auto job_status = runtime_.measurement() ? runtime_.measurement()->status() : measurement::MeasurementStatus{};
+    v.set("laser_running", json::Value(job_status.running));
+    v.set("stop_confirmation", measurement::to_json(job_status)["stop_confirmation"]);
+    v.set("stop_error", json::Value(job_status.stop_error));
     v.set("health", runtime_.health_json());
     v.set("prediction", runtime_.prediction() ? runtime_.prediction()->status() : json::Value());
     v.set("log_records", json::Value(static_cast<double>(runtime_.log().count())));
 
-    // 状态灯：灯色意图与上次下发结果。
-    //
-    // **灯是门禁之上的纯函数**：这里只用于诊断"灯现在显示出什么"。
-    // lamp_applied=false 只说明灯这条串口有问题，与"能不能出光"无关。
-    // 预检未装配时**如实说没有**，不要塞一个假的默认灯色 ——
-    // "灯是绿的"是现场据以判断安全与否的信息，编不得。
-    if (const readiness::PrecheckService* pc = runtime_.precheck()) {
-        json::Value lamp = json::object();
-        lamp.set("intent", json::Value(pc->lamp_intent()));
-        lamp.set("applied", json::Value(pc->last_report().lamp_applied));
-        const std::string& lamp_error = pc->last_report().lamp_error;
-        if (!lamp_error.empty()) {
-            lamp.set("last_error", json::Value(lamp_error));
-        }
-        v.set("indicator", std::move(lamp));
-    } else {
-        v.set("indicator", json::Value());   // 尚未装配，不谎报灯色
-    }
+    // 状态灯的目标和回读结果，供设备诊断展示。
+    v.set("indicator", runtime_.indicator_status());
 
     if (runtime_.last_delivery().has_value()) {
         const auto& d = *runtime_.last_delivery();
@@ -338,99 +327,20 @@ Response BusinessFacade::cmd_status(const json::Value& args) {
     return Response::success(std::move(v));
 }
 
-// `gate` 命令：布防 / 撤防 / 手动刷新一次判定。**纯运维与诊断入口**。
-//
-// ── 它绝不能变成"开始检测"的前置步骤 ──────────────────────────────────
-//
-// 本命令只回答"现在能不能出光"并把结论刷到灯上，**不做任何出光动作**。
-// 判定真正的执行点仍然是 MeasurementJob::start()。如果界面改成
-// "先 gate refresh 拿到绿灯，再发 measurement_start"，判定就出现了两个执行点 ——
-// 那是方案 §2 约束 1 明令禁止的形状。
+// The gate command reads the same verdict that drives measurement.
 Response BusinessFacade::cmd_gate(const json::Value& args) {
-    readiness::ReadinessMonitor* monitor = runtime_.monitor();
-    if (monitor == nullptr) {
+    if (args.has("action") && args["action"].as_string() != "refresh") {
         return Response::failure(libs::Error::make(
-            libs::ErrorKind::unsupported, "readiness_not_ready",
-            "就绪判定尚未装配（守护进程未完成启动）"));
+            libs::ErrorKind::invalid_argument, "gate_bad_action",
+            "gate 支持查询或 action=refresh"));
     }
-
-    // 参数齐备是一条**配置事实**，可以由调用方同步进来。
-    // 注意这里**不重跑判定**：改完参数下次判定自然会用上，
-    // 立刻重跑只会让"改参数"顺带变成一次设备读。
-    if (args.has("parameters_ready") && args["parameters_ready"].is_bool()) {
-        monitor->set_parameters_ready(args["parameters_ready"].as_bool());
+    const auto* monitor = runtime_.monitor();
+    if (!monitor || !runtime_.running()) {
+        return Response::failure(libs::Error::make(
+            libs::ErrorKind::unsupported, "readiness_not_ready", "安全门禁尚未启动"));
     }
-
-    if (args.has("action")) {
-        const std::string action = args["action"].as_string();
-        // **刻意不取 device_mutex**：事实源 lambda 自己会去拿那把锁，
-        // 外层再拿一次就是同一线程重复加锁 —— std::mutex 不自锁，直接死锁。
-        if (action == "arm") {
-            const libs::VoidResult r = monitor->arm();   // 内部会先 evaluate 一次
-            if (!r) return Response::failure(r.error());
-        } else if (action == "disarm") {
-            const libs::VoidResult r = monitor->disarm();
-            if (!r) return Response::failure(r.error());
-        } else if (action == "refresh") {
-            monitor->evaluate_now();   // 返回值即最新结论，下面统一回显
-        } else {
-            return Response::failure(libs::Error::make(
-                libs::ErrorKind::invalid_argument, "gate_bad_action",
-                "action 只能是 arm / disarm / refresh，收到: " + action));
-        }
-    }
+    if (args.has("action")) runtime_.measurement()->refresh_gate();
     return Response::success(gate_snapshot_json(*monitor));
-}
-
-// "precheck" 命令：显式跑一次完整设备预检。**全库唯一能被客户端主动触发的判定入口。**
-//
-// -- 它与 gate 的分工（两条不同的路径，别混用）--------------------------
-//
-//   * gate     -- 运维/诊断入口。只读缓存结论，或单独布防/撤防，
-//                 顺手把结论刷到灯上。它不组装预检报告。
-//   * precheck -- 操作员入口。一次完成"布防 -> 判定 -> 按结论刷灯"，
-//                 并把**完整报告**回给调用方。
-//
-// -- 它绝不成为"开始检测"的前置步骤-----------------------------------
-//
-// 判定真正的执行点仍然只有 MeasurementJob::start()。如果界面改成
-// "先 precheck 拿到绿灯，再发 measurement_start"，判定就出现了第二个执行点
-// —— 那是方案 §2 约束 1 明令禁止的形状，而且更隐蔽：precheck 走的是
-// 预检服务，measurement_start 走的是 monitor，两条路径读的事实可能不是同一时刻。
-// 正确形态始终是：measurement_start 一次成功或失败。
-Response BusinessFacade::cmd_precheck(const json::Value& args) {
-    // 预检没有可调参数：布防、判定、刷灯三件事都是固定的。
-    // 保留形参是为了和其他 cmd_* 签名一致（路由表按同一形状调用）。
-    (void)args;
-
-    readiness::PrecheckService* pc = runtime_.precheck();
-    if (pc == nullptr) {
-        return Response::failure(libs::Error::make(
-            libs::ErrorKind::unsupported, "precheck_not_ready",
-            "预检服务尚未装配（守护进程未完成启动）"));
-    }
-
-    // 参数齐备是一条**配置事实**，同步给 monitor。
-    // **不重跑判定**：run() 下面马上就会判一次，在那之前改事实只会让
-    // 这一次判定的输入来路不明。与 cmd_param_set / cmd_gate 同一条纪律。
-    if (readiness::ReadinessMonitor* monitor = runtime_.monitor()) {
-        if (config::ParameterStore* store = runtime_.parameters()) {
-            monitor->set_parameters_ready(store->readiness().ready);
-        }
-    }
-
-    // run() 内部：arm() -> evaluate_now() -> 按结论刷灯。
-    // **它一条激光写指令都不发** —— 读激光状态可以，写不行。
-    const libs::VoidResult r = pc->run();
-    json::Value report = pc->to_json(pc->last_report());
-
-    if (!r) {
-        // **失败也带完整报告。** 门禁不放行时操作员要的是"哪几条不满足"，
-        // 而不是一句"预检失败"。所以用 failure_with_payload 把报告挂在
-        // payload.report 下 —— 顶层 error 键保持 failure() 的原样，两者不打架。
-        return Response::failure_with_payload(r.error(), std::move(report));
-    }
-    return Response::success(std::move(report));
 }
 
 Response BusinessFacade::cmd_param_set(const json::Value& args) {
@@ -500,10 +410,10 @@ Response BusinessFacade::cmd_param_set(const json::Value& args) {
     r.set("ready", json::Value(readiness.ready));
     r.set("summary", json::Value(readiness.summary));
     v.set("readiness", std::move(r));
-    // 参数库这条视图与门禁那条必须一致。这里只同步**事实**，不重跑判定 ——
-    // 判定何时跑由 monitor / MeasurementJob 决定，不由查询命令决定。
     if (readiness::ReadinessMonitor* monitor = runtime_.monitor()) {
         monitor->set_parameters_ready(readiness.ready);
+        monitor->set_laser_commissioned(runtime_.parameter_service().commissioned_from_store());
+        if (auto* job = runtime_.measurement()) job->on_device_status_changed();
     }
     return Response::success(std::move(v));
 }
@@ -544,22 +454,16 @@ Response BusinessFacade::cmd_param_get(const json::Value& args) {
     r.set("ready", json::Value(readiness.ready));
     r.set("summary", json::Value(readiness.summary));
     v.set("readiness", std::move(r));
-    // param_get 与 param_set 读的是同一份存储，两处的"参数齐备"必须一致。
-    // 缺这一行会出现：参数已落盘、重启后 param_get 报"核心参数齐备"，
-    // 门禁却仍是 parameters_incomplete（因为只有 param_set 才同步过门禁）。
-    // 两个视图互相矛盾正是本项目 §6.4 记过的最难排障的一类缺陷。
-    // 参数库这条视图与门禁那条必须一致。这里只同步**事实**，不重跑判定 ——
-    // 判定何时跑由 monitor / MeasurementJob 决定，不由查询命令决定。
-    if (readiness::ReadinessMonitor* monitor = runtime_.monitor()) {
-        monitor->set_parameters_ready(readiness.ready);
-    }
     return Response::success(std::move(v));
 }
 
 Response BusinessFacade::cmd_capture(const json::Value& args) {
     (void)args;
+    std::unique_lock<std::mutex> poll(runtime_.spectrometer_poll_mutex());
     std::unique_lock<std::mutex> acquisition(runtime_.acquisition_mutex(), std::try_to_lock);
-    if (!acquisition.owns_lock() || runtime_.laser_session_active())
+    poll.unlock();
+    if (!acquisition.owns_lock() || runtime_.laser_session_active() ||
+        (runtime_.measurement() && runtime_.measurement()->stop_unconfirmed()))
         return Response::failure(libs::Error::make(libs::ErrorKind::device,
             "acquisition_busy", "测量已占用光谱仪，独立采集被拒绝"));
     std::lock_guard<std::mutex> lock(runtime_.device_mutex());
@@ -727,15 +631,6 @@ Response BusinessFacade::cmd_measurement_start(const json::Value& args) {
         return Response::failure(param_error);
     }
 
-    // 一次只允许一个出光会话。**出光现在只有这一条路径**，所以这把账拦的
-    // 只是"重复开工"：measurement 在跑的时候又发一次 start，后发的会
-    // 重新走一遍写激光器的流程，等于把上一轮的光悄悄接管掉。
-    if (!runtime_.begin_laser_session()) {
-        return Response::failure(libs::Error::make(
-            libs::ErrorKind::device, "laser_already_running",
-            "已有出光会话在进行（测量作业已在运行）；要停止请用 measurement_stop"));
-    }
-
     // ── 判定就在这一行里发生，别处不许再判一次 ──────────────────────────
     //
     // job->start() 的第一步是 readiness_.evaluate_now()，不放行就**在碰激光器
@@ -748,7 +643,6 @@ Response BusinessFacade::cmd_measurement_start(const json::Value& args) {
     const libs::Result<measurement::MeasurementStartRecord> result = job->start(params);
 
     if (!result) {
-        runtime_.end_laser_session();
         runtime_.log().write(logging::RecordKind::exception_recovery, "测量作业启动失败", [&] {
             json::Value f = json::object();
             f.set("error_code", json::Value(result.error().code));
@@ -759,8 +653,10 @@ Response BusinessFacade::cmd_measurement_start(const json::Value& args) {
     }
 
     const measurement::MeasurementStartRecord& r = result.value();
+    const auto current = job->status();
     json::Value v = json::object();
-    v.set("running", json::Value(true));
+    v.set("running", json::Value(current.running));
+    v.set("status", measurement::to_json(current));
     v.set("note", json::Value(r.note));
     v.set("settle_ms", json::Value(static_cast<double>(r.settle_ms)));
     v.set("discharge_counter_at_start",
@@ -773,9 +669,11 @@ Response BusinessFacade::cmd_measurement_start(const json::Value& args) {
     v.set("display_hint", json::Value(
         "帧已经自动 publish 到帧队列。UI 订阅 spectrum_stream {action:subscribe} 即可实时显示，"
         "无需再单独启动预览流"));
-    v.set("warning", json::Value(
-        "激光正在持续出光。停止请调用 measurement_stop；守护进程退出时也会自动收光，"
-        "但操作员离开前必须确认光闸已关"));
+    if (current.running) {
+        v.set("warning", json::Value(
+            "激光正在持续出光。停止请调用 measurement_stop；守护进程退出时也会自动收光，"
+            "但操作员离开前必须确认光闸已关"));
+    }
     json::Value frames = json::array();
     for (const std::string& f : r.sent_frames) frames.push_back(json::Value(f));
     v.set("sent_frames", std::move(frames));
@@ -807,7 +705,6 @@ Response BusinessFacade::cmd_measurement_stop(const json::Value& args) {
     // 测量作业的收光是直接对激光器句柄做的，不经过任何中间服务。
     const bool was_running = job->running();
     const libs::VoidResult stopped = job->stop();
-    runtime_.end_laser_session();
 
     json::Value v = json::object();
     v.set("running", json::Value(false));
@@ -821,7 +718,7 @@ Response BusinessFacade::cmd_measurement_stop(const json::Value& args) {
             f.set("error", json::Value(stopped.error().message));
             return f;
         }());
-        return Response::failure(stopped.error());
+        return Response::failure_with_payload(stopped.error(), std::move(v));
     }
     v.set("note", json::Value(was_running
         ? "测量作业已停止：光闸关、已停机，读回确认通过；落盘线程已收尾"
@@ -844,10 +741,11 @@ Response BusinessFacade::cmd_measurement_status(const json::Value& args) {
         v.set("note", json::Value("测量作业尚未装配（守护进程未完成启动）"));
         return Response::success(std::move(v));
     }
-    json::Value v = measurement::to_json(job->status());
+    const auto status = job->status();
+    json::Value v = measurement::to_json(status);
     v.set("available", json::Value(true));
     // 帧号是 UI 唯一能对上的东西：它单调递增，UI 据此发现丢帧/漏采。
-    v.set("laser_session_active", json::Value(runtime_.laser_session_active()));
+    v.set("laser_session_active", json::Value(status.running));
     return Response::success(std::move(v));
 }
 
@@ -905,6 +803,92 @@ Response BusinessFacade::cmd_health(const json::Value& args) {
     (void)args;
     std::lock_guard<std::mutex> lock(runtime_.device_mutex());
     return Response::success(runtime_.health_json());
+}
+
+Response BusinessFacade::cmd_device_connection_config(const json::Value& args) {
+    const auto action = args.has("action") ? args["action"].as_string() : std::string("read");
+    if (action != "read" && action != "save")
+        return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+            "connection_action_invalid", "连接设置只支持读取和保存"));
+    const auto& path = runtime_.site_config_file();
+    if (action == "save" && path.empty())
+        return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+            "site_config_not_supplied", "本次服务未指定站点配置文件，无法保存"));
+
+    static std::mutex config_io;
+    std::lock_guard<std::mutex> lock(config_io);
+    const auto active = config::to_json(runtime_.config());
+    const auto read = action == "save"
+        ? config::save_device_connection(path, args["device"].as_string(), args["values"])
+        : path.empty() ? libs::Result<config::SiteConfig>(runtime_.config()) : config::load_file(path);
+    if (!read) return Response::failure(read.error());
+
+    const auto saved = config::to_json(read.value());
+    const auto lamp_values = [](const json::Value& site) {
+        auto lamp = site["indicator"];
+        lamp.set("model", site["indicator_model"]);
+        lamp.set("address", site["indicator_address"]);
+        return lamp;
+    };
+    const auto lamp = lamp_values(saved);
+    auto result = json::object();
+    result.set("writable", json::Value(!path.empty()));
+    result.set("indicator", lamp);
+    result.set("rangefinder", saved["rangefinder"]);
+    result.set("indicator_pending", json::Value(json::stringify(lamp) != json::stringify(lamp_values(active))));
+    result.set("rangefinder_pending", json::Value(json::stringify(saved["rangefinder"]) != json::stringify(active["rangefinder"])));
+    return Response::success(std::move(result));
+}
+
+Response BusinessFacade::cmd_device_diagnostics(const json::Value& args) {
+    using Setpoints = libs::devices::AirConditionerSetpoints;
+    static constexpr struct Field { const char* name; double Setpoints::*value; } fields[] = {
+        {"cooling_on_c", &Setpoints::cooling_on_c}, {"cooling_off_c", &Setpoints::cooling_off_c},
+        {"heating_on_c", &Setpoints::heating_on_c}, {"heating_off_c", &Setpoints::heating_off_c},
+        {"dehumidify_on_percent", &Setpoints::dehumidify_on_percent},
+        {"dehumidify_off_percent", &Setpoints::dehumidify_off_percent},
+    };
+    const auto setpoints_json = [&](const Setpoints& setpoints) {
+        auto result = json::object();
+        for (const auto& field : fields) result.set(field.name, json::Value(setpoints.*field.value));
+        return result;
+    };
+
+    const auto action = args.has("action") ? args["action"].as_string() : std::string("read");
+    if (action != "read" && action != "read_air_conditioner_setpoints" && action != "apply_air_conditioner")
+        return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+            "diagnostics_action_invalid", "不支持的设备状态或参数操作"));
+
+    if (action == "read") return Response::success(runtime_.device_readings());
+
+    std::unique_lock<std::mutex> lock(runtime_.auxiliary_device_mutex(), std::try_to_lock);
+    if (!lock.owns_lock())
+        return Response::failure(libs::Error::make(libs::ErrorKind::device,
+            "diagnostics_busy", "已有联调操作正在进行"));
+    auto* air = runtime_.devices().air_conditioner();
+    if (action == "read_air_conditioner_setpoints") {
+        if (!air) return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+            "air_conditioner_not_open", "空调未启用或串口未打开"));
+        const auto current = air->readSetpoints();
+        return current ? Response::success(setpoints_json(current.value())) : Response::failure(current.error());
+    }
+    if (action == "apply_air_conditioner") {
+        Setpoints target{};
+        const auto& values = args["setpoints"];
+        for (const auto& field : fields) {
+            if (!values[field.name].is_number())
+                return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                    "diagnostics_setpoint_required", std::string("缺少数值设定：") + field.name));
+            target.*field.value = values[field.name].as_number();
+        }
+        if (!air) return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+            "air_conditioner_not_open", "空调未启用或串口未打开"));
+        const auto applied = air->applySetpoints(target);
+        return applied ? Response::success(setpoints_json(applied.value())) : Response::failure(applied.error());
+    }
+
+    return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+        "diagnostics_action_invalid", "不支持的设备操作"));
 }
 
 }  // namespace business::app

@@ -3,6 +3,7 @@
 #include "machine_state.hpp"
 
 #include <exception>
+#include <QDateTime>
 #include <QMutexLocker>
 #include <QWaitCondition>
 
@@ -69,6 +70,7 @@ private:
             // 就来自它，所以要一起取——否则 UI 只能说"参数不齐"，
             // 却列不出缺哪几项，那等于把问题推回给用户去猜。
             try {
+                next.params_requested_at_ms = QDateTime::currentMSecsSinceEpoch();
                 const QJsonObject params = client_.command(QStringLiteral("param_get"));
                 merge_params(next, params.value("payload").toObject());
             } catch (const QString&) {

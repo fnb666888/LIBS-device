@@ -2,10 +2,12 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <utility>
 #include "libs/measurement_limits.hpp"
+#include "libs/protocols/indicator.hpp"
 
 namespace business::config {
 namespace {
@@ -329,8 +331,9 @@ json::Value to_json(const SiteConfig& config) {
     return v;
 }
 
-Result<SiteConfig> load_file(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
+namespace {
+Result<json::Value> read_document(const std::string& path) {
+    std::ifstream in(std::filesystem::u8path(path), std::ios::binary);
     if (!in) return invalid("cannot open the site config file: " + path);
 
     std::ostringstream buffer;
@@ -344,7 +347,64 @@ Result<SiteConfig> load_file(const std::string& path) {
         msg << "invalid JSON in " << path << " at offset " << err.offset << ": " << err.message;
         return invalid(msg.str());
     }
-    return from_json(root);
+    return root;
+}
+}  // namespace
+
+Result<SiteConfig> load_file(const std::string& path) {
+    const auto root = read_document(path);
+    return root ? from_json(root.value()) : Result<SiteConfig>(root.error());
+}
+
+Result<SiteConfig> save_device_connection(const std::string& path, const std::string& device,
+                                          const json::Value& changes) {
+    const bool lamp = device == "indicator";
+    if ((!lamp && device != "rangefinder") || !changes.is_object())
+        return invalid("连接设置只接受状态灯或测距仪的参数对象");
+    auto loaded = read_document(path);
+    if (!loaded) return loaded.error();
+    auto& root = loaded.value();
+    const auto original = from_json(root);
+    if (!original) return original.error();
+    auto serial = root[device].is_object() ? root[device] : json::object();
+    for (const auto& field : changes.as_object()) {
+        const auto& key = field.first;
+        const auto& value = field.second;
+        const bool number = key == "baud" || key == "data_bits" || key == "timeout_ms" || key == "address" || (lamp && key == "idle_ms");
+        const bool string = key == "port" || key == "parity" || (lamp && key == "model");
+        if (!(number && value.is_number()) && !(string && value.is_string()) && !(key == "enabled" && value.is_bool()))
+            return invalid("无效的连接参数：" + key);
+        if (lamp && key == "address") root.set("indicator_address", value);
+        else if (lamp && key == "model") root.set("indicator_model", value);
+        else serial.set(key, value);
+    }
+    root.set(device, std::move(serial));
+    auto updated = from_json(root);
+    if (!updated) return updated.error();
+    if (lamp) {
+        const auto& site = updated.value();
+        if (site.indicator_address > 247 || site.indicator.timeout_ms < 80 || site.indicator.timeout_ms > 10000)
+            return invalid("状态灯地址须为 1–247，通信超时须为 80–10000 ms");
+        libs::indicator::ModelTraits model;
+        if (site.indicator.enabled && !libs::indicator::lookup_model(site.indicator_model, model))
+            return invalid("启用状态灯前，请填写设备层已支持的准确型号");
+    }
+
+    namespace fs = std::filesystem;
+    const auto target = fs::u8path(path);
+    auto temporary = target;
+    temporary += ".connection.tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output << json::stringify(root, 2) << '\n';
+    output.close();
+    std::error_code ec;
+    if (output) fs::rename(temporary, target, ec);
+    if (!output || ec) {
+        std::error_code ignored;
+        fs::remove(temporary, ignored);
+        return Error::make(ErrorKind::transport, "site_write_failed", "无法保存站点配置，请检查文件权限和占用状态");
+    }
+    return updated;
 }
 
 Result<SiteConfig> default_template() {

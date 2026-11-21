@@ -39,6 +39,7 @@ enum class GateReason {
     over_temperature,         // 超温
     not_enabled,              // 设备未使能
     laser_not_commissioned,   // 本机出光参数未标定
+    stop_unconfirmed,
 };
 const char* to_string(GateReason reason) noexcept;
 
@@ -49,6 +50,7 @@ struct GateVerdict {
 
     // 判据来源。allowed 只表示"业务层允许"，**不代表物理触发已发生**。
     std::string detail;
+    std::vector<std::string> warnings;
 
     const char* primary_reason() const noexcept;
 };

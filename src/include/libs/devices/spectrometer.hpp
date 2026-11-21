@@ -147,6 +147,8 @@ public:
 
     // 只读枚举。不 prepare、不 measure、不改持久参数。
     Result<std::vector<SpectrometerInfo>> enumerate();
+    // Drop stale SDK channel handles between jobs while retaining process ownership.
+    VoidResult resetChannels();
 
     // 可选的 incomplete_group 保留失败组中已实际取到的数据。它不计为完整组，
     // 调用方仍须处理采集错误和 expected_groups / received_groups。

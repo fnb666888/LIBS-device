@@ -16,6 +16,7 @@ const char* to_string(GateReason reason) noexcept {
         case GateReason::over_temperature:      return "over_temperature";
         case GateReason::not_enabled:           return "not_enabled";
         case GateReason::laser_not_commissioned: return "laser_not_commissioned";
+        case GateReason::stop_unconfirmed:     return "stop_unconfirmed";
     }
     return "unknown";
 }
@@ -44,6 +45,16 @@ GateVerdict evaluate(const ReadinessFacts& facts, GateCheckPhase phase) {
     // 电流/脉宽/Q 延时到底该取多少。后者过去被硬编码成量程下限，是事故根因。
     if (!facts.laser_commissioned) {
         v.blocked_by.push_back(GateReason::laser_not_commissioned);
+    }
+    if (facts.stop_unconfirmed) {
+        v.blocked_by.push_back(GateReason::stop_unconfirmed);
+    }
+    for (const auto& device : facts.auxiliary) {
+        for (const auto& warning : device.warnings) {
+            v.warnings.push_back(device.name + "：" + warning);
+        }
+        if (device.condition == DeviceCondition::normal) continue;
+        v.warnings.push_back(device.name + "：" + (device.detail.empty() ? "状态未知" : device.detail));
     }
 
     // 读不到激光器状态时**不能假定安全**。这是最关键的一条：

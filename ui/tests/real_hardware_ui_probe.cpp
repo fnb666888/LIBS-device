@@ -32,10 +32,7 @@ int main(int argc, char** argv) {
     auto* start = window.findChild<QPushButton*>(QStringLiteral("startBig"));
     auto* stop = window.findChild<QPushButton*>(QStringLiteral("stopBig"));
     auto* branch = window.findChild<QComboBox*>(QStringLiteral("predictionBranch"));
-    QPushButton* precheck = nullptr;
-    for (auto* button : window.findChildren<QPushButton*>())
-        if (button->text() == QStringLiteral("设备预检")) precheck = button;
-    if (!start || !stop || !branch || !precheck) return 3;
+    if (!start || !stop || !branch) return 3;
     QDir().mkpath(output);
     QJsonArray events;
     QElapsedTimer total, emission;
@@ -64,13 +61,7 @@ int main(int argc, char** argv) {
             window.grab().save(output + "/ui-timeout.png");
             app.exit(1); return; // Controller/watchdog independently requests stop.
         }
-        if (phase == 0 && total.elapsed() > 1000 && precheck->isEnabled() && start->isEnabled()) {
-            record("click_precheck"); precheck->click(); phase = 1;
-        } else if (phase == 1 && labels.contains(QStringLiteral("设备预检未通过"))) {
-            record("precheck_failed"); window.grab().save(output + "/ui-precheck-failed.png");
-            app.exit(1);
-        } else if (phase == 1 && start->isEnabled() && precheck->isEnabled() && branch->isEnabled() &&
-                   (labels.contains(QStringLiteral("设备预检通过")) || QFile::exists(output + "/precheck-passed.flag"))) {
+        if (phase == 0 && start->isEnabled() && branch->isEnabled()) {
             record("select_oxide_model"); branch->setCurrentIndex(branch->findData("oxide")); phase = 2;
         } else if (phase == 2 && labels.contains(QStringLiteral("模型加载失败"))) {
             record("ui_model_load_failed"); app.exit(1);

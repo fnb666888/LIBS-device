@@ -138,6 +138,8 @@ json::Value to_json(const SiteConfig& config);
 //   * JSON 语法错 -> ErrorKind::invalid_argument
 //   * 字段缺失/非法 -> ErrorKind::invalid_argument
 libs::Result<SiteConfig> load_file(const std::string& path);
+libs::Result<SiteConfig> save_device_connection(const std::string& path, const std::string& device,
+                                               const json::Value& changes);
 
 // 生成一份「全部设备未接」的骨架。
 //

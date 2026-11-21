@@ -334,6 +334,26 @@ CASE(evaluate_all_safe_and_parameters_ready_allows); {
     CHECK(verdict.blocked_by.empty());
 }
 
+CASE(auxiliary_device_conditions_warn_without_blocking_measurement); {
+    using readiness::DeviceCondition;
+    using readiness::GateCheckPhase;
+    auto facts = armed_facts();
+    facts.auxiliary.push_back({"空调", DeviceCondition::normal, {}, {"高湿告警"}});
+    CHECK_EQ(readiness::evaluate(facts).warnings.size(), std::size_t(1));
+    for (const auto condition : {DeviceCondition::communication_failed, DeviceCondition::fault,
+                                 DeviceCondition::unknown}) {
+        facts.auxiliary.front().condition = condition;
+        facts.auxiliary.front().warnings.clear();
+        for (const auto phase : {GateCheckPhase::before_emission, GateCheckPhase::during_emission}) {
+            const auto verdict = readiness::evaluate(facts, phase);
+            CHECK(verdict.allowed);
+            CHECK_EQ(verdict.warnings.size(), std::size_t(1));
+        }
+    }
+    facts.stop_unconfirmed = true;
+    CHECK(!readiness::evaluate(facts).allowed);
+}
+
 // "未标定不得启用" 是同一套纪律；区别是默认值就是"未标定"。
 CASE(evaluate_uncommissioned_laser_blocks_even_when_everything_else_is_safe); {
     readiness::ReadinessFacts f = armed_facts();

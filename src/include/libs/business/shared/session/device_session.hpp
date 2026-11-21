@@ -9,6 +9,7 @@
 // 生命周期：open() -> 使用 -> close()。析构只是兜底，正常路径必须显式 close()。
 
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "libs/business/shared/config/site_config.hpp"
@@ -34,7 +35,7 @@ struct DeviceState {
 
 // 会话健康检查结果。全部设备汇总，不含任何门禁判断——那是能力 4 的事。
 struct HealthReport {
-    // 现有测量所需设备的连接状态；辅助设备各自报告。
+    // 已启用的激光器和光谱仪是否已打开。
     bool all_required_open = true;
     std::string summary;
     DeviceState laser;
@@ -47,6 +48,7 @@ struct HealthReport {
 // 进程内唯一的设备持有者。不可拷贝、不可移动。
 class DeviceSession {
 public:
+    enum class Device { laser, indicator, rangefinder, air_conditioner, spectrometer };
     DeviceSession() = default;
     ~DeviceSession();
     DeviceSession(const DeviceSession&) = delete;
@@ -56,9 +58,12 @@ public:
     //
     // 部分成功是允许的且**如实报告**：某台设备没接不应该让整台机器起不来。
     // 已启用的主测量设备打开失败时，all_required_open 为 false。
-    // 测距仪和空调单独报告，业务层决定如何使用。
     // 绝不做做的事：静默回落、换端口重试、把失败吞掉。
     libs::VoidResult open(const config::SiteConfig& config);
+    // Retry the configured endpoint of a device that has no handle yet.
+    // Each endpoint is retried by its own sampler. Successful handles stay stable.
+    void retry_open(Device device);
+    void update_spectrometer_status(bool opened, std::string detail);
 
     // 优雅关闭。顺序与打开相反：先关光谱仪（SDK 需要显式清理），
     // 再关串口。可重复调用。
@@ -68,19 +73,26 @@ public:
 
     HealthReport health() const;
 
-    // 设备访问器。未打开时返回 nullptr——调用方必须自己判空，
-    // 不提供"自动打开"的隐式行为。
-    libs::devices::Laser* laser() noexcept { return laser_.get(); }
-    libs::devices::Indicator* indicator() noexcept { return indicator_.get(); }
-    libs::devices::Spectrometer* spectrometer() noexcept { return spectrometer_.get(); }
-    libs::devices::Rangefinder* rangefinder() noexcept { return rangefinder_.get(); }
-    libs::devices::AirConditioner* air_conditioner() noexcept { return air_conditioner_.get(); }
+    libs::devices::Laser* laser();
+    libs::devices::Indicator* indicator();
+    libs::devices::Spectrometer* spectrometer();
+    libs::devices::Rangefinder* rangefinder();
+    libs::devices::AirConditioner* air_conditioner();
+    const std::vector<libs::devices::SpectrometerInfo>& spectrometer_channels() const noexcept {
+        return spectrometer_channels_;
+    }
 
     const config::SiteConfig& config() const noexcept { return config_; }
 
 private:
+    template <class T, class Make>
+    void open_serial_device(const config::SerialPortConfig& config, const char* name,
+                            std::unique_ptr<T>& device, DeviceState& state, Make make);
+    void open_spectrometer();
+
     bool open_ = false;
     config::SiteConfig config_;
+    mutable std::mutex devices_mutex_;
 
     // 传输层句柄。驱动对象引用它们，所以链接对象必须比驱动活得久：
     // links_ 先声明，因此析构时驱动先于链路销毁。
@@ -90,6 +102,7 @@ private:
     std::unique_ptr<libs::devices::Spectrometer> spectrometer_;
     std::unique_ptr<libs::devices::Rangefinder> rangefinder_;
     std::unique_ptr<libs::devices::AirConditioner> air_conditioner_;
+    std::vector<libs::devices::SpectrometerInfo> spectrometer_channels_;
 
     DeviceState laser_state_;
     DeviceState indicator_state_;

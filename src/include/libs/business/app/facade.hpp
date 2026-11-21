@@ -87,16 +87,6 @@ private:
     Response cmd_config_show(const json::Value& args);
     Response cmd_status(const json::Value& args);
     Response cmd_gate(const json::Value& args);
-    // 业务一（设备预检）的 IPC 出口。
-    //
-    // 预检服务本身在 Runtime::start() 里就装配好了，但**在这条命令出现之前
-    // 它没有任何跨进程调用者**：也就是说这台机器能判"能不能出光"，
-    // 却没有任何一个客户端能主动让它判一次。界面上那颗"设备预检"按钮
-    // 只能去问 gate 缓存，而 gate 缓存要等别的命令先跑过判定才有内容。
-    //
-    // 这条命令补上的是**唯一缺失的那一环**：显式触发一次完整预检
-    // （布防 -> 判定 -> 刷灯），并把完整报告如实回给调用方。
-    Response cmd_precheck(const json::Value& args);
     Response cmd_param_set(const json::Value& args);
     Response cmd_param_get(const json::Value& args);
     Response cmd_capture(const json::Value& args);
@@ -111,6 +101,8 @@ private:
     Response cmd_recovery_list(const json::Value& args);
     Response cmd_recovery_write(const json::Value& args);
     Response cmd_health(const json::Value& args);
+    Response cmd_device_diagnostics(const json::Value& args);
+    Response cmd_device_connection_config(const json::Value& args);
 
     // 把一次采集结果交付到本地出口（能力 6.3.1）。
     //

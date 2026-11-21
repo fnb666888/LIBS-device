@@ -4,6 +4,7 @@
 // 全程 open_devices=false：不开任何串口、不加载 SDK。
 #include <string>
 #include <fstream>
+#include <thread>
 #include "libs/measurement_limits.hpp"
 
 #include "check.hpp"
@@ -59,9 +60,9 @@ CASE(stopped_runtime_rejects_device_commands_and_supports_restart); {
     CHECK(f.runtime.stop());
     CHECK(f.runtime.stop()); // explicit stop followed by destructor must also be safe
     CHECK(!f.runtime.running());
-    const auto precheck = f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    CHECK(!precheck.ok);
-    CHECK_EQ(precheck.payload["error"]["code"].as_string(), std::string("precheck_not_ready"));
+    const auto gate = f.facade.dispatch(R"({"command":"gate","args":{}})");
+    CHECK(!gate.ok);
+    CHECK_EQ(gate.payload["error"]["code"].as_string(), std::string("readiness_not_ready"));
     const auto measurement = f.facade.dispatch(R"({"command":"measurement_start","args":{}})");
     CHECK(!measurement.ok);
     app::Runtime::Options options;
@@ -81,6 +82,55 @@ CASE(facade_ping_reports_running_and_command_list); {
     CHECK(response.payload["running"].as_bool());
     CHECK(response.payload.has("commands"));
     CHECK(!response.payload["commands"].as_array().empty());
+}
+
+CASE(connection_settings_persist_without_changing_running_devices); {
+    const auto path = ::testing::scratch("build/tmp_facade_device_connections.json", false);
+    auto site = config::to_json(template_config());
+    auto indicator = site["indicator"];
+    indicator.set("installer_note", json::Value("keep"));
+    site.set("indicator", indicator);
+    site.set("station_note", json::Value("keep"));
+    {
+        std::ofstream out(path);
+        out << json::stringify(site);
+        CHECK(out.good());
+    }
+    Fixture f("device_connections");
+    const auto readonly = f.facade.dispatch(R"({"command":"device_connection_config"})");
+    CHECK(readonly.ok);
+    CHECK(!readonly.payload["writable"].as_bool());
+    CHECK(f.runtime.stop());
+    app::Runtime::Options options;
+    options.open_devices = false;
+    options.data_dir = f.data_dir;
+    options.site_config_file = path;
+    CHECK(f.runtime.start(template_config(), options));
+
+    const auto range = f.facade.dispatch(R"({"command":"device_connection_config","args":{"action":"save","device":"rangefinder","values":{"port":"COM41","baud":19200,"address":7,"parity":"even","data_bits":8,"timeout_ms":750}}})");
+    CHECK(range.ok);
+    CHECK(range.payload["writable"].as_bool());
+    CHECK(range.payload["rangefinder_pending"].as_bool());
+    CHECK(!range.payload["indicator_pending"].as_bool());
+    CHECK_EQ(static_cast<int>(f.runtime.config().rangefinder.address), 1);
+
+    const auto lamp = f.facade.dispatch(R"({"command":"device_connection_config","args":{"action":"save","device":"indicator","values":{"port":"COM42","address":12,"model":"TL50-485","idle_ms":100}}})");
+    CHECK(lamp.ok);
+    CHECK(lamp.payload["rangefinder_pending"].as_bool());
+    CHECK(lamp.payload["indicator_pending"].as_bool());
+    CHECK(!f.facade.dispatch(R"({"command":"device_connection_config","args":{"action":"save","device":"rangefinder","values":{"address":248}}})").ok);
+    CHECK(!f.facade.dispatch(R"({"command":"device_connection_config","args":{"action":"save","device":"indicator","values":{"enabled":true,"model":"unknown"}}})").ok);
+    std::ifstream in(path);
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    json::Value saved;
+    CHECK(json::parse(contents.str(), saved).ok);
+    CHECK_EQ(saved["rangefinder"]["address"].as_number(), 7.0);
+    CHECK_EQ(saved["indicator_address"].as_number(), 12.0);
+    CHECK_EQ(saved["indicator_model"].as_string(), std::string("TL50-485"));
+    CHECK_EQ(saved["indicator"]["idle_ms"].as_number(), 100.0);
+    CHECK_EQ(saved["station_note"].as_string(), std::string("keep"));
+    CHECK_EQ(saved["indicator"]["installer_note"].as_string(), std::string("keep"));
 }
 
 CASE(facade_bad_json_is_invalid_argument_not_a_crash); {
@@ -618,115 +668,61 @@ CASE(param_get_after_restart_keeps_the_gate_in_sync); {
 }
 
 
-// ── 设备预检（业务一）的 IPC 出口 ────────────────────────────────────────────────
-//
-// PrecheckService::run() 在 Runtime::start() 里就装配好了，但在这条命令
-// 出现之前**全库没有任何生产调用者**：这台机器能判"能不能出光"，却没有任何
-// 一个客户端能主动让它判一次。下面这组用例钉住补上的这唯一一环。
-CASE(precheck_is_in_the_command_surface); {
-    const std::vector<std::string>& cmds = app::BusinessFacade::commands();
-    bool found = false;
-    for (const std::string& c : cmds) {
-        if (c == "precheck") found = true;
-    }
-    CHECK(found);
-    // 路由表和分派必须对齐：登记了却没接上，等于没有。
-    Fixture f("precheck_cmd");
-    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    // 离线夹具里激光器没开 -> 布防失败。这是**如实失败**，不是崩溃。
-    CHECK(!response.ok);
-    CHECK_EQ(response.error.code, std::string("gate_laser_disabled"));
-}
-
-CASE(precheck_without_a_laser_is_blocked_but_still_reports_why); {
-    // 门禁不放行时，返回体里必须带完整报告 —— 否则操作员只看到
-    // 一句"预检失败"，不知道该去查哪一条。
-    Fixture f("precheck_report");
-    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    CHECK(!response.ok);
-    CHECK(response.payload.has("error"));
-    CHECK(response.payload.has("report"));
-    const json::Value& report = response.payload["report"];
-    CHECK(!report["allowed"].as_bool(true));
-    // 报告必须能说清"是没读到"还是"读到了但不安全"。
-    CHECK(!report["laser_readable"].as_bool(true));
-    CHECK(!report["detail"].as_string().empty());
-    // 灯的字段同样要带回来：预检的产出之一就是刷灯。
-    CHECK(report.has("lamp_intent"));
-    CHECK(report.has("lamp_applied"));
-    // 关键：报告挂在 report 子对象下，**不能覆盖顶层 error**。
-    CHECK(response.payload["error"].has("code"));
-    CHECK_EQ(response.payload["error"]["code"].as_string(), std::string("gate_laser_disabled"));
-}
-
-CASE(precheck_does_not_fire_the_laser); {
-    // 预检必须是只读的：布防 + 判定 + 刷灯，一条激光写指令都不发。
-    // 这里断言的是"出光作业没有被动过"——
-    // 真去数激光指令数需要替身设备，超出这一层的职责；
-    // 但"跑完预检后作业没起来"是能从外部看到的，必须钉住。
-    Fixture f("precheck_no_fire");
-    (void)f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    const app::Response status = f.facade.dispatch(R"({"command":"status","args":{}})");
+CASE(runtime_exposes_one_gate_at_startup_without_starting_measurement); {
+    auto configuration = template_config();
+    configuration.laser.enabled = true;
+    configuration.rangefinder.serial.enabled = true;
+    configuration.air_conditioner.serial.enabled = true;
+    Fixture f("single_gate", configuration);
+    const auto status = f.facade.dispatch(R"({"command":"status","args":{}})");
     CHECK(status.ok);
+    CHECK(!status.payload.has("startup_precheck"));
     CHECK(!status.payload["laser_running"].as_bool(true));
-    // 判定执行点只有一个：作业没启动，判定就不该由预检之外的地方产生。
-    const app::Response ms = f.facade.dispatch(R"({"command":"measurement_status","args":{}})");
-    CHECK(ms.ok);
-    CHECK(!ms.payload["running"].as_bool(true));
+    const auto& gate = status.payload["gate"];
+    CHECK(gate["armed"].as_bool());
+    CHECK(!gate["allowed"].as_bool(true));
+    CHECK_EQ(gate["warnings"].as_array().size(), std::size_t(2));
+    const auto read = f.facade.dispatch(R"({"command":"gate"})");
+    CHECK(read.ok);
+    CHECK_EQ(json::stringify(read.payload), json::stringify(gate));
+    const auto precheck = f.facade.dispatch(R"({"command":"precheck"})");
+    CHECK(!precheck.ok);
+    CHECK_EQ(precheck.error.code, std::string("unknown_command"));
+    CHECK(!f.facade.dispatch(R"({"command":"gate","args":{"action":"disarm"}})").ok);
 }
 
-CASE(precheck_does_not_stand_in_front_of_measurement_start); {
-    // 这条是纪律测试，不是功能测试。
-    // 判定真正的执行点只有 MeasurementJob::start()；预检通了不代表
-    // measurement_start 会通过。界面**绝不能**"先预检拿绿灯再开始检测"，
-    // 否则判定出现第二个执行点，而且两条路径读的事实不是同一时刻。
-    Fixture f("precheck_not_gate");
-    const app::Response pre = f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    CHECK(!pre.ok);
-    const app::Response started =
-        f.facade.dispatch(R"({"command":"measurement_start","args":{}})");
-    // 设备没开，作业自己会失败 —— 无论预检结论如何。
-    CHECK(!started.ok);
-    // 两条路径都必须如实报告自己那一侧的结果，不能有一方"替另一方说话"。
-    CHECK(started.payload.has("error"));
-}
-
-CASE(precheck_reaches_the_verdict_when_the_laser_is_configured_but_closed); {
-    // 布防只看**配置里有没有使能**，不看设备开没开。
-    // 所以把 laser.enabled 打开、设备仍然不开，就能在离线夹具里
-    // 走到 evaluate_now()，从而断言"预检确实触发了判定"而不只是布防。
-    config::SiteConfig cfg = template_config();
-    cfg.laser.enabled = true;
-    Fixture f("precheck_verdict", cfg);
-    const app::Response response = f.facade.dispatch(R"({"command":"precheck","args":{}})");
-    CHECK(!response.ok);
-    CHECK(response.payload.has("report"));
-    const json::Value& report = response.payload["report"];
-    CHECK(!report["allowed"].as_bool(true));
-    CHECK(!report["laser_readable"].as_bool(true));
-    bool has_reason = false;
-    for (const auto& r : report["blocked_by"].as_array()) {
-        const std::string code = r.as_string();
-        // 设备没开 -> 事实读不到 -> laser_unavailable。
-        if (code == "laser_unavailable") has_reason = true;
-        // 反向断言：布防成功了，报告里**不能**出现"没布防"这条理由。
-        CHECK(code != "gate_disarmed");
-    }
-    CHECK(has_reason);
-    // 布防成功 => armed 为真；否则判定恒假，blocked_by 就只剩 disarm。
-    const app::Response gate = f.facade.dispatch(R"({"command":"gate","args":{}})");
-    CHECK(gate.ok);
-    CHECK(gate.payload["armed"].as_bool(false));
-}
 CASE(capture_refuses_active_measurement_and_shutdown_is_explicit); {
     Fixture f("tmp_facade_acquisition_busy");
-    CHECK(f.runtime.begin_laser_session());
-    const auto capture = f.facade.dispatch(R"({"command":"capture"})");
+    std::unique_lock<std::mutex> occupied(f.runtime.acquisition_mutex());
+    app::Response capture;
+    std::thread requested([&] { capture = f.facade.dispatch(R"({"command":"capture"})"); });
+    requested.join();
+    occupied.unlock();
     CHECK(!capture.ok);
     CHECK_EQ(capture.error.code, std::string("acquisition_busy"));
-    f.runtime.end_laser_session();
     const auto shutdown = f.facade.dispatch(R"({"command":"shutdown"})");
     CHECK(shutdown.ok); CHECK(f.runtime.shutdown_requested());
+}
+CASE(device_diagnostics_reports_disabled_devices_and_rejects_bad_input); {
+    Fixture f("tmp_facade_device_diagnostics");
+    const auto read = f.facade.dispatch(R"({"command":"device_diagnostics"})");
+    CHECK(read.ok);
+    CHECK(!read.payload["rangefinder"]["opened"].as_bool(true));
+    CHECK(!read.payload["air_conditioner"]["opened"].as_bool(true));
+    CHECK(read.payload["laser"].is_object());
+    CHECK(read.payload["spectrometer_channels"].is_array());
+    const auto read_setpoints = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"read_air_conditioner_setpoints"}})");
+    CHECK(!read_setpoints.ok);
+    CHECK_EQ(read_setpoints.error.code, std::string("air_conditioner_not_open"));
+    CHECK(!f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"bad"}})").ok);
+    const auto missing = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"apply_air_conditioner"}})");
+    CHECK(!missing.ok);
+    CHECK_EQ(missing.error.code, std::string("diagnostics_setpoint_required"));
+    const auto apply = f.facade.dispatch(R"({"command":"device_diagnostics","args":{
+        "action":"apply_air_conditioner","setpoints":{"cooling_on_c":36,"cooling_off_c":29,
+        "heating_on_c":-10,"heating_off_c":10,"dehumidify_on_percent":80,"dehumidify_off_percent":65}}})");
+    CHECK(!apply.ok);
+    CHECK_EQ(apply.error.code, std::string("air_conditioner_not_open"));
 }
 CASE(prediction_routes_are_independent_of_device_readiness); {
     Fixture f("prediction_routes");

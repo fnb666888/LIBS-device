@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>固废筛查系统 · UI 演示</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="styles.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header class="app-header" id="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <p class="app-title">固废筛查系统</p>
+    </div>
+    <div class="status system-readiness">
+      <span>检测状态</span>
+      <span class="dot lamp-green" id="system-status" role="img" tabindex="0" aria-label="可检测" data-tooltip="可检测"></span>
+    </div>
+    <nav class="tabs primary-nav" aria-label="主页面">
+      <a href="#spectrum" data-page-link="spectrum">实时光谱</a>
+      <a href="#parameters" data-page-link="parameters">仪器参数</a>
+      <a href="#devices" data-page-link="devices">设备状态</a>
+    </nav>
+    <time class="hint clock" id="clock"></time>
+  </header>
+
+  <main>
+    <section id="page-spectrum" aria-label="实时光谱">
+      <p class="banner" id="measurement-message" role="status">模拟采集，可启停并导出光谱。</p>
+      <section class="card control-card" id="measurement-controls" aria-labelledby="control-title">
+        <h1 id="control-title">检测控制</h1>
+        <div class="actions">
+          <button type="button" id="start-measurement" class="primary">开始检测</button>
+          <button type="button" id="stop-measurement" class="danger" disabled>停止检测</button>
+          <span class="hint" id="gate-state" role="status">等待读取安全门禁</span>
+          <div class="scenario">
+            <label for="demo-scenario">演示场景</label>
+            <select id="demo-scenario">
+              <option value="ready">设备就绪</option>
+              <option value="standby">待就绪</option>
+              <option value="interlock">门禁告警</option>
+              <option value="offline">设备离线</option>
+            </select>
+          </div>
+        </div>
+      </section>
+      <div class="spectrum-layout">
+        <section class="card spectrum-card" id="spectrum-card" aria-labelledby="spectrum-title">
+          <h2 id="spectrum-title">实时光谱</h2>
+          <div class="spectrum-tools actions">
+            <label class="check"><input type="checkbox" id="auto-axis" checked>纵轴自动</label>
+            <label class="check"><input type="checkbox" id="lock-axis">锁定纵轴</label>
+            <label class="check"><input type="checkbox" id="pause-display">暂停刷新</label>
+            <button type="button" id="export-spectrum" disabled>导出数据</button>
+          </div>
+          <div class="plot" id="spectrum-plot">
+            <canvas id="spectrum-canvas" role="img" aria-label="模拟光谱，横轴为波长，纵轴为强度"></canvas>
+            <div class="plot-empty" id="plot-empty">
+              <strong>等待光谱数据</strong>
+              <span class="hint">开始测量后，各通道光谱将在此显示</span>
+            </div>
+          </div>
+          <div class="spectrum-footer">
+            <p class="hint" id="capture-note">等待采集 · 尚无光谱数据</p>
+            <div class="legend" id="spectrum-legend" hidden>
+              <span><i class="trace blue"></i>通道 1</span><span><i class="trace green"></i>通道 2</span><span><i class="trace amber"></i>通道 3</span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card prediction-card" id="prediction-card" aria-labelledby="prediction-title">
+          <h2 id="prediction-title">成分预测</h2>
+          <p class="hint">铁矿模型 · 质量分数 %</p>
+          <div class="prediction-controls">
+            <select id="prediction-branch" aria-label="铁矿模型">
+              <option value="">关闭预测</option><option value="oxide">氧化矿</option><option value="sulfide">硫化矿</option>
+            </select>
+            <button type="button" id="retry-prediction">重试</button>
+          </div>
+          <button type="button" id="import-spectrum" class="soft">导入 LIBS 光谱预测</button>
+          <input type="file" id="spectrum-file" accept=".csv,.txt,.json,.libs" hidden>
+          <p class="hint" id="prediction-note">选择矿石类型后启用实时预测。</p>
+          <dl class="prediction-values" id="prediction-values"></dl>
+          <p class="hint">演示结果为模拟数据。P 为元素磷。</p>
+        </section>
+      </div>
+      <section class="card capture-card" id="capture-summary" aria-labelledby="capture-title">
+        <h2 id="capture-title">设备状态与采集计数</h2>
+        <div class="capture-line">
+          <ul class="quick-status" id="quick-status" aria-label="五台设备状态"></ul>
+          <p class="hint counters" id="capture-counters">采集 0 / 失败 0 · 落盘 0 / 失败 0 · 积压 0</p>
+        </div>
+      </section>
+    </section>
+
+    <section id="page-parameters" class="parameters-layout" aria-label="仪器参数" hidden>
+      <form class="card parameter-card" id="laser-parameters" aria-labelledby="laser-parameter-title" novalidate></form>
+      <form class="card parameter-card" id="air-parameters" aria-labelledby="air-parameter-title" novalidate></form>
+      <form class="card parameter-card" id="spectrometer-parameters" aria-labelledby="spectrometer-parameter-title" novalidate></form>
+      <form class="card parameter-card" id="rangefinder-parameters" aria-labelledby="rangefinder-parameter-title" novalidate>
+        <h2 id="rangefinder-parameter-title">测距仪参数</h2>
+        <div class="tile-grid" id="rangefinder-rule-fields"></div>
+        <div class="range-result" id="rangefinder-preview">
+          <span class="status">模拟距离 <strong id="range-distance">—</strong></span>
+          <span class="status" id="range-material"><span class="dot" aria-hidden="true"></span><span>待判定</span></span>
+          <span class="status" id="range-window"><span class="dot" aria-hidden="true"></span><span>待判定</span></span>
+        </div>
+        <div class="parameter-footer">
+          <p class="hint" id="rangefinder-rule-note" role="status"></p>
+          <button type="submit" id="save-range-rules" class="primary" aria-label="保存测距仪参数">保存参数</button>
+        </div>
+      </form>
+      <form class="card parameter-card" id="indicator-parameters" aria-labelledby="indicator-parameter-title">
+        <div class="card-title">
+          <h2 id="indicator-parameter-title">状态灯参数</h2>
+          <span class="status" id="indicator-preview"><span class="dot warning" aria-hidden="true"></span><span>自动 · 黄灯</span></span>
+        </div>
+        <div class="tile-grid">
+          <div class="parameter-tile">
+            <label for="indicator-color">试灯颜色</label>
+            <select id="indicator-color" name="color">
+              <option value="red">红灯</option>
+              <option value="yellow">黄灯</option>
+              <option value="green">绿灯</option>
+              <option value="off">全灭</option>
+            </select>
+          </div>
+          <div class="parameter-tile">
+            <label for="indicator-pattern">显示方式</label>
+            <select id="indicator-pattern" name="pattern">
+              <option value="steady">常亮</option>
+              <option value="fast">快闪（2 Hz）</option>
+            </select>
+          </div>
+        </div>
+        <div class="parameter-footer">
+          <p class="hint" id="indicator-test-note" role="status"></p>
+          <div class="actions">
+            <button type="button" id="end-lamp-test" class="ghost" hidden>恢复自动</button>
+            <button type="button" id="start-lamp-test" class="ghost">模拟试灯</button>
+            <button type="submit" id="save-lamp-preset" class="primary" aria-label="保存状态灯试灯参数">保存参数</button>
+          </div>
+        </div>
+      </form>
+    </section>
+
+    <section id="page-devices" aria-label="设备状态" hidden>
+      <header class="device-toolbar actions">
+        <p class="hint" id="refresh-note" role="status">等待读取设备</p>
+        <button type="button" class="ghost" id="refresh-devices">刷新状态</button>
+      </header>
+      <div class="device-layout" id="device-cards"></div>
+    </section>
+  </main>
+</body>
+</html>

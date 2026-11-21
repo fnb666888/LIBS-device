@@ -27,24 +27,6 @@ json::Value to_json(const session::HealthReport& report) {
 
 json::Value Runtime::health_json() const { return business::app::to_json(devices_.health()); }
 
-// ── 出光会话记账（进程级资源互斥，不是业务逻辑）───────────────────────────
-
-bool Runtime::begin_laser_session() {
-    std::lock_guard<std::mutex> lock(laser_session_mutex_);
-    if (laser_session_active_) return false;
-    laser_session_active_ = true;
-    return true;
-}
-
-void Runtime::end_laser_session() noexcept {
-    std::lock_guard<std::mutex> lock(laser_session_mutex_);
-    laser_session_active_ = false;
-}
-
-bool Runtime::laser_session_active() const {
-    std::lock_guard<std::mutex> lock(laser_session_mutex_);
-    return laser_session_active_;
-}
 
 Runtime::Runtime() = default;
 
@@ -104,15 +86,8 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     // "读不到"如实返回 false —— **不假定安全**。
     monitor_ = std::make_unique<readiness::ReadinessMonitor>(
         [this](readiness::ReadinessFacts& facts) {
-            std::lock_guard<std::mutex> lock(device_mutex_);
-            libs::devices::Laser* laser = devices_.laser();
-            if (laser == nullptr) return false;
-            const libs::Result<libs::devices::LaserActual> actual = laser->readActual();
-            if (!actual) return false;
-            // 极性换算集中在 readiness::parse_actual 一处，
-            // 出光前复核与运行期重判都调它 —— 不允许两处各写一遍。
-            facts.laser = readiness::parse_actual(actual.value());
-            return true;
+            collect_gate_facts(facts);
+            return facts.laser.available;
         });
 
     // 配置事实（不是设备读数）在这里一次性注入。参数齐备与否是**启动时就能
@@ -124,7 +99,6 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     // 出光参数是否已标定，**按参数库实际内容算**，不再读 site.json 的 commissioned：
     // 参数管理页面填齐 9 个合法值即视为已标定。未标定 -> 判定拦截，一条写指令都不发。
     monitor_->set_laser_commissioned(parameters_service_.commissioned_from_store());
-    monitor_->set_spectrometer_ready(config_.spectrometer.enabled);
 
     // ── shared：数据交付 ────────────────────────────────────────────────
     local_sink_ = std::unique_ptr<data_delivery::DeliverySink>(
@@ -149,8 +123,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     }
     // 设备开了没有，是一个**事实**，交给判定去解释。
     monitor_->set_devices_opened(devices_.laser() != nullptr);
-    // Bind the indicator after opening devices; beforehand it is always null.
-    precheck_ = std::make_unique<readiness::PrecheckService>(*monitor_, devices_.indicator());
+    monitor_->set_spectrometer_ready(devices_.health().spectrometer.opened);
 
     // ── measurement：业务二 ─────────────────────────────────────────────
     //
@@ -159,8 +132,12 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     // 不随守护进程起来就自动出光（那就成了开机即打光）。
     writer_ = std::make_unique<measurement::Writer>(*local_sink_, config_.station_id);
     measurement_ = std::make_unique<measurement::MeasurementJob>(
-        devices_.laser(), devices_.spectrometer(), *monitor_, frame_bus_, *writer_, &acquisition_mutex_);
+        devices_.laser(), devices_.spectrometer(), *monitor_, frame_bus_, *writer_,
+        &acquisition_mutex_, &spectrometer_poll_mutex_);
     measurement_->set_log(log_.get());
+    measurement_->set_laser_source([this] { return devices_.laser(); });
+    measurement_->configure_gate_sampling(
+        [this] { sample_laser(); }, [this] { request_laser_sample(); });
     // 测量参数同样来自参数库 —— 与出光读同一份，
     // 否则采集的积分时间和出光参数各走各的。
     // 包成 lambda 而不是直接传结构体：MeasurementJob 每帧都要取一次参数，
@@ -173,10 +150,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     prediction_ = std::make_unique<measurement::prediction::Service>(frame_bus_, data_dir + "/predictions");
     prediction_->start();  // No devices or inference in the sampling loop.
 
-    // 开机就把灯刷到位：现场看到的第一眼必须是真实结论，不是"上一次的灯色"。
-    // 此时还没布防，状态停在 standby -> 黄灯。预检（precheck->run()）会
-    // arm() + evaluate() 并再刷一次。
-    sync_indicator();
+    start_device_monitoring();
 
     running_ = true;
     return libs::VoidResult();
@@ -184,6 +158,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
 
 libs::VoidResult Runtime::stop() {
     if (!running_) {
+        stop_device_monitoring();
         // start 中途失败也可能已经建出 measurement_（它是在 devices_.open()
         // 之后构造的）。它没跑起来，析构会兜底，但这里先 stop() 一次是零成本的，
         // 而且能把"设备还没关、作业已经不在了"这个顺序摆正。
@@ -194,10 +169,6 @@ libs::VoidResult Runtime::stop() {
         if (prediction_ != nullptr) {
             prediction_->stop();
             prediction_.reset();
-        }
-        if (precheck_ != nullptr) {
-            precheck_->force_offline();
-            precheck_.reset();
         }
         devices_.close();   // start 中途打开过也要关
         return libs::VoidResult();
@@ -222,10 +193,10 @@ libs::VoidResult Runtime::stop() {
                             : ("停止测量作业时收光未确认（现场需人工确认光闸）: " +
                                stopped.error().message));
     }
+    stop_device_monitoring();
     // The job destructor also stops the laser. Destroy it while its device
     // pointers are still valid, before DeviceSession releases those objects.
     measurement_.reset();
-    end_laser_session();
     if (prediction_ != nullptr) prediction_->stop();
     prediction_.reset();
 
@@ -235,22 +206,10 @@ libs::VoidResult Runtime::stop() {
     //
     // 退出路径要的是**全灭**，不是撤防后的 standby 黄灯 —— 软件都要关了，
     // 留一圈灯在假装系统还活着。
-    if (precheck_ != nullptr) precheck_->force_offline();
-    precheck_.reset();
     const libs::VoidResult closed = devices_.close();
     log_->write(logging::RecordKind::general,
                 closed ? "设备已关闭" : ("设备关闭报错: " + closed.error().message));
     return closed;
-}
-
-libs::VoidResult Runtime::sync_indicator() {
-    // 灯显示的是**判定结论**，而真正刷灯的实现在 PrecheckService ——
-    // 全库唯一的灯下发点。Runtime 只转发，不解释结论。
-    if (precheck_ == nullptr) {
-        return libs::Error::make(libs::ErrorKind::unsupported, "precheck_not_ready",
-                                 "预检服务未装配，无法刷新状态灯");
-    }
-    return precheck_->sync_lamp_only();
 }
 
 void Runtime::set_last_delivery(data_delivery::DeliveryStatus status) {

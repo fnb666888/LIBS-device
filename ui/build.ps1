@@ -67,6 +67,7 @@ $sources = @(
     "src/main.cpp",
     "src/main_window.cpp",
     "src/parameter_page.cpp",
+    "src/device_status_page.cpp",
   "src/spectrum_plot.cpp",
     "src/theme.cpp",
     "src/widgets.cpp",

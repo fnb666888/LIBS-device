@@ -22,8 +22,9 @@ MeasurementJob::MeasurementJob(libs::devices::Laser* laser,
                                libs::devices::Spectrometer* spectrometer,
                                readiness::ReadinessMonitor& readiness,
                                FrameQueue& frame_bus,
-                               Writer& writer, std::mutex* acquisition_mutex)
-    : acquisition_mutex_(acquisition_mutex), laser_(laser),
+                               Writer& writer, std::mutex* acquisition_mutex,
+                               std::mutex* spectrometer_poll_mutex)
+    : acquisition_mutex_(acquisition_mutex), spectrometer_poll_mutex_(spectrometer_poll_mutex), laser_(laser),
       spectrometer_(spectrometer),
       readiness_(readiness),
       frame_bus_(frame_bus),
@@ -49,12 +50,30 @@ void MeasurementJob::configure(const config::SiteConfig& site,
     measurement_provider_ = std::move(provider);
 }
 
+void MeasurementJob::configure_gate_sampling(std::function<void()> sample,
+                                             std::function<void()> phase_changed) {
+    sample_gate_inputs_ = std::move(sample);
+    gate_phase_changed_ = std::move(phase_changed);
+}
+
 libs::Result<MeasurementStartRecord> MeasurementJob::start(const FireParameters& params) {
     std::unique_lock<std::mutex> lifecycle(lifecycle_mutex_);
     if (running_.load())
         return libs::Error::make(libs::ErrorKind::device, "laser_already_running", "测量作业已在运行");
     if (worker_.joinable()) worker_.join();
+    if (stop_unconfirmed())
+        return libs::Error::make(libs::ErrorKind::device, "laser_stop_unconfirmed", "上次停机未确认，请先执行停止检测并核对结果");
+    if (laser_source_) laser_ = laser_source_();
     writer_.stop();
+    std::unique_lock<std::mutex> acquisition;
+    if (acquisition_mutex_) {
+        // Let an idle probe finish before acquiring the SDK for this job.
+        std::unique_lock<std::mutex> poll;
+        if (spectrometer_poll_mutex_) poll = std::unique_lock<std::mutex>(*spectrometer_poll_mutex_);
+        acquisition = std::unique_lock<std::mutex>(*acquisition_mutex_, std::try_to_lock);
+        if (!acquisition.owns_lock())
+            return libs::Error::make(libs::ErrorKind::device, "acquisition_busy", "光谱仪正在进行独立采集");
+    }
     if (laser_ == nullptr)
         return libs::Error::make(libs::ErrorKind::unsupported, "laser_not_open", "激光器未打开");
     std::function<SpectrumMeasurement()> provider;
@@ -65,7 +84,7 @@ libs::Result<MeasurementStartRecord> MeasurementJob::start(const FireParameters&
     if (!provider)
         return libs::Error::make(libs::ErrorKind::invalid_argument,
                                  "measurement_not_configured", "测量参数未配置");
-    const readiness::GateVerdict verdict = readiness_.evaluate_now();
+    const readiness::GateVerdict verdict = refresh_gate();
     if (!verdict.allowed)
         return libs::Error::make(libs::ErrorKind::device, "gate_blocked", "门禁未放行，未发出任何写指令：" + verdict.detail);
     SpectrumMeasurement initial = provider();
@@ -83,68 +102,102 @@ libs::Result<MeasurementStartRecord> MeasurementJob::start(const FireParameters&
         libs::devices::LaserOperationTrace trace;
     };
     const auto startup = std::make_shared<Startup>();
-    const auto prepared = laser_->prepareContinuous(to_device_settings(params.laser),
-                                                   params.laser.settle_timeout_ms, startup->trace);
-    if (!prepared) return prepared.error();
     stopping_.store(false);
     running_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stop_confirmation_.store(StopConfirmation::pending);
+        stop_error_ = {};
+        faulted_ = false;
+        gate_fault_ = false;
+        last_error_code_.clear();
+        last_error_message_.clear();
+    }
+    const auto prepared = laser_->prepareContinuous(to_device_settings(params.laser),
+                                                   params.laser.settle_timeout_ms, startup->trace);
+    if (!prepared) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            last_error_code_ = prepared.error().code;
+            last_error_message_ = prepared.error().message;
+        }
+        finish_stop(true);
+        return prepared.error();
+    }
+    if (acquisition.owns_lock()) acquisition.unlock();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         laser_frequency_hz_ = params.laser.frequency_hz;
         active_params_ = params;
         last_gate_check_ms_ = monotonic_ms();
     }
-    writer_.start();
-    worker_ = std::thread([this, startup, initial]() {
-        auto armed = [this, startup]() -> libs::VoidResult {
-            // Preparing the laser may take seconds; refresh interlocks before opening.
-            const auto verdict = readiness_.evaluate_now();
-            const auto opened = verdict.allowed
-                ? laser_->openQGate(startup->trace)
-                : libs::VoidResult(libs::Error::make(libs::ErrorKind::device,
-                    "gate_lost_during_startup", "布防完成后门禁未放行：" + verdict.detail));
-            {
-                std::lock_guard<std::mutex> lock(startup->mutex);
-                if (!opened) startup->error = opened.error();
-                startup->done = true;
-            }
-            startup->cv.notify_one();
-            return opened;
-        };
-        auto first = [this, startup](const SpectrumFrame& frame) {
-            std::lock_guard<std::mutex> lock(startup->mutex);
-            if (!startup->done) {
-                startup->error = libs::Error::make(libs::ErrorKind::device,
-                    frame.capture_error_code.empty() ? "capture_not_armed" : frame.capture_error_code,
-                    frame.capture_error_message.empty() ? "光谱仪未完成布防" : frame.capture_error_message);
-                startup->done = true;
-                stopping_.store(true);
+    try {
+        writer_.start();
+        worker_ = std::thread([this, startup, initial]() {
+            auto armed = [this, startup]() -> libs::VoidResult {
+                // Preparing the laser may take seconds; refresh interlocks before opening.
+                std::lock_guard<std::mutex> gate_lock(gate_mutex_);
+                if (sample_gate_inputs_) sample_gate_inputs_();
+                const auto verdict = readiness_.evaluate_now();
+                const auto opened = verdict.allowed
+                    ? laser_->openQGate(startup->trace)
+                    : libs::VoidResult(libs::Error::make(libs::ErrorKind::device,
+                        "gate_lost_during_startup", "布防完成后门禁未放行：" + verdict.detail));
+                emitting_ = opened.ok();
+                if (emitting_ && gate_phase_changed_) gate_phase_changed_();
+                {
+                    std::lock_guard<std::mutex> lock(startup->mutex);
+                    if (!opened) startup->error = opened.error();
+                    startup->done = true;
+                }
                 startup->cv.notify_one();
-            }
-            if (!startup->error.ok()) stopping_.store(true);
-        };
-        auto failed = [this, startup](const std::string& message) {
-            stopping_.store(true);
-            libs::devices::LaserOperationTrace stopped;
-            (void)laser_->stopContinuous(stopped);
-            running_.store(false);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                last_error_code_ = "measurement_worker_exception";
-                last_error_message_ = message;
-            }
+                return opened;
+            };
+            auto first = [this, startup](const SpectrumFrame& frame) {
+                std::lock_guard<std::mutex> lock(startup->mutex);
+                if (!startup->done) {
+                    startup->error = libs::Error::make(libs::ErrorKind::device,
+                        frame.capture_error_code.empty() ? "capture_not_armed" : frame.capture_error_code,
+                        frame.capture_error_message.empty() ? "光谱仪未完成布防" : frame.capture_error_message);
+                    startup->done = true;
+                    stopping_.store(true);
+                    startup->cv.notify_one();
+                }
+                if (!startup->error.ok()) stopping_.store(true);
+            };
+            auto failed = [this, startup](const std::string& message) {
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    last_error_code_ = "measurement_worker_exception";
+                    last_error_message_ = message;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(startup->mutex);
+                    startup->error = libs::Error::make(libs::ErrorKind::internal,
+                                                      "measurement_worker_exception", message);
+                    startup->done = true;
+                }
+            };
+            bool faulted = true;
+            try { faulted = loop(armed, first, initial); }
+            catch (const std::exception& e) { failed(e.what()); }
+            catch (...) { failed("测量线程发生未知异常"); }
             {
                 std::lock_guard<std::mutex> lock(startup->mutex);
-                startup->error = libs::Error::make(libs::ErrorKind::internal,
-                                                  "measurement_worker_exception", message);
-                startup->done = true;
+                if (!startup->done) {
+                    startup->error = libs::Error::make(libs::ErrorKind::device,
+                        "capture_not_armed", "首次采集激活前测量已结束");
+                    startup->done = true;
+                }
+                faulted = faulted || !startup->error.ok();
             }
+            finish_stop(faulted);
             startup->cv.notify_one();
-        };
-        try { loop(armed, first, initial); }
-        catch (const std::exception& e) { failed(e.what()); }
-        catch (...) { failed("测量线程发生未知异常"); }
-    });
+        });
+    } catch (const std::exception& e) {
+        finish_stop(true);
+        return libs::Error::make(libs::ErrorKind::internal, "measurement_thread_start", e.what());
+    }
     std::unique_lock<std::mutex> wait(startup->mutex);
     startup->cv.wait(wait, [&]() { return startup->done; });
     const auto error = startup->error;
@@ -154,12 +207,7 @@ libs::Result<MeasurementStartRecord> MeasurementJob::start(const FireParameters&
     record.discharge_counter_at_start = startup->trace.counter_before;
     wait.unlock();
     if (!error.ok()) {
-        stopping_.store(true);
-        libs::devices::LaserOperationTrace stopped;
-        (void)laser_->stopContinuous(stopped);
         if (worker_.joinable()) worker_.join();
-        writer_.stop();
-        running_.store(false);
         return error;
     }
     {
@@ -182,6 +230,13 @@ libs::Result<MeasurementStartRecord> MeasurementJob::start(const FireParameters&
 json::Value to_json(const MeasurementStatus& s) {
     json::Value v = json::object();
     v.set("running", json::Value(s.running));
+    const char* confirmation = "unknown";
+    if (s.stop_confirmation == StopConfirmation::pending) confirmation = "pending";
+    if (s.stop_confirmation == StopConfirmation::confirmed) confirmation = "confirmed";
+    if (s.stop_confirmation == StopConfirmation::unconfirmed) confirmation = "unconfirmed";
+    v.set("stop_confirmation", json::Value(confirmation));
+    v.set("stop_error", json::Value(s.stop_error));
+    v.set("faulted", json::Value(s.faulted));
     v.set("shots_captured", json::Value(static_cast<double>(s.shots_captured)));
     v.set("shots_failed", json::Value(static_cast<double>(s.shots_failed)));
     v.set("disk_writes_ok", json::Value(static_cast<double>(s.disk_writes_ok)));
@@ -197,64 +252,54 @@ json::Value to_json(const MeasurementStatus& s) {
 
 libs::VoidResult MeasurementJob::stop() {
     std::lock_guard<std::mutex> lifecycle(lifecycle_mutex_);
-    // Signal cooperative SDK polling cancellation, close the gate and stop the laser,
-    // then join the acquisition thread before closing any device handles.
+    const bool retry = !running() && stop_unconfirmed();
     stopping_.store(true);
+    if (worker_.joinable()) worker_.join();
+    frame_bus_.clear_pending();
+    if (laser_source_) laser_ = laser_source_();
+    if (laser_ == nullptr)
+        return libs::Error::make(libs::ErrorKind::unsupported, "laser_not_open", "激光器未打开，无法收光");
+    if (retry || stop_confirmation_.load() == StopConfirmation::unknown) finish_stop(false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stop_error_ ? libs::VoidResult(stop_error_) : libs::VoidResult();
+}
 
-    libs::devices::Laser* laser = nullptr;
+void MeasurementJob::finish_stop(bool faulted) {
+    stopping_.store(true);
+    libs::devices::LaserOperationTrace trace;
+    const auto stopped = [&] {
+        std::lock_guard<std::mutex> gate_lock(gate_mutex_);
+        const auto result = laser_->stopContinuous(trace);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_error_ = result.error();
+            stop_confirmation_.store(result ? StopConfirmation::confirmed : StopConfirmation::unconfirmed);
+        }
+        emitting_ = false;
+        return result;
+    }();
+    writer_.stop();
+    std::string reason;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        laser = laser_;
-    }
-    if (laser == nullptr) {
-        // 激光器没打开：收光这条命令**发不出去**，但线程仍然要收干净。
-        // 不能因为发不出收光指令就把落盘线程和采集线程晾在后台。
-        if (worker_.joinable()) worker_.join();
-        writer_.stop();
+        faulted = faulted || gate_fault_;
+        faulted_ = faulted || !stopped;
+        reason = last_error_code_;
         running_.store(false);
-        frame_bus_.clear_pending();
-        return libs::Error::make(libs::ErrorKind::unsupported, "laser_not_open",
-                                 "激光器未打开，无法收光");
     }
-
-    // 收光**无条件执行**：哪怕 start 从没成功过、哪怕中途哪一步失败，
-    // 都要尽力把光闸关掉。守护进程退出时也靠它。
-    libs::devices::LaserOperationTrace trace;
-    const libs::VoidResult stopped = laser->stopContinuous(trace);
-
-    // join：采集线程的 capture 超时返回后自然退出。
-    if (worker_.joinable()) worker_.join();
-    // 落盘线程：把队列里剩下的帧写完再退出。
-    writer_.stop();
-    running_.store(false);
-    frame_bus_.clear_pending();
-
-    if (stopped) {
-        log_record(logging::RecordKind::state_change, "测量作业已停止",
-                   [this, &trace]() {
-                       json::Value v = json::object();
-                       json::Value frames = json::array();
-                       for (const std::string& f : trace.sent_frames) {
-                           frames.push_back(json::Value(f));
-                       }
-                       v.set("sent_frames", json::Value(std::move(frames)));
-                       v.set("shots_captured",
-                             json::Value(static_cast<double>(shots_captured_.load())));
-                       v.set("shots_failed",
-                             json::Value(static_cast<double>(shots_failed_.load())));
-                       v.set("disk_writes_ok",
-                             json::Value(static_cast<double>(writer_.writes_ok())));
-                       v.set("disk_writes_failed",
-                             json::Value(static_cast<double>(writer_.writes_failed())));
-                       return v;
-                   });
-    }
-    return stopped;
+    if (gate_phase_changed_) gate_phase_changed_();
+    log_record(stopped ? logging::RecordKind::state_change : logging::RecordKind::exception_recovery,
+               stopped ? "测量已停止，停机回读确认" : "测量已结束，停机回读未确认", [&]() {
+        json::Value fields = json::object();
+        fields.set("stop_readback_confirmed", json::Value(stopped.ok()));
+        if (faulted) fields.set("error_code", json::Value(reason));
+        if (!stopped) fields.set("stop_error", json::Value(stopped.error().message));
+        return fields;
+    });
 }
 
 MeasurementStatus MeasurementJob::status() const {
     MeasurementStatus s;
-    s.running = running_.load();
     s.shots_captured = shots_captured_.load();
     s.shots_failed = shots_failed_.load();
     s.disk_writes_ok = writer_.writes_ok();
@@ -262,6 +307,10 @@ MeasurementStatus MeasurementJob::status() const {
     s.disk_backlog = writer_.backlog();
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        s.running = running_.load();
+        s.stop_confirmation = stop_confirmation_.load();
+        s.stop_error = stop_error_.message;
+        s.faulted = faulted_;
         s.last_error_code = last_error_code_;
         s.last_error_message = last_error_message_;
     }
@@ -277,7 +326,7 @@ MeasurementStatus MeasurementJob::status() const {
 
 // ── 采集循环 ───────────────────────────────────────────────────────────────
 
-void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
+bool MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
                           std::function<void(const SpectrumFrame&)> on_first,
                           SpectrumMeasurement initial) {
     bool first = true;
@@ -291,7 +340,7 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
         // 所以这里周期性重判。**判定的执行方和收光的执行方必须是同一个对象**：
         // 不能靠 UI（可能崩/被关/卡住），也不能靠互锁自己
         // （互锁是"事实变了"，它不负责"去把光关掉"）。
-        if (!recheck_gate(!first)) break;
+        if (!sample_gate_inputs_ && !refresh_gate(false).allowed) return true;
 
         const SpectrumFrame frame = capture_once(first ? on_armed : std::function<libs::VoidResult()>{},
                                                 first ? &initial : nullptr);
@@ -309,30 +358,12 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
                 code == "capture_parameters_invalid" || code == "spectrometer_disconnected" ||
                 code == "serial_not_found" || code == "serial_not_available" ||
                 code == "no_devices" || code == "spectrometer_not_open";
-            const bool abort = fatal || consecutive_failures >= 3;
-            if (abort) {
-                stopping_.store(true);
-                libs::devices::LaserOperationTrace trace;
-                const auto stopped = laser_->stopContinuous(trace);
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    last_error_message_ = frame.capture_error_message +
-                        (fatal ? "；设备或配置异常，已请求自动停止测量。" :
-                                 "；连续三次采集失败，已请求自动停止测量。");
-                    if (!stopped) last_error_message_ += " 停止回读失败：" + stopped.error().message;
+            if (fatal || consecutive_failures >= 3) {
+                if (sample_gate_inputs_ && spectrometer_reset_requested_.load()) {
+                    stopping_.store(true);
+                    on_device_status_changed();
                 }
-                running_.store(false);
-                log_record(logging::RecordKind::exception_recovery, "采集异常，自动停止测量",
-                    [&]() {
-                        json::Value v = json::object();
-                        v.set("error_code", json::Value(code));
-                        v.set("detail", json::Value(frame.capture_error_message));
-                        v.set("consecutive_failures", json::Value(static_cast<double>(consecutive_failures)));
-                        v.set("stop_readback_confirmed", json::Value(static_cast<bool>(stopped)));
-                        if (!stopped) v.set("stop_error", json::Value(stopped.error().message));
-                        return v;
-                    });
-                break;
+                return true;
             }
             log_record(logging::RecordKind::exception_recovery, "采集失败，等待重试",
                 [&]() {
@@ -355,61 +386,44 @@ void MeasurementJob::loop(std::function<libs::VoidResult()> on_armed,
         // 帧 → 落盘（异步队列，O(1)，不反压采集）
         writer_.enqueue(frame);
     }
+    return false;
 }
 
-bool MeasurementJob::recheck_gate(bool emitting) {
-    const std::uint64_t now = monotonic_ms();
+readiness::GateVerdict MeasurementJob::refresh_gate(bool force) {
+    std::lock_guard<std::mutex> gate_lock(gate_mutex_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (last_gate_check_ms_ != 0 &&
-            now - last_gate_check_ms_ < kGateRecheckIntervalMs) {
-            return true;   // 还没到周期，判一次太贵
-        }
-        last_gate_check_ms_ = now;
+        const auto now = static_cast<std::uint64_t>(monotonic_ms());
+        if (!force && last_gate_check_ms_ != 0 &&
+            now - last_gate_check_ms_ < kGateRecheckIntervalMs) return readiness_.latest();
     }
+    if (sample_gate_inputs_) sample_gate_inputs_();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_gate_check_ms_ = monotonic_ms();
+    }
+    return evaluate_gate_locked();
+}
 
-    // Preserve B2 facts. Opening Q is expected only after this job has armed
-    // the spectrometers and opened the gate; all other safety checks still apply.
-    const readiness::GateVerdict verdict = readiness_.evaluate_now(emitting
+void MeasurementJob::on_device_status_changed() {
+    std::lock_guard<std::mutex> gate_lock(gate_mutex_);
+    evaluate_gate_locked();
+}
+
+readiness::GateVerdict MeasurementJob::evaluate_gate_locked() {
+    const auto verdict = readiness_.evaluate_now(emitting_
         ? readiness::GateCheckPhase::during_emission
         : readiness::GateCheckPhase::before_emission);
-    if (verdict.allowed) return true;
-
-    // 中途失锁：**自己收光**。不等 UI，不等互锁，不等下一次 status 查询。
-    libs::devices::Laser* laser = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        laser = laser_;
-        last_error_code_ = "gate_lost_mid_run";
-        last_error_message_ = "运行期重判发现门禁已关闭，作业自行收光：" + verdict.detail;
+        if (emitting_ && !verdict.allowed && !stopping_.load()) {
+            gate_fault_ = true;
+            last_error_code_ = "gate_lost_mid_run";
+            last_error_message_ = "运行期门禁未放行：" + verdict.detail;
+            stopping_.store(true);
+        }
     }
-
-    libs::devices::LaserOperationTrace trace;
-    if (laser != nullptr) {
-        laser->stopContinuous(trace);
-    }
-    // 让循环自然结束：stopping_ 不由这里置，因为那会让 stop() 的收光命令
-    // 与线程退出互相踩。这里置它，让 loop() 走完这一轮就退出，
-    // stop() 随后照常 join 并再收一次光（幂等）。
-    stopping_.store(true);
-    // running_ 也要立即落下来，不能等 stop() 才落。光已经关了，
-    // 这时向 UI 报“正在测”就是撒谎：操作员会继续等待一个永远不来的帧，
-    // 而下一次 start() 还会被 laser_already_running 拒绝。
-    // 线程本身仍在退出途中，但从“还在采集”的角度看，它已经结束了。
-    running_.store(false);
-
-    log_record(logging::RecordKind::state_change, "运行期门禁关闭，已自行收光",
-               [this, &verdict]() {
-                   json::Value v = json::object();
-                   v.set("error_code", json::Value("gate_lost_mid_run"));
-                   v.set("detail", json::Value(verdict.detail));
-                   v.set("shots_captured",
-                         json::Value(static_cast<double>(shots_captured_.load())));
-                   v.set("shots_failed",
-                         json::Value(static_cast<double>(shots_failed_.load())));
-                   return v;
-               });
-    return false;
+    return verdict;
 }
 
 SpectrumFrame MeasurementJob::capture_once(const std::function<libs::VoidResult()>& on_armed,
@@ -478,6 +492,13 @@ SpectrumFrame MeasurementJob::capture_once(const std::function<libs::VoidResult(
     if (!result) {
         frame.capture_error_code = result.error().code;
         frame.capture_error_message = result.error().message;
+        if (frame.capture_error_code == "spectrometer_disconnected" ||
+            frame.capture_error_code == "no_devices" ||
+            frame.capture_error_code == "serial_not_found" ||
+            frame.capture_error_code == "serial_not_available") {
+            readiness_.set_spectrometer_ready(false);
+            spectrometer_reset_requested_.store(true);
+        }
         // Owner cancellation is the normal stop path, not a failed acquisition.
         // Keep any earlier real error; the loop discards this frame on stopping_.
         if (stopping_.load() && result.error().code == "capture_cancelled") return frame;

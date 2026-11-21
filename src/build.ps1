@@ -65,7 +65,6 @@ $layers = [ordered]@{
         "src/business/readiness/verdict.cpp",
         "src/business/readiness/lamp.cpp",
         "src/business/readiness/monitor.cpp",
-        "src/business/readiness/precheck.cpp",
         # measurement/：业务二，激光触发光谱检测。
         "src/business/measurement/frame.cpp",
         "src/business/measurement/frame_bus.cpp",
@@ -79,6 +78,7 @@ $layers = [ordered]@{
         # 因为它要引用 measurement::FireParameters / SpectrumMeasurement ——
         # 放 shared 会直接违反下面的依赖方向检查。
         "src/business/app/parameter_service.cpp",
+        "src/business/app/device_monitoring.cpp",
         "src/business/app/runtime.cpp",
         "src/business/app/facade.cpp")
 }

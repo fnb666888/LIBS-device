@@ -1,5 +1,6 @@
 #include "libs/business/shared/session/device_session.hpp"
 
+#include <algorithm>
 #include <sstream>
 #include <utility>
 
@@ -17,36 +18,33 @@ std::string describe(const libs::Error& e) {
     return os.str();
 }
 
-// 打开一个串口并把设备包起来。失败时只记录，不抛出——部分成功是允许的。
-template <class Make>
-bool open_serial_device(const config::SerialPortConfig& cfg, const char* name,
-                        std::vector<std::unique_ptr<libs::transport::Link>>& links,
-                        Make make, DeviceState& state) {
-    if (!cfg.enabled) {
-        state = DeviceState{false, false, "", "", std::string("配置未启用（enabled=false）")};
-        return false;
-    }
-
-    // configured 的含义是"配置里 enabled=true"，与打开成败无关。
-    // 漏掉这一行会让**打开成功**的设备在 health 里被报成"未启用"。
-    state = DeviceState{true, false, cfg.port, "", ""};
-
-    Result<std::unique_ptr<libs::transport::Link>> link =
-        libs::transport::open_serial(cfg.port, cfg.baud, cfg.parity, cfg.data_bits);
-    if (!link) {
-        // 设备打不开是现场事实，不是编程错误：记下来，如实上报。
-        state = DeviceState{true, false, cfg.port, "", std::string(name) + " 打开失败：" + describe(link.error())};
-        return false;
-    }
-
-    state.endpoint = link.value()->endpoint();
-    links.push_back(std::move(link.value()));
-    make(links.back().get());
-    state.opened = true;
-    return true;
-}
-
 }  // namespace
+
+template <class T, class Make>
+void DeviceSession::open_serial_device(const config::SerialPortConfig& cfg, const char* name,
+                                       std::unique_ptr<T>& device, DeviceState& state, Make make) {
+    DeviceState next;
+    if (!cfg.enabled) {
+        next.note = "配置未启用（enabled=false）";
+    } else {
+        next.configured = true;
+        next.endpoint = cfg.port;
+        auto link = libs::transport::open_serial(cfg.port, cfg.baud, cfg.parity, cfg.data_bits);
+        if (link) {
+            auto device_to_publish = make(*link.value());
+            next.opened = true;
+            next.endpoint = link.value()->endpoint();
+            std::lock_guard<std::mutex> lock(devices_mutex_);
+            links_.push_back(std::move(link.value()));
+            device = std::move(device_to_publish);
+            state = std::move(next);
+            return;
+        }
+        next.note = std::string(name) + " 打开失败：" + describe(link.error());
+    }
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    state = std::move(next);
+}
 
 DeviceSession::~DeviceSession() {
     // 兜底。正常路径是显式 close()；这里只保证不泄漏句柄。
@@ -68,67 +66,122 @@ VoidResult DeviceSession::open(const config::SiteConfig& config) {
 
     config_ = config;
 
-    open_serial_device(config_.laser, "激光器", links_,
-                       [&](libs::transport::Link* link) {
-                           laser_ = std::make_unique<libs::devices::Laser>(*link, config_.laser.timeout_ms);
-                       },
-                       laser_state_);
+    open_ = true;
+    for (auto device : {Device::laser, Device::indicator, Device::rangefinder,
+                        Device::air_conditioner, Device::spectrometer}) {
+        retry_open(device);
+    }
+    return libs::VoidResult();
+}
 
-    open_serial_device(config_.indicator, "状态灯", links_,
-                       [&](libs::transport::Link* link) {
-                           // 写命令需要相邻命令间隔；用配置里的 idle_ms 作为下限。
-                           const unsigned gap = config_.indicator.idle_ms < 50 ? 50 : config_.indicator.idle_ms;
-                           indicator_ = std::make_unique<libs::devices::Indicator>(
-                               *link, config_.indicator_address, config_.indicator_model,
-                               config_.indicator.timeout_ms, gap);
-                       },
-                       indicator_state_);
+void DeviceSession::retry_open(Device device) {
+    if (!open_) return;
+    switch (device) {
+        case Device::laser:
+            if (!laser()) open_serial_device(config_.laser, "激光器", laser_, laser_state_, [&](auto& link) {
+                return std::make_unique<libs::devices::Laser>(link, config_.laser.timeout_ms);
+            });
+            break;
+        case Device::indicator:
+            if (!indicator()) open_serial_device(config_.indicator, "状态灯", indicator_, indicator_state_, [&](auto& link) {
+                const unsigned gap = std::max(config_.indicator.idle_ms, 50u);
+                return std::make_unique<libs::devices::Indicator>(
+                    link, config_.indicator_address, config_.indicator_model, config_.indicator.timeout_ms, gap);
+            });
+            break;
+        case Device::rangefinder:
+            if (!rangefinder()) {
+                const auto& range = config_.rangefinder;
+                open_serial_device(range.serial, "测距仪", rangefinder_, rangefinder_state_, [&](auto& link) {
+                    return std::make_unique<libs::devices::Rangefinder>(link, range.address, range.serial.timeout_ms);
+                });
+            }
+            break;
+        case Device::air_conditioner:
+            if (!air_conditioner()) {
+                const auto& air = config_.air_conditioner;
+                open_serial_device(air.serial, "空调", air_conditioner_, air_conditioner_state_, [&](auto& link) {
+                    return std::make_unique<libs::devices::AirConditioner>(link, air.address, air.serial.timeout_ms);
+                });
+            }
+            break;
+        case Device::spectrometer:
+            if (!spectrometer()) open_spectrometer();
+            break;
+    }
+}
 
-    const auto& range = config_.rangefinder;
-    open_serial_device(range.serial, "测距仪", links_,
-                       [&](libs::transport::Link* link) {
-                           rangefinder_ = std::make_unique<libs::devices::Rangefinder>(
-                               *link, range.address, range.serial.timeout_ms);
-                       }, rangefinder_state_);
-    const auto& air = config_.air_conditioner;
-    open_serial_device(air.serial, "空调", links_,
-                       [&](libs::transport::Link* link) {
-                           air_conditioner_ = std::make_unique<libs::devices::AirConditioner>(
-                               *link, air.address, air.serial.timeout_ms);
-                       }, air_conditioner_state_);
-
-    // 光谱仪走厂商 DLL，不走串口。命名互斥体由驱动自己管。
+void DeviceSession::open_spectrometer() {
+    DeviceState state;
+    std::unique_ptr<libs::devices::Spectrometer> device;
+    std::vector<libs::devices::SpectrometerInfo> channels;
     if (!config_.spectrometer.enabled) {
-        spectrometer_state_ = DeviceState{false, false, "", "", "配置未启用（enabled=false）"};
+        state.note = "配置未启用（enabled=false）";
     } else {
-        Result<std::unique_ptr<libs::devices::Spectrometer>> spec =
-            libs::devices::Spectrometer::open(config_.spectrometer.sdk_dll);
-        if (!spec) {
-            spectrometer_state_ =
-                DeviceState{true, false, config_.spectrometer.sdk_dll, "",
-                            "光谱仪打开失败：" + describe(spec.error())};
+        state.configured = true;
+        state.endpoint = config_.spectrometer.sdk_dll;
+        auto opened = libs::devices::Spectrometer::open(state.endpoint);
+        if (!opened) {
+            state.note = "光谱仪打开失败：" + describe(opened.error());
         } else {
-            spectrometer_ = std::move(spec.value());
-            spectrometer_state_ = DeviceState{true, true, config_.spectrometer.sdk_dll, "", ""};
-
-            // 枚举通道。这是只读操作，不 prepare、不 measure、不改持久参数。
-            const Result<std::vector<libs::devices::SpectrometerInfo>> devices =
-                spectrometer_->probeChannels();
-            if (!devices) {
-                spectrometer_state_.opened = false;
-                spectrometer_state_.note = "光谱仪已打开但枚举失败：" + describe(devices.error());
-                spectrometer_.reset();
+            auto probed = opened.value()->probeChannels();
+            if (!probed) {
+                state.note = "光谱仪已打开但枚举失败：" + describe(probed.error());
             } else {
-                for (const libs::devices::SpectrometerInfo& d : devices.value()) {
-                    if (spectrometer_state_.model.empty()) spectrometer_state_.model = d.friendly_name;
+                channels = std::move(probed.value());
+                const auto usable = [](const auto& channel) { return channel.pixels_known; };
+                const auto first = std::find_if(channels.begin(), channels.end(), usable);
+                const auto& selected = config_.spectrometer.serials;
+                const bool selected_ready = std::all_of(selected.begin(), selected.end(), [&](const auto& serial) {
+                    return std::any_of(channels.begin(), channels.end(), [&](const auto& channel) {
+                        return channel.serial == serial && usable(channel);
+                    });
+                });
+                if (first == channels.end() || !selected_ready) {
+                    state.note = "没有可用或缺少已配置的光谱仪通道";
+                } else {
+                    state.opened = true;
+                    state.model = first->friendly_name;
                 }
             }
+            device = std::move(opened.value());
         }
     }
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    spectrometer_channels_ = std::move(channels);
+    spectrometer_state_ = std::move(state);
+    spectrometer_ = std::move(device);
+}
 
-    // 会话已建立（哪怕部分设备没开）。是否可继续工作由 health() 告诉调用方。
-    open_ = true;
-    return libs::VoidResult();
+libs::devices::Laser* DeviceSession::laser() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return laser_.get();
+}
+
+libs::devices::Indicator* DeviceSession::indicator() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return indicator_.get();
+}
+
+libs::devices::Spectrometer* DeviceSession::spectrometer() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return spectrometer_.get();
+}
+
+void DeviceSession::update_spectrometer_status(bool opened, std::string detail) {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    spectrometer_state_.opened = opened;
+    spectrometer_state_.note = std::move(detail);
+}
+
+libs::devices::Rangefinder* DeviceSession::rangefinder() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return rangefinder_.get();
+}
+
+libs::devices::AirConditioner* DeviceSession::air_conditioner() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return air_conditioner_.get();
 }
 
 VoidResult DeviceSession::close() {
@@ -146,6 +199,7 @@ VoidResult DeviceSession::close() {
     indicator_.reset();
     rangefinder_.reset();
     air_conditioner_.reset();
+    spectrometer_channels_.clear();
     links_.clear();
     for (auto* state : {&laser_state_, &indicator_state_, &spectrometer_state_,
                         &rangefinder_state_, &air_conditioner_state_}) {
@@ -164,6 +218,7 @@ VoidResult DeviceSession::close() {
 }
 
 HealthReport DeviceSession::health() const {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
     HealthReport report;
     report.laser = laser_state_;
     report.indicator = indicator_state_;
@@ -190,7 +245,7 @@ HealthReport DeviceSession::health() const {
     };
 
     account("激光器", laser_state_, true);
-    account("状态灯", indicator_state_, true);
+    account("状态灯", indicator_state_, false);
     account("光谱仪", spectrometer_state_, true);
     account("测距仪", rangefinder_state_, false);
     account("空调", air_conditioner_state_, false);

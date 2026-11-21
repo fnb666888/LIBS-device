@@ -285,6 +285,12 @@ TEST_MAIN_BEGIN_ARGV()
           const auto list = session.enumerate();   // 这一趟把三路都激活了
           CHECK(list);
           if (list) CHECK_EQ(list.value().size(), std::size_t(3));
+          const auto refreshed = session.probeChannels();
+          CHECK(refreshed);
+          if (refreshed) {
+              CHECK_EQ(refreshed.value().size(), std::size_t(3));
+              for (const auto& channel : refreshed.value()) CHECK(channel.pixels_known);
+          }
 
           auto request = test_request();
           request.serials = {"MASTER", "SLAVE1", "SLAVE2"};
@@ -295,6 +301,13 @@ TEST_MAIN_BEGIN_ARGV()
           // 关键断言：必须认得出这是自己的设备，而不是"被别人占着"。
           CHECK(result); if(!result) show("capture", result.error());
           if (result) CHECK_EQ(result.value().groups.size(), std::size_t(1));
+          CHECK(session.resetChannels());
+          const auto recovered = session.probeChannels();
+          CHECK(recovered);
+          if (recovered) {
+              CHECK_EQ(recovered.value().size(), std::size_t(3));
+              for (const auto& channel : recovered.value()) CHECK(channel.pixels_known);
+          }
           CHECK(session.close());
       }
       fake_reset(0);

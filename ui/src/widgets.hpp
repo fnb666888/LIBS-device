@@ -32,6 +32,7 @@ public:
     explicit StatusDot(QWidget* parent = nullptr);
 
     void set_state(Level level, const QString& text, const QString& detail = QString());
+    void set_indicator(Level level, const QString& status, const QString& detail = QString());
     void set_level(Level level);
     void set_text(const QString& text);
     void set_detail(const QString& detail);

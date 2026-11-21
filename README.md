@@ -200,7 +200,7 @@ D:\LIBS
 | `readiness/verdict.hpp` / `.cpp` | business/readiness | `evaluate()` 是**零设备 I/O 的纯函数**，可离线穷举。`GateVerdict` 不只过/不过，还要说明**为什么不过**。 |
 | `readiness/lamp.hpp` / `.cpp` | business/readiness | 状态->灯色**纯函数** + `apply_lamp()` **全库唯一灯下发点**。灯不反向参与判定；灯写失败不改变 verdict。 |
 | `readiness/monitor.hpp` / `.cpp` | business/readiness | 回答**何时判**。`FactSource` 用回调而非持设备指针。常驻线程接口先定死、暂不实现。 |
-| `readiness/precheck.hpp` / `.cpp` | business/readiness | **唯一**把门禁结论变成物理动作（写灯）的地方。预检与亮灯不拆成两个。`force_offline()` 只给关机路径用。 |
+| `app/device_monitoring.cpp` | business/app | 后台采集设备状态、刷新同一条安全门禁并同步状态灯。Qt 读取当前快照。 |
 
 #### measurement —— 业务二：激光触发光谱检测
 
@@ -505,7 +505,7 @@ air-conditioning/   空调协议 V2（RS485 / Modbus RTU 变体）
 | --- | --- |
 | **[docs/real-device-parameters-20260929.md](docs/real-device-parameters-20260929.md)** | **2026-09-29 真机参数记录：激光器 80A/200us/1Hz/Q延时 210us，光谱仪 1.28us 积分延时 / 1.05ms 积分时间** |
 | **[docs/architecture-report.md](docs/architecture-report.md)** | **架构报告：两进程三层全貌、逐文件职责、横切关注点、五条硬约束与设计判断** |
-| **[docs/ui-modification-plan.md](docs/ui-modification-plan.md)** | **UI 修改方案：收敛为「三按钮 + 实时光谱 + 设备状态条」主页面与独立参数页，并指出设备预检缺失的命令出口** |
+| **[docs/hardware-business-interface.md](docs/hardware-business-interface.md)** | 当前联调阶段的安全门禁、设备状态和硬件接口 |
 | [docs/business-layer-two-businesses-execution-plan.md](docs/business-layer-two-businesses-execution-plan.md) | 两条业务（readiness + measurement）的执行方案 |
 | [docs/business-layer-scope-report.md](docs/business-layer-scope-report.md) | 12 项能力的范围裁剪与 A/B/C 分级 |
 | [docs/device-layer-consolidation-implementation-report.md](docs/device-layer-consolidation-implementation-report.md) | 设备层收敛：单一控制器边界、迁移步骤、安全禁区、验收标准 |

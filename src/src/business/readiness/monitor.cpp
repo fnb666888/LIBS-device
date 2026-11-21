@@ -85,8 +85,8 @@ ReadinessFacts ReadinessMonitor::collect_facts() const {
         facts.spectrometer_ready = spectrometer_ready_;
     }
 
-    // ── 第二步：设备事实要真的去读 ──────────────────────────────────────
-    // 读不到就保持 available=false，判定会据此拦截（"不知道" != "安全"）。
+    // ── 第二步：读取已经发布的设备事实 ──────────────────────────────────
+    // 采样失败时 available=false，门禁据此拦截。
     if (source_) source_(facts);
     // **armed 只属于本类**：它是状态机的位置（按了布防 = 第一步），
     // 不是从设备里读出来的事实。事实源的签名是 bool(ReadinessFacts&)，
@@ -107,7 +107,8 @@ ReadinessFacts ReadinessMonitor::collect_facts() const {
 GateVerdict ReadinessMonitor::evaluate_now(GateCheckPhase phase) {
     const ReadinessFacts facts = collect_facts();
     const GateVerdict verdict = evaluate(facts, phase);
-    const MachineState state = state_of(facts, verdict);
+    const auto state = verdict.allowed && phase == GateCheckPhase::during_emission
+        ? MachineState::acquiring : state_of(facts, verdict);
     std::lock_guard<std::mutex> lock(mutex_);
     latest_ = verdict;
     latest_state_ = state;
@@ -115,19 +116,9 @@ GateVerdict ReadinessMonitor::evaluate_now(GateCheckPhase phase) {
     return verdict;
 }
 
-void ReadinessMonitor::start_continuous(unsigned interval_ms) {
-    // **接口先定死，实现以后补。**
-    //
-    // 线程逻辑（周期、异常处理、与业务的交互）依赖现场调试计划，
-    // 现在写等于凭空猜参数。但签名现在就摆在这里，意味着将来加线程时
-    // 调用方一个字都不用改 —— 这才是"不返工"的真实含义。
-    (void)interval_ms;
-    interval_ms_ = interval_ms;
-    continuous_.store(false);
-}
-
-void ReadinessMonitor::stop_continuous() {
-    continuous_.store(false);
+ReadinessMonitor::Snapshot ReadinessMonitor::snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {latest_, latest_state_, armed_, laser_readable_};
 }
 
 bool ReadinessMonitor::laser_readable() const {

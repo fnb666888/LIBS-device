@@ -662,9 +662,37 @@ CASE(disconnected_spectrometer_stops_after_one_failure); {
         CHECK_EQ(f.job->status().shots_captured, 1u);
         CHECK_EQ(f.job->status().shots_failed, 1u);
         CHECK_EQ(f.job->status().last_error_code, std::string(code));
+        CHECK(f.job->status().faulted);
+        CHECK(f.job->status().stop_confirmation == measurement::StopConfirmation::confirmed);
         CHECK(!f.link.work_state); CHECK(!f.link.q_gate_open);
+        f.job->set_capture_hook_for_test([] { return ok_capture(); });
+        CHECK(f.job->start(make_params()));
         CHECK(f.job->stop());
     }
+}
+CASE(automatic_stop_failure_is_exposed_and_blocks_restart_until_confirmed); {
+    Fixture f;
+    unsigned calls = 0;
+    f.job->set_capture_hook_for_test([&]() -> Result<libs::devices::CaptureResult> {
+        if (++calls == 1) return ok_capture();
+        f.link.fail_writes = true;
+        return Error::make(ErrorKind::device, "spectrometer_disconnected", "fake disconnect");
+    });
+    CHECK(f.job->start(make_params()));
+    CHECK(wait_for([&] { return !f.job->running(); }));
+    const auto status = f.job->status();
+    CHECK(status.faulted);
+    CHECK(status.stop_confirmation == measurement::StopConfirmation::unconfirmed);
+    CHECK(!status.stop_error.empty());
+    const auto blocked = f.job->start(make_params());
+    CHECK(!blocked);
+    if (!blocked) CHECK_EQ(blocked.error().code, std::string("laser_stop_unconfirmed"));
+    f.link.fail_writes = false;
+    CHECK(f.job->stop());
+    CHECK(f.job->status().stop_confirmation == measurement::StopConfirmation::confirmed);
+    f.job->set_capture_hook_for_test([] { return ok_capture(); });
+    CHECK(f.job->start(make_params()));
+    CHECK(f.job->stop());
 }
 CASE(repeated_immediate_capture_errors_are_bounded_and_stop_laser); {
     Fixture f;
@@ -1127,13 +1155,13 @@ CASE(sdk_channels_are_armed_before_laser_gate_opens); {
         }
     }
 }
-CASE(stop_cancels_pending_sdk_capture_without_waiting_for_ttl_timeout); {
+CASE(manual_stop_and_gate_loss_cancel_pending_sdk_capture_without_waiting_for_ttl); {
     const char* path = std::getenv("LIBS_FAKE_AVASPEC_DLL");
     if (path) {
         HMODULE module = LoadLibraryA(path);
         const auto reset = fake_export<void (*)(int)>(module, "FakeReset");
         CHECK(reset);
-        if (reset) {
+        if (reset) for (const bool gate_lost : {false, true}) {
             reset(4);
             {
                 Fixture f;
@@ -1146,14 +1174,29 @@ CASE(stop_cancels_pending_sdk_capture_without_waiting_for_ttl_timeout); {
                     f.job->bind_devices(f.laser.get(), spec.value().get());
                     f.job->set_capture_hook_for_test({});
                     auto params = make_params(); params.capture_timeout_ms = 1500;
+                    unsigned samples = 0;
+                    if (gate_lost) f.job->configure_gate_sampling([&] { ++samples; }, {});
                     CHECK(f.job->start(params));
                     const auto begin = std::chrono::steady_clock::now();
+                    if (gate_lost) {
+                        f.facts.laser.interlock_1 = false;
+                        const auto samples_before = samples;
+                        f.job->on_device_status_changed();
+                        CHECK_EQ(samples, samples_before);
+                        CHECK(!f.monitor->latest().allowed);
+                        while (f.job->running() &&
+                               std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(500)) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        }
+                        CHECK(!f.job->running());
+                    }
                     CHECK(f.job->stop());
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - begin).count();
                     CHECK(elapsed < 500);
                     CHECK(!f.link.q_gate_open); CHECK(!f.link.work_state);
-                    CHECK(f.job->status().last_error_code.empty());
+                    CHECK_EQ(f.job->status().last_error_code,
+                             std::string(gate_lost ? "gate_lost_mid_run" : ""));
                     CHECK_EQ(f.job->status().shots_failed, 0u);
                     CHECK(spec.value()->close());
                     f.job->bind_devices(f.laser.get(), nullptr);

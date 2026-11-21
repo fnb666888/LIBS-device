@@ -17,17 +17,18 @@
 //     Runtime 构造它并注入事实源（读激光 B2），但**从不自己解释结论**。
 //   * 出光只有一处：`measurement::MeasurementJob`。
 //     Runtime 不碰激光器写指令，只在 stop() 里调 job->stop() 收光。
-//   * 出光会话记账（`begin_laser_session`）是**进程级资源互斥**，
-//     不是业务逻辑 —— 它拦的只是"重复出光"，不仲裁设备。
 //
 // 依赖方向：`app -> {readiness, measurement} -> {shared, devices} -> libs`。
 // 反向没有任何引用。设备对象只由 session 持有，别处拿指针。
 
 #include <memory>
 #include <atomic>
+#include <array>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 #include "libs/business/app/parameter_service.hpp"
 #include "libs/business/measurement/frame_bus.hpp"
@@ -35,7 +36,6 @@
 #include "libs/business/measurement/prediction/service.hpp"
 #include "libs/business/measurement/writer.hpp"
 #include "libs/business/readiness/monitor.hpp"
-#include "libs/business/readiness/precheck.hpp"
 #include "libs/business/shared/config/parameter_store.hpp"
 #include "libs/business/shared/config/site_config.hpp"
 #include "libs/business/shared/data_delivery.hpp"
@@ -59,6 +59,7 @@ public:
         std::string captures_dir;                  // 空则用 data_dir/captures
         std::string recovery_dir;                  // 空则用 data_dir/recovery
         bool open_devices = true;                  // 离线演示/测试可关掉，只跑纯软件能力
+        std::string site_config_file;
     };
 
     Runtime();
@@ -81,14 +82,19 @@ public:
     //
     // **锁留在 Runtime**：串口互斥是**进程级**的，不属于任何一个业务。
     std::mutex& device_mutex() noexcept { return device_mutex_; }
+    std::mutex& auxiliary_device_mutex() noexcept { return auxiliary_device_mutex_; }
     std::mutex& acquisition_mutex() noexcept { return acquisition_mutex_; }
+    std::mutex& spectrometer_poll_mutex() noexcept { return spectrometer_poll_mutex_; }
     void request_shutdown() noexcept { shutdown_requested_.store(true); }
     bool shutdown_requested() const noexcept { return shutdown_requested_.load(); }
 
     const config::SiteConfig& config() const noexcept { return config_; }
+    const std::string& site_config_file() const noexcept { return options_.site_config_file; }
     session::DeviceSession& devices() noexcept { return devices_; }
     session::HealthReport health() const { return devices_.health(); }
     json::Value health_json() const;
+    json::Value device_readings() const;
+    json::Value indicator_status() const;
     config::ParameterStore* parameters() noexcept { return parameters_.get(); }
 
     // 业务一：就绪判定。**未构造（start 未跑）时返回 nullptr**，调用方必须判空。
@@ -98,9 +104,6 @@ public:
     // 再自己决定要不要开始" —— 那会让判定出现第二个执行点。
     readiness::ReadinessMonitor* monitor() noexcept { return monitor_.get(); }
     const readiness::ReadinessMonitor* monitor() const noexcept { return monitor_.get(); }
-
-    // 门禁结论 -> 状态灯。**全库唯一的灯下发点**。
-    readiness::PrecheckService* precheck() noexcept { return precheck_.get(); }
 
     // 业务二：测量作业。**唯一持有激光器 + 光谱仪的业务对象**。
     //
@@ -130,30 +133,10 @@ public:
     logging::RunLog& log() noexcept { return *log_; }
     logging::RecoveryContextStore& recovery() noexcept { return *recovery_; }
 
-    // ── 出光会话互斥（进程级资源记账）────────────────────────────────────
-    //
-    // **它是什么**：一个布尔 + 一把锁，回答"这台激光器当前有没有出光会话"。
-    // 原先需要它是因为有两条能发出光的路径；现在只剩 `measurement_start`
-    // 一条，但**记账仍然保留** —— 因为"重复出光"是必须拦的，
-    // 而这个拦截点应该独立于具体走哪条命令。
-    //
-    // **它不是什么**：不是设备仲裁。早年那次要仲裁（`AcquisitionLease`）
-    // 是因为同时存在两个采集者；现在物理上只有一个采集者。
-    //
-    // 调用方约定：**无论是哪条路径**，调用方应当原地拒绝，不要覆盖。
-    bool begin_laser_session();
-    void end_laser_session() noexcept;
-    bool laser_session_active() const;
+    // 查询统一测量作业状态。独立采集也遵守同一个占用状态。
+    bool laser_session_active() const { return measurement_ && measurement_->running(); }
     // 兼容字段：UI 的 status 面板读 laser_running。语义 = "是否有出光会话在进行"。
     bool laser_running() const { return laser_session_active(); }
-
-    // 按当前判定结论刷新一次状态灯。
-    //
-    // 灯显示的是判定结论，所以顺序是：先 evaluate 得状态 -> 再映射成灯色下发。
-    // 真正刷灯的实现在 PrecheckService —— 全库唯一的灯下发点。
-    //
-    // 灯写失败**不抛**、不改判定：状态灯是辅助指示，不是判据。
-    libs::VoidResult sync_indicator();
 
     ::business::data_delivery::DeliverySink& local_sink() noexcept { return *local_sink_; }
 
@@ -162,11 +145,28 @@ public:
     void set_last_delivery(data_delivery::DeliveryStatus status);
 
 private:
+    enum class AuxiliaryDevice { indicator, rangefinder, air_conditioner };
+    void start_device_monitoring();
+    void stop_device_monitoring();
+    void start_sampler(std::function<void()> sample, unsigned interval_ms);
+    void run_laser_sampler();
+    void request_laser_sample();
+    void sample_laser();
+    void collect_gate_facts(readiness::ReadinessFacts& facts);
+    void sample_indicator();
+    void sample_rangefinder();
+    void sample_air_conditioner();
+    void sample_spectrometer();
+    void publish_auxiliary(AuxiliaryDevice device, readiness::DeviceCondition condition,
+                           std::string detail, std::vector<std::string> warnings = {});
+
     bool running_ = false;
     config::SiteConfig config_;
     Options options_;
     std::mutex device_mutex_;
+    std::mutex auxiliary_device_mutex_;
     std::mutex acquisition_mutex_;
+    std::mutex spectrometer_poll_mutex_;
     std::atomic<bool> shutdown_requested_{false};
 
     // ── shared：共同底座 ────────────────────────────────────────────────
@@ -185,11 +185,20 @@ private:
 
     // ── readiness：业务一 ───────────────────────────────────────────────
     //
-    // monitor_ 与 precheck_ 延迟构造：它们的事实源要 devices_ 打开之后
-    // 才拿得到激光器句柄。事实源由 start() 装成一个闭包，
-    // **Runtime 不解释事实、也不解释结论** —— 它只负责把设备递进去。
     std::unique_ptr<readiness::ReadinessMonitor> monitor_;
-    std::unique_ptr<readiness::PrecheckService> precheck_;
+    mutable std::mutex readings_mutex_;
+    readiness::LaserSafetyFacts laser_safety_;
+    bool laser_opened_ = false;
+    json::Value readings_ = json::object();
+    json::Value indicator_status_;
+    std::optional<readiness::MachineState> applied_lamp_state_;
+    std::array<readiness::AuxiliaryDeviceFacts, 3> auxiliary_;
+    std::array<std::uint64_t, 3> auxiliary_fresh_until_ms_{};
+    std::mutex sampler_mutex_;
+    std::condition_variable sampler_wake_;
+    bool samplers_stopping_ = false;
+    bool laser_sample_requested_ = false;
+    std::vector<std::thread> samplers_;
 
     // ── measurement：业务二 ─────────────────────────────────────────────
     //
@@ -206,9 +215,6 @@ private:
 
     std::optional<data_delivery::DeliveryStatus> last_delivery_;
 
-    // 出光会话记账。见上面的 begin_laser_session() 说明。
-    mutable std::mutex laser_session_mutex_;
-    bool laser_session_active_ = false;
 };
 
 }  // namespace business::app

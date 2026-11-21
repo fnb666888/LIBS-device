@@ -55,16 +55,11 @@ int main(int argc, char** argv) {
         const QString size = qEnvironmentVariable("LIBS_UI_SHOT_SIZE");
         const auto dimensions = size.split(QLatin1Char('x'));
         if (dimensions.size() == 2) window.resize(dimensions[0].toInt(), dimensions[1].toInt());
-        if (page == QLatin1String("parameter") || page == QLatin1String("parameter_advanced")) {
-            // show_parameter_page() 是 private slot，走 invokeMethod 而不是
-            // 直接调用：加一个 public 的"给测试跳页"入口，等于把页面导航
-            // 的可变状态暴露给任何调用方。
-            QMetaObject::invokeMethod(&window, "show_parameter_page",
-                                      Qt::DirectConnection);
-            if (page == QLatin1String("parameter_advanced"))
-                for (auto* button : window.findChildren<QPushButton*>(QStringLiteral("advancedToggle")))
-                    button->setChecked(true);
-        }
+        if (page == QLatin1String("parameter") || page == QLatin1String("parameter_advanced") ||
+            page == QLatin1String("parameter_connections"))
+            QMetaObject::invokeMethod(&window, "show_parameter_page", Qt::DirectConnection);
+        if (page == QLatin1String("device_status"))
+            QMetaObject::invokeMethod(&window, "show_device_status_page", Qt::DirectConnection);
         int delay = qEnvironmentVariableIntValue("LIBS_UI_SHOT_DELAY_MS");
         if (delay <= 0) delay = 2500;   // 没设或设坏了都用 2.5s
         QTimer::singleShot(delay, [&window, &shot] {

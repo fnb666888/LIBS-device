@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             site = std::move(loaded.value());
+            options.site_config_file = config_path;
         } else {
             // 没给配置也能起，但会有一处被标注的行为缺失——如实告知，不静默兜底。
             std::fprintf(stderr,

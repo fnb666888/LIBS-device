@@ -12,11 +12,14 @@
 #include <QFile>
 #include <QFileDialog>
 #include <QHBoxLayout>
+#include <QIcon>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
 #include <QDir>
+#include <QPainter>
+#include <QPixmap>
 #include <QPointer>
 #include <QPushButton>
 #include <QStyle>
@@ -27,6 +30,7 @@
 #include <QVBoxLayout>
 
 #include "parameter_page.hpp"
+#include "device_status_page.hpp"
 #include "theme.hpp"
 #include "widgets.hpp"
 #include <cmath>
@@ -54,7 +58,8 @@ QString humanize_reason_impl(const QString& code) {
         {QStringLiteral("laser_unavailable"),     QStringLiteral("读不到激光器状态，按不安全处理")},
         {QStringLiteral("laser_fault"),           QStringLiteral("激光器报故障")},
         {QStringLiteral("over_temperature"),      QStringLiteral("激光器超温")},
-        {QStringLiteral("not_armed"),             QStringLiteral("门禁未布防，请先执行设备预检")},
+        {QStringLiteral("not_armed"),             QStringLiteral("门禁未布防")},
+        {QStringLiteral("not_enabled"),           QStringLiteral("测量设备未启用或未就绪")},
         {QStringLiteral("interlock_open"),        QStringLiteral("联锁断开")},
         {QStringLiteral("emergency_stopped"),     QStringLiteral("急停已触发")},
         {QStringLiteral("q_gate_open"),           QStringLiteral("光闸处于打开位置")},
@@ -67,24 +72,12 @@ QString humanize_reason_impl(const QString& code) {
     return it == kNames.constEnd() ? code : it.value();
 }
 
-QString humanize_state_impl(const QString& s) {
-    if (s == QLatin1String("offline"))  return QStringLiteral("设备离线");
-    if (s == QLatin1String("standby"))  return QStringLiteral("待机（未布防）");
-    if (s == QLatin1String("ready"))     return QStringLiteral("就绪");
-    if (s == QLatin1String("armed"))     return QStringLiteral("已布防");
-    if (s == QLatin1String("acquiring")) return QStringLiteral("采集中");
-    if (s == QLatin1String("fault"))     return QStringLiteral("故障");
-    if (s.isEmpty())                     return QStringLiteral("未知");
-    return s;
-}
-
 }  // namespace
 
 QString MainWindow::humanize_reason(const QString& code) { return humanize_reason_impl(code); }
-QString MainWindow::humanize_state(const QString& s) { return humanize_state_impl(s); }
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
-    setWindowTitle(QStringLiteral("LIBS 现场检测系统"));
+    setWindowTitle(QStringLiteral("固废筛查系统"));
     resize(1440, 900);
     setMinimumSize(1180, 720);
 
@@ -114,19 +107,35 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     banner_ = new QLabel(central);
     banner_->setWordWrap(true);
     banner_->setObjectName(QStringLiteral("banner"));
-    auto* banner_wrap = new QWidget(central);
-    auto* bw = new QVBoxLayout(banner_wrap);
+    banner_wrap_ = new QWidget(central);
+    auto* bw = new QVBoxLayout(banner_wrap_);
     bw->setContentsMargins(24, 14, 24, 0);
     bw->addWidget(banner_);
-    root->addWidget(banner_wrap);
+    root->addWidget(banner_wrap_);
     set_banner_default();
 
     pages_ = new QStackedWidget(central);
     param_page_ = new ParameterPage(pages_);
     connect(param_page_, &ParameterPage::save_requested, this, &MainWindow::on_param_save_requested);
     connect(param_page_, &ParameterPage::reload_requested, this, &MainWindow::on_param_reload_requested);
+    connect(param_page_, &ParameterPage::air_read_requested, this, &MainWindow::read_air_parameters);
+    connect(param_page_, &ParameterPage::air_apply_requested, this, [this](const QJsonObject& values) {
+        call_async(QStringLiteral("device_diagnostics"), {{"action", "apply_air_conditioner"}, {"setpoints", values}}, 85000,
+                   [this](const QJsonObject& payload, bool ok, const QString& error) {
+                       param_page_->show_air_result(payload, ok, error, true);
+                   });
+    });
+    connect(param_page_, &ParameterPage::range_read_requested, this, &MainWindow::refresh_device_status);
     pages_->addWidget(build_main_page());   // 0 = 主页面
     pages_->addWidget(param_page_);         // 1 = 参数页
+    device_status_page_ = new DeviceStatusPage(pages_);
+    pages_->addWidget(device_status_page_);
+    connect(device_status_page_->refresh_button(), &QPushButton::clicked, this, &MainWindow::refresh_device_status);
+    auto* device_refresh = new QTimer(this);
+    connect(device_refresh, &QTimer::timeout, this, [this] {
+        if (pages_->currentWidget() == device_status_page_) refresh_device_status();
+    });
+    device_refresh->start(4000);
     root->addWidget(pages_, 1);
 
     setCentralWidget(central);
@@ -158,39 +167,39 @@ void MainWindow::build_header(QVBoxLayout* root) {
     auto* h = new QHBoxLayout(header);
     h->setContentsMargins(24, 16, 24, 16);
     h->setSpacing(16);
-    auto* brand = new QLabel(QStringLiteral("LIBS"), header);
+    auto* brand = new QLabel(header);
     brand->setObjectName(QStringLiteral("brandMark"));
     brand->setAlignment(Qt::AlignCenter);
-    brand->setFixedSize(58, 48);
+    brand->setFixedSize(42, 42);
+    QPixmap mark(84, 84);
+    mark.setDevicePixelRatio(2);
+    mark.fill(Qt::transparent);
+    {
+        QPainter painter(&mark);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(theme::color::accent());
+        painter.drawRoundedRect(QRectF(0, 0, 42, 42), 10, 10);
+        painter.translate(9, 9);
+        painter.fillRect(1, 21, 22, 2, Qt::white);
+        const int heights[] = {8, 14, 21, 11, 16};
+        for (int i = 0; i < 5; ++i) painter.fillRect(1 + 5 * i, 22 - heights[i], 2, heights[i], Qt::white);
+    }
+    brand->setPixmap(mark);
+    setWindowIcon(QIcon(mark));
     h->addWidget(brand);
-    auto* brand_text = new QVBoxLayout;
-    brand_text->setSpacing(3);
-
-    title_ = new QLabel(QStringLiteral("LIBS 现场检测系统"), header);
-    title_->setObjectName(QStringLiteral("appTitle"));
-    // 标题优先级最高：设最小宽度，长详情再怎么长也不会把"LIBS 现场检测系统"挤没。
-    title_->setMinimumWidth(190);
-    brand_text->addWidget(title_);
-    auto* subtitle = new QLabel(QStringLiteral("激光诱导击穿光谱 · 测量工作台"), header);
-    subtitle->setObjectName(QStringLiteral("appSubtitle"));
-    brand_text->addWidget(subtitle);
-    h->addLayout(brand_text);
-
-    h->addSpacing(8);
-
-    daemon_dot_ = new StatusDot(header);
-    daemon_dot_->set_state(Level::Idle, QStringLiteral("服务未连接"));
-    h->addWidget(daemon_dot_);
-
-    gate_dot_ = new StatusDot(header);
-
-    // 顶栏宽度封顶的原因：现场屏只有 1536px，守护进程报错时那条详情（管道名 +
-    // Win32 错误码 + 提示）能把右侧按钮整排顶出可视区，用户就点不到「测量参数」。
-    // 两个点分开设：守护进程的错误详情长，门禁的短。
-    daemon_dot_->set_max_width(180);
-    gate_dot_->set_state(Level::Idle, QStringLiteral("门禁状态未知"));
-    h->addWidget(gate_dot_);
-    gate_dot_->set_max_width(230);
+    auto* title = new QLabel(QStringLiteral("固废筛查系统"), header);
+    title->setObjectName(QStringLiteral("appTitle"));
+    h->addWidget(title);
+    auto* readiness = new QHBoxLayout;
+    readiness->setSpacing(7);
+    auto* caption = new QLabel(QStringLiteral("检测状态"), header);
+    caption->setObjectName(QStringLiteral("dim"));
+    readiness->addWidget(caption);
+    readiness_dot_ = new StatusDot(header);
+    readiness_dot_->set_indicator(Level::Idle, QStringLiteral("等待读取状态"));
+    readiness->addWidget(readiness_dot_, 0, Qt::AlignVCenter);
+    h->addLayout(readiness);
 
     h->addStretch(1);
 
@@ -209,6 +218,11 @@ void MainWindow::build_header(QVBoxLayout* root) {
     connect(main_page_btn_, &QPushButton::clicked, this, &MainWindow::show_main_page);
     h->addWidget(main_page_btn_);
     h->addWidget(param_page_btn_);
+    device_status_btn_ = new QPushButton(QStringLiteral("设备状态"), header);
+    device_status_btn_->setObjectName(QStringLiteral("navTab"));
+    device_status_btn_->setCheckable(true);
+    connect(device_status_btn_, &QPushButton::clicked, this, &MainWindow::show_device_status_page);
+    h->addWidget(device_status_btn_);
 
     clock_ = new QLabel(header);
     clock_->setObjectName(QStringLiteral("appClock"));
@@ -252,24 +266,11 @@ QWidget* MainWindow::build_main_page() {
 
 void MainWindow::build_action_bar(QVBoxLayout* root) {
     auto* bar = new Card(QStringLiteral("检测控制"));
-    bar->set_hint(QStringLiteral("准备设备后开始测量，实时查看光谱和采集状态。"));
     auto* row = new QHBoxLayout;
     row->setSpacing(16);
     bar->body()->addLayout(row);
 
-    // ① 设备预检 —— 只读检测。一条激光写指令都不发。
-    //    它做的是：布防 -> 读一次激光状态 -> 判定 -> 按结论刷状态灯。
-    precheck_btn_ = new QPushButton(QStringLiteral("设备预检"), bar);
-    precheck_btn_->setObjectName(QStringLiteral("actionBtn"));
-    precheck_btn_->setMinimumSize(140, 48);
-    precheck_btn_->setToolTip(QStringLiteral(
-        "检查设备连接与激光器状态。\n"
-        "预检不会触发激光出光。"));
-    connect(precheck_btn_, &QPushButton::clicked, this, &MainWindow::on_precheck);
-    row->addWidget(precheck_btn_);
-
-    // ② 开始检测 —— 发 measurement_start。成功即已开光。
-    //    可用性**只**由 status.laser_running 决定（见 render_buttons）。
+    // 开始检测 —— 发 measurement_start。
     start_btn_ = new QPushButton(QStringLiteral("开始检测"), bar);
     start_btn_->setObjectName(QStringLiteral("startBig"));
     start_btn_->setMinimumSize(140, 48);
@@ -279,7 +280,7 @@ void MainWindow::build_action_bar(QVBoxLayout* root) {
     connect(start_btn_, &QPushButton::clicked, this, &MainWindow::on_start_detection);
     row->addWidget(start_btn_);
 
-    // ③ 停止检测 —— 发 measurement_stop。不做确认弹窗。
+    // 停止检测 —— 发 measurement_stop。
     stop_btn_ = new QPushButton(QStringLiteral("停止检测"), bar);
     stop_btn_->setObjectName(QStringLiteral("stopBig"));
     stop_btn_->setMinimumSize(140, 48);
@@ -288,14 +289,17 @@ void MainWindow::build_action_bar(QVBoxLayout* root) {
     connect(stop_btn_, &QPushButton::clicked, this, &MainWindow::on_stop_detection);
     row->addWidget(stop_btn_);
 
+    gate_status_ = new StatusDot(bar);
+    gate_status_->set_max_width(460);
+    gate_status_->set_state(Level::Idle, QStringLiteral("等待读取安全门禁"));
+    row->addWidget(gate_status_);
     row->addStretch(1);
     root->addWidget(bar);
+    render_buttons(MachineSnapshot{});
 }
 
 void MainWindow::build_chart(QVBoxLayout* root) {
     auto* card = new Card(QStringLiteral("实时光谱"));
-    card->set_hint(QStringLiteral(
-        "各通道按独立颜色显示，支持纵轴调整、暂停显示与原始数据导出。"));
 
     auto* tools = new QHBoxLayout;
     auto_y_ = new QCheckBox(QStringLiteral("纵轴自动"), card);
@@ -556,46 +560,37 @@ void MainWindow::render_prediction(const QJsonObject& status) {
 void MainWindow::build_device_bar(QVBoxLayout* root) {
     auto* card = new Card(QStringLiteral("设备状态与采集计数"));
     auto* row = new QHBoxLayout;
-    row->setSpacing(28);
+    row->setSpacing(20);
     card->body()->addLayout(row);
 
-    // 设备就是三台。**不再给测距仪和空调留位置** ——
-    // DeviceSession::health() 已经不账户它们，界面上那两格只会
-    // 常年显示"未配置"，让人以为那台机器坏了。
-    laser_dot_ = new StatusDot(card);
-    laser_dot_->set_state(Level::Idle, QStringLiteral("激光器 · 未知"));
-    row->addWidget(laser_dot_);
-
-    indicator_dot_ = new StatusDot(card);
-    indicator_dot_->set_state(Level::Idle, QStringLiteral("状态灯 · 未知"));
-    row->addWidget(indicator_dot_);
-
-    spectrometer_dot_ = new StatusDot(card);
-    spectrometer_dot_->set_state(Level::Idle, QStringLiteral("光谱仪 · 未知"));
-    row->addWidget(spectrometer_dot_);
-
-    row->addStretch(1);
-
+    const struct { StatusDot** dot; const char* name; } devices[] = {
+        {&laser_dot_, "激光器"}, {&spectrometer_dot_, "光谱仪"}, {&indicator_dot_, "三色状态灯"},
+        {&rangefinder_dot_, "测距仪"}, {&air_dot_, "空调"},
+    };
+    for (const auto& device : devices) {
+        auto* status = new QWidget(card);
+        status->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Preferred);
+        auto* item = new QHBoxLayout(status);
+        item->setContentsMargins(0, 0, 0, 0);
+        item->setSpacing(7);
+        auto* label = new QLabel(QString::fromUtf8(device.name), status);
+        label->setObjectName(QStringLiteral("dim"));
+        item->addWidget(label);
+        *device.dot = new StatusDot(status);
+        (*device.dot)->set_indicator(Level::Idle, QStringLiteral("未知"));
+        item->addWidget(*device.dot, 0, Qt::AlignVCenter);
+        row->addWidget(status);
+    }
+    row->addStretch();
     measurement_label_ = make_hint(QStringLiteral("采集计数 · 未知"));
     measurement_label_->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     row->addWidget(measurement_label_);
-
     root->addWidget(card);
-}
-
-// ── 渲染 ────────────────────────────────────────────────────────────────
-
-Level MainWindow::level_for_state(const MachineSnapshot& s) {
-    // "不知道"绝不能落到 Ok。把未知放在最前面判，是为了防止将来有人
-    // 在函数末尾加分支时把默认值排到 Ok 那一侧。
-    if (!s.error.isEmpty()) return Level::Danger;
-    if (!s.valid) return Level::Idle;
-    if (s.gate.known && !s.gate.allowed) return Level::Danger;
-    return Level::Ok;
 }
 
 void MainWindow::set_banner(const QString& text, Level level) {
     if (!banner_) return;
+    banner_wrap_->show();
     // 用 objectName 选样式，而不是逐次 setStyleSheet：后者会把内联样式
     // 钉死在控件上，改主题时它不跟着变（theme.cpp 的纪律）。
     const char* name = "bannerIdle";
@@ -613,88 +608,84 @@ void MainWindow::set_banner(const QString& text, Level level) {
 }
 
 void MainWindow::set_banner_default() {
+    if (pages_ && pages_->currentIndex() != 0) {
+        banner_wrap_->hide();
+        return;
+    }
     set_banner(QString::fromUtf8(kDisclaimer), Level::Idle);
 }
 
 void MainWindow::render_snapshot(const MachineSnapshot& s) {
-    // 顶栏：守护进程连通性。
     if (!s.error.isEmpty()) {
-        daemon_dot_->set_state(Level::Danger, QStringLiteral("服务未连接"), s.error);
-        set_banner(QStringLiteral("服务未连接，当前显示上一次读取的数据。\n%1")
-                       .arg(s.error),
-                   Level::Danger);
+        set_banner(QStringLiteral("服务未连接，当前显示上一次读取的数据。\n%1").arg(s.error), Level::Danger);
     } else if (s.valid) {
-        daemon_dot_->set_state(Level::Ok, QStringLiteral("服务已连接"));
-        set_banner_default();
-    } else {
-        daemon_dot_->set_state(Level::Idle, QStringLiteral("尚未取到状态"));
+        if (s.stop_confirmation == QLatin1String("unconfirmed"))
+            set_banner(QStringLiteral("停机未确认。请现场核对设备状态。%1").arg(s.stop_error), Level::Danger);
+        else if (!s.laser_running && s.measurement_faulted)
+            set_banner(QStringLiteral("测量因故障结束：%1").arg(s.measurement_error_message), Level::Warn);
+        else set_banner_default();
     }
 
     render_gate(s);
     render_devices(s);
     render_measurement(s);
     render_buttons(s);
-    // Prediction has its own fast cached-status poller. An older machine
-    // snapshot must not overwrite a newer prediction result.
-
     if (param_page_) param_page_->apply_snapshot(s);
+    if (device_status_page_) device_status_page_->apply_status(s);
 }
 
 void MainWindow::render_gate(const MachineSnapshot& s) {
-    const GateState& g = s.gate;
-    if (!g.known) {
-        gate_dot_->set_state(Level::Idle, QStringLiteral("门禁状态未知"),
-                             QStringLiteral("status 未返回 gate，可能是守护进程刚启动"));
-        return;
-    }
-    // detail 优先用后端给的中文说明；没有就把 blocked_by 逐条翻成人话。
-    QString why = g.detail;
-    if (why.isEmpty() && !g.blocked_by.isEmpty()) {
-        QStringList parts;
-        for (const QString& code : g.blocked_by) parts << humanize_reason(code);
-        why = parts.join(QStringLiteral("；"));
-    }
-    if (g.allowed) {
-        gate_dot_->set_state(Level::Ok,
-                             QStringLiteral("门禁允许出光（%1）").arg(humanize_state(g.state)),
-                             why);
+    const auto& gate = s.gate;
+    const auto warnings = gate.warnings.isEmpty() ? QString{} :
+        QStringLiteral("辅助设备告警 %1").arg(gate.warnings.join(QStringLiteral("；")));
+    QString label;
+    QString detail;
+    Level level = Level::Idle;
+    if (!s.valid || !gate.known) {
+        label = s.error.isEmpty() ? QStringLiteral("等待读取安全门禁") : QStringLiteral("服务未连接");
+        detail = s.error;
+    } else if (s.stop_confirmation == QLatin1String("unconfirmed")) {
+        label = QStringLiteral("停机未确认");
+        detail = s.stop_error;
+        level = Level::Danger;
+    } else if (gate.allowed) {
+        const bool active = s.laser_running || s.measurement_running;
+        label = active ? QStringLiteral("检测中") : QStringLiteral("可检测");
+        detail = warnings;
+        level = detail.isEmpty() ? Level::Ok : Level::Warn;
     } else {
-        // 不放行就是"现在点了开始也会被业务层拒绝"。如实说，
-        // 但**不把开始按钮禁用掉** —— 按钮可用性只由 laser_running 决定，
-        // 那是 render_buttons 的唯一职责，界面不在这里做安全判定。
-        gate_dot_->set_state(Level::Danger,
-                             QStringLiteral("门禁不放行（%1）").arg(humanize_state(g.state)),
-                             why);
+        label = s.laser_running ? QStringLiteral("门禁已撤销放行，正在停机") : QStringLiteral("不可检测");
+        QStringList reasons;
+        for (const auto& code : gate.blocked_by) reasons << humanize_reason(code);
+        detail = reasons.isEmpty() ? gate.detail : reasons.join(QStringLiteral("；"));
+        if (!warnings.isEmpty()) detail += QStringLiteral(" · %1").arg(warnings);
+        level = s.laser_running || gate.state == QLatin1String("fault") ? Level::Danger : Level::Warn;
     }
+    gate_status_->set_state(level, label, detail);
+    readiness_dot_->set_indicator(level, label, detail);
 }
 
 void MainWindow::render_devices(const MachineSnapshot& s) {
-    struct Slot { StatusDot* dot; const char* key; const char* fallback; };
-    const Slot entries[] = {
-        {laser_dot_,       "laser",       "激光器"},
-        {indicator_dot_,   "indicator",   "状态灯"},
-        {spectrometer_dot_,"spectrometer","光谱仪"},
+    const struct { StatusDot* dot; const char* key; } devices[] = {
+        {laser_dot_, "laser"}, {spectrometer_dot_, "spectrometer"}, {indicator_dot_, "indicator"},
+        {rangefinder_dot_, "rangefinder"}, {air_dot_, "air_conditioner"},
     };
-    for (const Slot& sl : entries) {
-        const QString key = QString::fromLatin1(sl.key);
-        const DeviceHealth* d = s.device(key);
-        if (d == nullptr) {
-            // 守护进程没给这台设备的信息：**未知**，不是"坏了"。
-            // fallback 是中文裸字面量，必须按 UTF-8 解码。这条分支只在守护进程
-            // 没返回该设备时走（daemon 未启动那一刻），所以"打开后乱码消失"正是
-            // 因为那时改走了 d->name。用 fromLatin1 会在这里漏出乱码。
-            sl.dot->set_state(Level::Idle, QStringLiteral("%1 · 未知").arg(QString::fromUtf8(sl.fallback)));
-            continue;
-        }
-        if (!d->configured) {
-            sl.dot->set_state(Level::Idle, QStringLiteral("%1 · 未配置").arg(d->name),
-                              QStringLiteral("未启用此设备"));
-        } else if (d->opened) {
-            sl.dot->set_state(Level::Ok, QStringLiteral("%1 · 已打开").arg(d->name), d->endpoint);
+    for (const auto& device : devices) {
+        const auto key = QLatin1String(device.key);
+        const auto* health = s.valid ? s.device(key) : nullptr;
+        if (!health) {
+            device.dot->set_indicator(Level::Idle, QStringLiteral("状态未知"), s.error);
+        } else if (!health->configured) {
+            device.dot->set_indicator(Level::Idle, QStringLiteral("未启用"));
+        } else if (!health->opened) {
+            device.dot->set_indicator(Level::Danger, QStringLiteral("打开失败"),
+                                       health->note.isEmpty() ? health->endpoint : health->note);
+        } else if (key == QLatin1String("laser") && s.gate.state == QLatin1String("fault")) {
+            device.dot->set_indicator(Level::Danger, QStringLiteral("联锁或设备告警"), s.gate.detail);
+        } else if (key == QLatin1String("indicator") && !s.lamp_error.isEmpty()) {
+            device.dot->set_indicator(Level::Warn, QStringLiteral("灯态未确认"), s.lamp_error);
         } else {
-            // configured=true 却没打开 —— 这是**真故障**，不能和"未配置"同色。
-            sl.dot->set_state(Level::Danger, QStringLiteral("%1 · 打开失败").arg(d->name),
-                              d->note.isEmpty() ? d->endpoint : d->note);
+            device.dot->set_indicator(Level::Ok, QStringLiteral("已打开"), health->endpoint);
         }
     }
 }
@@ -712,6 +703,10 @@ void MainWindow::render_measurement(const MachineSnapshot& s) {
                        .arg(s.disk_writes_ok).arg(s.disk_writes_failed)
                        .arg(s.disk_backlog);
     if (s.measurement_running) text += QStringLiteral(" · 作业运行中");
+    if (s.stop_confirmation == QLatin1String("confirmed") && !s.laser_running)
+        text += QStringLiteral(" · 停机已确认");
+    if (s.stop_confirmation == QLatin1String("unconfirmed"))
+        text += QStringLiteral(" · 停机未确认");
     measurement_label_->setText(text);
 
     QString tip = QStringLiteral(
@@ -724,6 +719,7 @@ void MainWindow::render_measurement(const MachineSnapshot& s) {
         tip += QStringLiteral("\n最近一次错误：%1 %2")
                    .arg(s.measurement_error_code, s.measurement_error_message);
     }
+    if (!s.stop_error.isEmpty()) tip += QStringLiteral("\n停机回读：%1").arg(s.stop_error);
     measurement_label_->setToolTip(tip);
 }
 
@@ -770,23 +766,12 @@ void MainWindow::render_frame_info(const FrameData& f) {
 }
 
 void MainWindow::render_buttons(const MachineSnapshot& s) {
-    // 按钮可用性**只有这一个来源**：后端 status。
-    //
-    //   设备预检   已连接
-    //   开始检测   已连接 且 未在出光
-    //   停止检测   已连接 且 正在出光
-    //
-    // 特意**不**把 gate.allowed 掺进来：那是安全判定，判定权在
-    // MeasurementJob::start()。界面一预先拦，界面上那颗绿灯/红灯就
-    // 变成了第二个判定源，而后端加规则时界面不会跟着变。
     const bool connected = s.valid && s.error.isEmpty();
+    const bool unconfirmed = s.stop_confirmation == QLatin1String("unconfirmed");
 
-    if (precheck_btn_) {
-        precheck_btn_->setEnabled(connected && !command_in_flight_);
-    }
     if (start_btn_) {
-        start_btn_->setEnabled(connected && !command_in_flight_ && !s.laser_running);
-        start_btn_->setToolTip(s.laser_running
+        start_btn_->setEnabled(connected && s.gate.allowed && !command_in_flight_ && !s.laser_running && !unconfirmed);
+        start_btn_->setToolTip(unconfirmed ? QStringLiteral("停机未确认，请重新执行停止检测并核对结果。") : s.laser_running
                                    ? QStringLiteral("激光正在出光。先点「停止检测」再重新开始。")
                                    : QStringLiteral(
                                          "启动激光触发光谱采集，持续显示并保存数据。\n"
@@ -794,8 +779,8 @@ void MainWindow::render_buttons(const MachineSnapshot& s) {
                                          "条件不满足时业务层一条写指令都不会发。"));
     }
     if (stop_btn_) {
-        stop_btn_->setEnabled(connected && !command_in_flight_ && s.laser_running);
-        stop_btn_->setToolTip(s.laser_running
+        stop_btn_->setEnabled(connected && !command_in_flight_ && (s.laser_running || unconfirmed));
+        stop_btn_->setToolTip(unconfirmed ? QStringLiteral("重新请求停机并读取确认。") : s.laser_running
                                   ? QStringLiteral(
                                         "停止测量：把剩余帧写完再返回，然后确认激光已关断。\n"
                                         "停止是安全方向的动作，不做二次确认。")
@@ -931,7 +916,7 @@ void MainWindow::call_async(const QString& command, const QJsonObject& args, int
     // 工作线程里**只**做管道往返 + JSON 解析，一个 QWidget 都不碰。
     // 结果用 queued invokeMethod 送回 UI 线程再回调。
     //
-    // 为什么不直接在 UI 线程里同步发：status/precheck/param_set 都要过
+    // 为什么不直接在 UI 线程里同步发：status/param_set 都要过
     // 守护进程的 device_mutex，一次往返的耗时**取决于现场设备有多慢**。
     // 锁着界面等串口是工控现场最烦人的一种卡顿。
     //
@@ -961,49 +946,33 @@ void MainWindow::call_async(const QString& command, const QJsonObject& args, int
     worker->start();
 }
 
-void MainWindow::on_precheck() {
-    if (command_in_flight_) return;
-    command_in_flight_ = true;
-    if (state_poller_) render_buttons(state_poller_->snapshot());
-    set_banner(QStringLiteral("正在执行设备预检……（只读检测，不会出光）"), Level::Warn);
-
-    call_async(QStringLiteral("precheck"), QJsonObject(), 20000,
-               [this](const QJsonObject& payload, bool ok, const QString& message) {
-                   on_precheck_result(payload, ok, message);
+void MainWindow::refresh_device_status() {
+    if (!device_status_page_ || device_status_reading_) return;
+    device_status_reading_ = true;
+    device_status_page_->set_reading_pending(true);
+    call_async(QStringLiteral("device_diagnostics"), {}, 55000,
+               [this](const QJsonObject& payload, bool ok, const QString& error) {
+                   device_status_reading_ = false;
+                   device_status_page_->set_reading_pending(false);
+                   device_status_page_->apply_readings(ok ? payload : QJsonObject{}, ok ? QString{} : error);
+                   param_page_->apply_range_reading(ok ? payload.value("rangefinder").toObject()
+                                                       : QJsonObject{{"error", error}});
+                   if (air_read_queued_) {
+                       air_read_queued_ = false;
+                       read_air_parameters();
+                   }
                });
 }
 
-void MainWindow::on_precheck_result(const QJsonObject& payload, bool ok, const QString& message) {
-    command_in_flight_ = false;
-
-    // 失败时报告挂在 payload.report 下（后端 failure_with_payload 的约定），
-    // 成功时报告就是 payload 本身。两种形态都要读得到结论。
-    QJsonObject report = payload.value(QStringLiteral("report")).toObject();
-    if (report.isEmpty()) report = payload;
-
-    QStringList reasons;
-    const QJsonArray blocked = report.value(QStringLiteral("blocked_by")).toArray();
-    for (const QJsonValue& v : blocked) reasons << humanize_reason(v.toString());
-    const QString detail = report.value(QStringLiteral("detail")).toString();
-    const bool laser_readable = report.value(QStringLiteral("laser_readable")).toBool(true);
-    const QString state = humanize_state(report.value(QStringLiteral("state")).toString());
-
-    if (ok) {
-        QString text = QStringLiteral("设备预检通过（%1）。%2").arg(state, detail);
-        if (!reasons.isEmpty()) text += QStringLiteral("\n提示：%1").arg(reasons.join(QStringLiteral("；")));
-        set_banner(text, Level::Ok);
-    } else {
-        QString text = QStringLiteral("设备预检未通过：%1").arg(message);
-        if (!reasons.isEmpty()) text += QStringLiteral("\n不满足：%1").arg(reasons.join(QStringLiteral("；")));
-        else if (!detail.isEmpty()) text += QStringLiteral("\n%1").arg(detail);
-        if (!laser_readable) {
-            text += QStringLiteral("\n另外：没读到激光器状态，已按不安全处理。");
-        }
-        set_banner(text, Level::Danger);
+void MainWindow::read_air_parameters() {
+    if (device_status_reading_) {
+        air_read_queued_ = true;
+        return;
     }
-
-    // 预检会刷新 monitor 的缓存结论和状态灯，所以立刻拉一次新状态。
-    if (state_poller_) state_poller_->request_refresh();
+    call_async(QStringLiteral("device_diagnostics"), {{"action", "read_air_conditioner_setpoints"}}, 12000,
+               [this](const QJsonObject& payload, bool ok, const QString& error) {
+                   param_page_->show_air_result(payload, ok, error, false);
+               });
 }
 
 void MainWindow::on_start_detection() {
@@ -1022,7 +991,13 @@ void MainWindow::on_start_detection() {
 void MainWindow::on_start_result(const QJsonObject& payload, bool ok, const QString& message) {
     command_in_flight_ = false;
 
-    if (ok) {
+    if (ok && !payload.value("running").toBool(true)) {
+        const auto status = payload.value("status").toObject();
+        const bool unconfirmed = status.value("stop_confirmation").toString() == QLatin1String("unconfirmed");
+        set_banner(QStringLiteral("测量已结束：%1").arg(unconfirmed
+                       ? QStringLiteral("停机未确认。 %1").arg(status.value("stop_error").toString())
+                       : status.value("last_error_message").toString()), unconfirmed ? Level::Danger : Level::Warn);
+    } else if (ok) {
         // 注意这里用的是 Danger 色：此刻**激光真的在出光**。
         // 用绿色显示"开始成功"会让人放松，而放松的代价是眼睛。
         const QString note = payload.value(QStringLiteral("note")).toString();
@@ -1033,7 +1008,7 @@ void MainWindow::on_start_result(const QJsonObject& payload, bool ok, const QStr
         // 失败原因**原样上送**，不转述成"设备故障"这类模糊话。
         // 业务层已经写了具体的 error code 与 message，界面上再加工一遍
         // 就等于替现场做了一次翻译，翻译错了没人查得到。
-        set_banner(QStringLiteral("开始检测被业务层拒绝：%1\n业务层在拒绝时会保证一条写指令都没发。")
+        set_banner(QStringLiteral("开始检测未完成：%1")
                        .arg(message),
                    Level::Warn);
     }
@@ -1073,70 +1048,56 @@ void MainWindow::on_stop_result(bool ok, const QString& message) {
 // ── 参数页 ──────────────────────────────────────────────────────────────
 
 void MainWindow::on_param_save_requested(const QJsonObject& request) {
+    const auto group = request.value("group").toString();
     call_async(QStringLiteral("param_set"), request, 20000,
-               [this](const QJsonObject& payload, bool transport_ok, const QString& message) {
-                   if (!transport_ok) {
-                       on_param_result(false, QStringLiteral("保存失败（管道/命令层）：%1").arg(message));
-                       return;
-                   }
-                   // **必须检查 completed。** 后端 note 的原话就是
-                   // 「调用方必须检查它」—— completed=false 是
-                   // "收到请求但未完成"，当成功处理等于骗操作员。
-                   const bool completed = payload.value(QStringLiteral("completed")).toBool(false);
-                   const QString msg = payload.value(QStringLiteral("message")).toString();
-                   const QString group = payload.value(QStringLiteral("group")).toString();
-
+               [this, group](const QJsonObject& payload, bool ok, const QString& transport_error) {
+                   const bool completed = ok && payload.value("completed").toBool();
+                   QString message = payload.value("message").toString(transport_error);
+                   if (!completed && message.isEmpty()) message = QStringLiteral("保存未完成。");
                    QStringList failed;
-                   const QJsonArray bad =
-                       payload.value(QStringLiteral("failed_fields")).toArray();
-                   for (const QJsonValue& v : bad) failed << v.toString();
-
-                   if (!completed) {
-                       on_param_result(false,
-                                       QStringLiteral("【%1】未完成：%2\n被拒绝的字段：%3")
-                                           .arg(group, msg,
-                                                failed.isEmpty() ? QStringLiteral("（后端未列出）")
-                                                                 : failed.join(QStringLiteral("、"))));
-                       return;
-                   }
-                   // 成功也不许说"现在可以出光了" —— 那是 UI 自己做安全判定。
-                   on_param_result(true,
-                                   QStringLiteral("【%1】已保存：%2\n光谱参数用于后续采集，激光会话参数在下次启动测量时使用。")
-                                       .arg(group, msg));
+                   for (const auto& field : payload.value("failed_fields").toArray()) failed << field.toString();
+                   param_page_->finish_save(group, completed, message, failed);
+                   if (state_poller_) state_poller_->request_refresh();
                });
 }
 
-void MainWindow::on_param_reload_requested() {
-    call_async(QStringLiteral("param_get"), QJsonObject(), 15000,
-               [this](const QJsonObject& payload, bool ok, const QString& message) {
-                   if (!ok) {
-                       on_param_result(false, QStringLiteral("重新读取失败：%1").arg(message));
-                       return;
-                   }
-                   const QJsonObject groups = payload.value(QStringLiteral("groups")).toObject();
-                   // force=true：「放弃修改」的语义就是**明知有改动也覆盖回去**。
-                   if (param_page_) param_page_->apply_values(groups, true);
-                   on_param_result(true, QStringLiteral("已从守护进程重新读取参数，未保存的改动已丢弃。"));
+void MainWindow::on_param_reload_requested(const QString& group) {
+    call_async(QStringLiteral("param_get"), {{"group", group}}, 15000,
+               [this, group](const QJsonObject& payload, bool ok, const QString& message) {
+                   // param_get(group) 返回单组结果；兼容旧服务返回的整个 groups 对象。
+                   auto groups = payload.value("groups").toObject();
+                   if (groups.isEmpty() && payload.value("values").isObject()) groups.insert(group, payload);
+                   param_page_->finish_reload(group, groups, ok,
+                                              ok ? QString{} : QStringLiteral("重新读取失败：%1").arg(message));
+                   if (state_poller_) state_poller_->request_refresh();
                });
-}
-
-void MainWindow::on_param_result(bool ok, const QString& summary) {
-    if (param_page_) param_page_->on_save_result(ok, summary);
-    if (state_poller_) state_poller_->request_refresh();
 }
 
 void MainWindow::show_main_page() {
     if (pages_) pages_->setCurrentIndex(0);
+    if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
     if (param_page_btn_) param_page_btn_->setChecked(false);
     if (main_page_btn_) main_page_btn_->setChecked(true);
+    if (device_status_btn_) device_status_btn_->setChecked(false);
 }
 
 void MainWindow::show_parameter_page() {
     if (pages_) pages_->setCurrentIndex(1);
+    if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
     if (param_page_btn_) param_page_btn_->setChecked(true);
     if (main_page_btn_) main_page_btn_->setChecked(false);
-    // 切进参数页立刻拉一次状态：新参数齐备指示要马上反映出来。
+    if (device_status_btn_) device_status_btn_->setChecked(false);
+    refresh_device_status();
     if (state_poller_) state_poller_->request_refresh();
+}
+
+void MainWindow::show_device_status_page() {
+    pages_->setCurrentWidget(device_status_page_);
+    if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
+    param_page_btn_->setChecked(false);
+    main_page_btn_->setChecked(false);
+    device_status_btn_->setChecked(true);
+    refresh_device_status();
 }
 
 // ── 光谱小工具 ──────────────────────────────────────────────────────────
