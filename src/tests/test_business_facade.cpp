@@ -223,7 +223,7 @@ CASE(fresh_store_is_seeded_with_the_real_device_parameters); {
     // 拿到的也是真机参数。默认值来自 docs/real-device-parameters-20260929.md，
     // 由 ParameterService::seed_defaults() 在 Runtime::start 里补进参数库。
     //
-    // 在此之前：激光侧完全不播种（9 个框全是量程下限、门禁卡未标定），
+    // 在此之前：激光侧完全不播种（输入框全是量程下限、门禁卡未标定），
     // 光谱侧种的是通用占位值 10 ms / 3000 ms / 5000 ns，与真机对不上。
     Fixture f("realseed");
     const app::Response get = f.facade.dispatch(R"({"command":"param_get","args":{}})");
@@ -238,7 +238,7 @@ CASE(fresh_store_is_seeded_with_the_real_device_parameters); {
     CHECK_EQ(laser["q_delay_us"].as_number(), 210.0);             // 0x16
     CHECK_EQ(laser["q_warmup_s"].as_number(), 0.0);               // 0x19
     CHECK_EQ(laser["settle_timeout_ms"].as_number(), 20000.0);
-    CHECK_EQ(laser["emission_hold_ms"].as_number(), 3000.0);
+    CHECK(!laser.has("emission_hold_ms"));
     CHECK_EQ(laser["min_discharges"].as_number(), 1.0);
 
     const json::Value& spec = get.payload["groups"]["spectrometer"]["values"];
@@ -246,7 +246,7 @@ CASE(fresh_store_is_seeded_with_the_real_device_parameters); {
     CHECK_EQ(spec["capture_timeout_ms"].as_number(), 10000.0);
     CHECK_EQ(spec["integration_delay_ns"].as_number(), 1280.0);
 
-    // 9 个字段齐备且合法 -> 视为已标定：门禁不会因为参数卡住。
+    // 必填字段齐备且合法，门禁不会因为参数卡住。
     const app::Response gate = f.facade.dispatch(R"({"command":"gate","args":{}})");
     CHECK(gate.ok);
     for (const auto& r : gate.payload["blocked_by"].as_array()) {
@@ -323,12 +323,12 @@ CASE(parameter_limits_apply_to_saving_and_request_overrides_without_partial_upda
             // 再单独验证本次覆盖；越界保存已拒绝，参数库仍保持合法值。
             args = json::object(); args.set(group, values);
             const auto overridden = f.runtime.parameter_service().fire_parameters(args);
-            CHECK_EQ(overridden.ok(), range.contains(value));
+            CHECK_EQ(overridden.ok(), field == "emission_hold_ms" || range.contains(value));
         }
         if (range.integer) {
             json::Value values = json::object(); values.set(field, json::Value(range.lo + 0.5));
             json::Value args = json::object(); args.set(group, values);
-            CHECK(!f.runtime.parameter_service().fire_parameters(args));
+            CHECK_EQ(f.runtime.parameter_service().fire_parameters(args).ok(), field == "emission_hold_ms");
             // 绕过门面直接写参数库，也必须拒绝小数。
             CHECK(!f.runtime.parameters()->apply(group, {{field, range.lo + 0.5}}).completed());
         }
@@ -344,6 +344,28 @@ CASE(parameter_limits_apply_to_saving_and_request_overrides_without_partial_upda
     CHECK(!f.runtime.parameters()->apply("spectrometer", {{"integration_ms", 12},
         {"integration_delay_ns", 1000001}}).completed());
     CHECK_EQ(f.runtime.parameter_service().spectrometer_measurement().integration_ms, before.integration_ms);
+}
+
+CASE(saved_instrument_parameters_are_used_by_the_next_measurement); {
+    const char* tag = "saved_instrument_parameters";
+    {
+        Fixture f(tag);
+        CHECK(f.facade.dispatch(R"({"command":"param_set","args":{"group":"laser","values":{"frequency_hz":2}}})").ok);
+        CHECK(f.facade.dispatch(R"({"command":"param_set","args":{"group":"spectrometer","values":{"integration_ms":2.5}}})").ok);
+        const auto params = f.runtime.parameter_service().fire_parameters(json::object());
+        CHECK(params);
+        if (params) {
+            CHECK_EQ(params.value().laser.frequency_hz, 2u);
+            CHECK_EQ(params.value().integration_ms, 2.5);
+        }
+    }
+    Fixture restarted(tag);
+    const auto params = restarted.runtime.parameter_service().fire_parameters(json::object());
+    CHECK(params);
+    if (params) {
+        CHECK_EQ(params.value().laser.frequency_hz, 2u);
+        CHECK_EQ(params.value().integration_ms, 2.5);
+    }
 }
 
 CASE(historical_out_of_range_parameters_are_preserved_but_block_measurement); {
@@ -409,6 +431,32 @@ CASE(capture_with_pace_but_no_device_is_unsupported); {
         f.facade.dispatch(R"({"command":"capture","args":{"from_config":true}})");
     CHECK(!response.ok);
     CHECK_EQ(response.error.kind, ErrorKind::unsupported);
+}
+
+CASE(hardware_diagnostics_require_real_devices_and_reject_invalid_requests); {
+    Fixture f("hardware_diagnostics");
+    const auto capture = f.facade.dispatch(R"({"command":"capture","args":{"trigger":"free_run"}})");
+    CHECK_EQ(capture.error.code, std::string("spectrometer_not_open"));
+    const auto bad_trigger = f.facade.dispatch(R"({"command":"capture","args":{"trigger":true}})");
+    CHECK_EQ(bad_trigger.error.code, std::string("capture_trigger_invalid"));
+
+    const auto light = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"test_indicator","color":"red","mode":"on"}})");
+    CHECK_EQ(light.error.code, std::string("indicator_not_open"));
+    const auto buzzer = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"test_indicator","color":"buzzer","mode":"on"}})");
+    CHECK_EQ(buzzer.error.code, std::string("indicator_test_invalid"));
+    for (const auto* ms : {"500", "4500", "20000"}) {
+        const auto test = f.facade.dispatch(std::string(R"({"command":"device_diagnostics","args":{"action":"test_indicator","color":"yellow","mode":"on","duration_ms":)") + ms + "}}");
+        CHECK_EQ(test.error.code, std::string("indicator_not_open"));
+    }
+    for (const auto* ms : {"499", "20001", "500.5", "\"1000\"", "null"}) {
+        const auto test = f.facade.dispatch(std::string(R"({"command":"device_diagnostics","args":{"action":"test_indicator","color":"yellow","mode":"on","duration_ms":)") + ms + "}}");
+        CHECK_EQ(test.error.code, std::string("indicator_test_duration_invalid"));
+    }
+
+    const auto power = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"set_air_power","on":true}})");
+    CHECK_EQ(power.error.code, std::string("air_conditioner_not_open"));
+    const auto mode = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"set_air_mode","mode":"cooling"}})");
+    CHECK_EQ(mode.error.code, std::string("air_conditioner_not_open"));
 }
 
 CASE(recovery_write_only_writes_and_never_resumes); {
@@ -634,7 +682,7 @@ CASE(legacy_laser_commands_are_rejected_as_unknown); {
 // 碰巧调一次 param_get 才恢复。现场表现是"刚开机预检莫名不通过"。
 // 这条直接断言：**重启后什么都不用调，门禁就该是齐备的**。
 // 启动时 seed_defaults() 已把真机参数补进参数库（只补缺失），
-// 所以这里无需先手工填 9 个值；下面的 param_set 只是把磁盘内容写成
+// 所以这里无需先手工填完参数；下面的 param_set 只是把磁盘内容写成
 // 与默认值不同的形状，用来验证"重启后从磁盘读回的那份也齐备"。
 CASE(param_get_after_restart_keeps_the_gate_in_sync); {
     const char* tag = "persist_gate";
@@ -711,6 +759,10 @@ CASE(device_diagnostics_reports_disabled_devices_and_rejects_bad_input); {
     CHECK(!read.payload["air_conditioner"]["opened"].as_bool(true));
     CHECK(read.payload["laser"].is_object());
     CHECK(read.payload["spectrometer_channels"].is_array());
+    const auto range = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"read_rangefinder"}})");
+    CHECK(range.ok);
+    CHECK(!range.payload["opened"].as_bool(true));
+    CHECK(!range.payload.has("distance_mm"));
     const auto read_setpoints = f.facade.dispatch(R"({"command":"device_diagnostics","args":{"action":"read_air_conditioner_setpoints"}})");
     CHECK(!read_setpoints.ok);
     CHECK_EQ(read_setpoints.error.code, std::string("air_conditioner_not_open"));
@@ -739,4 +791,53 @@ CASE(prediction_routes_are_independent_of_device_readiness); {
     const auto disabled = f.facade.dispatch(R"({"command":"prediction","args":{"action":"configure","enabled":false}})");
     CHECK(disabled.ok); CHECK(!f.runtime.laser_session_active());
 }
+CASE(motor_is_optional_and_offline_control_never_claims_success); {
+    Fixture disabled("motor_disabled");
+    const auto status = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"status"}})");
+    CHECK(status.ok);
+    CHECK(!disabled.facade.dispatch(R"({"command":"motor","args":{"action":"forward"}})").ok);
+    CHECK(!disabled.facade.dispatch(R"({"command":"motor","args":{"action":"bad"}})").ok);
+    const auto invalid_duration = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"forward","duration_ms":100.5}})");
+    CHECK(!invalid_duration.ok);
+    CHECK_EQ(invalid_duration.error.code, std::string("motor_duration_invalid"));
+    const auto maximum = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"forward","duration_ms":50000}})");
+    CHECK_EQ(maximum.error.code, std::string("motor_control_disabled"));
+    const auto too_long = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"forward","duration_ms":50001}})");
+    CHECK_EQ(too_long.error.code, std::string("motor_duration_invalid"));
+    const auto valid_frequency = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"set_frequency","frequency_hz":20.5}})");
+    CHECK_EQ(valid_frequency.error.code, std::string("motor_control_disabled"));
+    const auto invalid_frequency = disabled.facade.dispatch(R"({"command":"motor","args":{"action":"set_frequency","frequency_hz":20.55}})");
+    CHECK_EQ(invalid_frequency.error.code, std::string("motor_frequency_invalid"));
+
+    auto site = template_config();
+    site.motor.connection.serial.enabled = true;
+    site.motor.connection.serial.port = "COM55";
+    site.motor.jog_ms = 400;
+    const auto timed = config::from_json(config::to_json(site));
+    CHECK(timed);
+    site.motor.forward_limit_mask = 1;
+    site.motor.reverse_limit_mask = 2;
+    const auto roundtrip = config::from_json(config::to_json(site));
+    CHECK(roundtrip);
+    if (roundtrip) CHECK_EQ(roundtrip.value().motor.jog_ms, 400u);
+    site.motor.reverse_limit_mask = 1;
+    CHECK(!config::validate(site));
+    site.motor.reverse_limit_mask = 2;
+
+    Fixture unavailable("motor_unavailable", site);
+    const auto read = unavailable.facade.dispatch(R"({"command":"motor"})");
+    CHECK(read.ok);
+    CHECK(read.payload["configured"].as_bool());
+    CHECK_EQ(read.payload["jog_ms"].as_number(), 400.0);
+    CHECK(!read.payload["stopped"].as_bool(true));
+    CHECK(!unavailable.facade.dispatch(R"({"command":"motor","args":{"action":"reverse"}})").ok);
+    const auto profile = unavailable.facade.dispatch(R"({"command":"motor","args":{"action":"profile"}})");
+    CHECK_EQ(profile.error.code, std::string("su300_not_open"));
+    const auto gate = unavailable.facade.dispatch(R"({"command":"gate"})");
+    bool blocked = false;
+    for (const auto& code : gate.payload["blocked_by"].as_array())
+        if (code.as_string() == "head_stop_unconfirmed") blocked = true;
+    CHECK(blocked);
+}
+
 TEST_MAIN_RETURN()

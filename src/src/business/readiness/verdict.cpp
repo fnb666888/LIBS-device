@@ -17,6 +17,7 @@ const char* to_string(GateReason reason) noexcept {
         case GateReason::not_enabled:           return "not_enabled";
         case GateReason::laser_not_commissioned: return "laser_not_commissioned";
         case GateReason::stop_unconfirmed:     return "stop_unconfirmed";
+        case GateReason::head_stop_unconfirmed: return "head_stop_unconfirmed";
     }
     return "unknown";
 }
@@ -48,6 +49,9 @@ GateVerdict evaluate(const ReadinessFacts& facts, GateCheckPhase phase) {
     }
     if (facts.stop_unconfirmed) {
         v.blocked_by.push_back(GateReason::stop_unconfirmed);
+    }
+    if (!facts.head_stopped) {
+        v.blocked_by.push_back(GateReason::head_stop_unconfirmed);
     }
     for (const auto& device : facts.auxiliary) {
         for (const auto& warning : device.warnings) {

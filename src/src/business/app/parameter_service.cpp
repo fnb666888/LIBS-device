@@ -20,7 +20,6 @@ constexpr const char* kFieldDischargeDelay  = "discharge_delay_us";
 constexpr const char* kFieldQDelay          = "q_delay_us";
 constexpr const char* kFieldQWarmup         = "q_warmup_s";
 constexpr const char* kFieldSettleTimeout   = "settle_timeout_ms";
-constexpr const char* kFieldEmissionHold    = "emission_hold_ms";
 constexpr const char* kFieldMinDischarges   = "min_discharges";
 
 constexpr const char* kFieldIntegrationMs     = "integration_ms";
@@ -61,29 +60,28 @@ std::map<std::string, std::vector<std::string>> ParameterService::required_field
     return {
         {"laser", {kFieldDischargeCurrent, kFieldPulseWidth, kFieldFrequency,
                    kFieldDischargeDelay, kFieldQDelay, kFieldQWarmup,
-                   kFieldSettleTimeout, kFieldEmissionHold, kFieldMinDischarges}},
+                   kFieldSettleTimeout, kFieldMinDischarges}},
         {"spectrometer", {kFieldIntegrationMs, kFieldCaptureTimeoutMs, kFieldIntegrationDelay}},
     };
 }
 
 libs::VoidResult ParameterService::seed_defaults() {
     // 首次开机（或参数库里缺字段）时把**真机默认参数**补进参数库：
-    //   * 激光侧 9 个：80 A / 200 us / 1 Hz / 0 us / 210 us / 0 s /
-    //                  20000 ms / 3000 ms / 1 次
+    //   * 激光侧 8 个：80 A / 200 us / 1 Hz / 0 us / 210 us / 0 s / 20000 ms / 1 次
     //   * 光谱侧 3 个：1.05 ms / 10000 ms / 1280 ns
     // 全部取自 docs/real-device-parameters-20260929.md。
     //
     // 语义是"补缺失"，不是"覆盖"：操作员在参数管理页面标定过的值永远优先，
     // 重启不会把现场调好的参数打回默认。进程启动即可检测 —— 门禁的
     // parameters_incomplete / laser_not_commissioned 两条自然放行，
-    // 不用等操作员先手工把 9 个框填一遍。
+    // 不用等操作员先手工填完全部参数。
     //
     // 曾经叫 seed_from_site(site)，把 site.json 的 laser_fire 抄进参数库 ——
     // 不带 --config 启动就把一串 0 种了进去。现在默认值只来自真机记录，
     // 函数不再需要 site 入参。
     //
     // **曾经激光侧完全不播种**（"本机标定值，无通用默认"），结果是开箱状态下
-    // 界面上 9 个框全是量程下限、门禁卡在未标定。既然已有 2026-09-29 真机
+    // 界面上全是量程下限、门禁卡在未标定。既然已有 2026-09-29 真机
     // 记录作为本机默认，就一并播种；换机器时在参数页填新的真机值保存即可
     //（种子只补缺失字段，不会把新值打回）。
     //
@@ -125,7 +123,7 @@ libs::VoidResult ParameterService::seed_defaults() {
     });
     if (!spec) return spec;
 
-    // ── laser 组：9 个字段逐个补缺失 ─────────────────────────────────
+    // ── laser 组：逐个补缺失字段 ───────────────────────────────────
     // 真机默认值来自 2026-09-29 记录。只补缺失字段，所以现场标定过的值不会被
     // 打回；"已标定"仍由 commissioned_from_store() 按参数库实际内容判定。
     const libs::VoidResult laser = ensure("laser", {
@@ -136,7 +134,6 @@ libs::VoidResult ParameterService::seed_defaults() {
         {kFieldQDelay,           kRealDeviceDefaults.q_delay_us},
         {kFieldQWarmup,          kRealDeviceDefaults.q_warmup_s},
         {kFieldSettleTimeout,    kRealDeviceDefaults.settle_timeout_ms},
-        {kFieldEmissionHold,     kRealDeviceDefaults.emission_hold_ms},
         {kFieldMinDischarges,    kRealDeviceDefaults.min_discharges},
     });
     if (!laser) return laser;
@@ -181,9 +178,6 @@ libs::VoidResult ParameterService::collect_laser(measurement::FireParameters& ou
     if (!take_uint(values, kFieldSettleTimeout, &cfg.settle_timeout_ms)) {
         return bad("parameter_field_bad", "laser.settle_timeout_ms 缺失或不是非负整数");
     }
-    if (!take_uint(values, kFieldEmissionHold, &cfg.emission_hold_ms)) {
-        return bad("parameter_field_bad", "laser.emission_hold_ms 缺失或不是非负整数");
-    }
     if (!take_uint(values, kFieldMinDischarges, &cfg.min_discharges)) {
         return bad("parameter_field_bad", "laser.min_discharges 缺失或不是非负整数");
     }
@@ -223,10 +217,10 @@ libs::VoidResult ParameterService::collect_spectrometer(measurement::FireParamet
 
 bool ParameterService::commissioned_from_store() const {
     // "已标定"不再由配置文件里的一个 bool 决定，而是**按参数库实际内容算**：
-    // laser 组 9 个字段齐备，且每一个都落在协议量程内。
+    // laser 组必填字段齐备，且每一个都落在协议量程内。
     //
     // 这样"填齐了参数"和"允许出光"就是同一件事，界面上的参数管理页面
-    // 成了唯一的标定入口：操作员把 9 个框填成合法值保存，系统即视为已标定。
+    // 成了唯一的标定入口：操作员保存合法值后，系统即视为已标定。
     // 反过来，只要有一个框缺失或越界，就仍是未标定 —— 一条写指令都不发。
     const config::ParameterStore* store = runtime_.parameters();
     if (store == nullptr) return false;
@@ -242,7 +236,6 @@ bool ParameterService::commissioned_from_store() const {
     if (!take_uint(values, kFieldQDelay, &cfg.q_delay_us)) return false;
     if (!take_uint(values, kFieldQWarmup, &cfg.q_warmup_s)) return false;
     if (!take_uint(values, kFieldSettleTimeout, &cfg.settle_timeout_ms)) return false;
-    if (!take_uint(values, kFieldEmissionHold, &cfg.emission_hold_ms)) return false;
     if (!take_uint(values, kFieldMinDischarges, &cfg.min_discharges)) return false;
 
     cfg.commissioned = true;
@@ -283,7 +276,6 @@ libs::Result<measurement::FireParameters> ParameterService::fire_parameters(cons
             read_u(kFieldQDelay,          &out.laser.q_delay_us) &&
             read_u(kFieldQWarmup,         &out.laser.q_warmup_s) &&
             read_u(kFieldSettleTimeout,   &out.laser.settle_timeout_ms) &&
-            read_u(kFieldEmissionHold,    &out.laser.emission_hold_ms) &&
             read_u(kFieldMinDischarges,   &out.laser.min_discharges);
         if (!shape_ok) {
             return bad("laser_overrides_bad", "args.laser 的字段必须是 0 或正整数");

@@ -67,6 +67,8 @@ struct AirConditionerEnvironment {
     std::optional<bool> power_on;
     std::optional<bool> cooling;
     std::optional<bool> heating;
+    std::optional<bool> indoor_fan_on;
+    std::optional<bool> outdoor_fan_on;
     std::vector<std::string> active_alarms;
     std::string status_error;
     std::string parameters_error;

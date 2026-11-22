@@ -49,7 +49,7 @@ $layers = [ordered]@{
         "src/protocols/air_conditioner.cpp",
         "src/devices/laser.cpp", "src/devices/rangefinder.cpp",
         "src/devices/indicator.cpp", "src/devices/spectrometer.cpp",
-    "src/devices/air_conditioner.cpp")
+    "src/devices/air_conditioner.cpp", "src/devices/su300.cpp")
     # 业务层。只在 devices 之上组装业务语义，不反向改驱动。
     "libs_business"  = @(
         # shared/：共同底座。它不认识任何业务（下面的依赖方向检查守住这条）。
@@ -79,6 +79,7 @@ $layers = [ordered]@{
         # 放 shared 会直接违反下面的依赖方向检查。
         "src/business/app/parameter_service.cpp",
         "src/business/app/device_monitoring.cpp",
+        "src/business/app/motor_control.cpp",
         "src/business/app/runtime.cpp",
         "src/business/app/facade.cpp")
 }

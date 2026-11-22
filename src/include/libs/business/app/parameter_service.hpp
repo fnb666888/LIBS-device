@@ -21,7 +21,7 @@
 //   测量参数（归本服务 / ParameterStore）：
 //       激光器：discharge_current_a / pulse_width_us / frequency_hz /
 //               discharge_delay_us / q_delay_us / q_warmup_s /
-//               settle_timeout_ms / emission_hold_ms / min_discharges
+//               settle_timeout_ms / min_discharges
 //       光谱仪：integration_ms / capture_timeout_ms / integration_delay_ns
 //
 //   装机配置（归 SiteConfig）：
@@ -81,7 +81,7 @@ public:
     // 避免出现"参数库里的名字"和"代码里的名字"两套。
     static std::map<std::string, std::vector<std::string>> required_fields();
 
-    // 启动时把**真机默认参数**补进参数库（激光 9 个 + 光谱 3 个），只补缺失的。
+    // 启动时把真机默认参数补进参数库，只补缺失的字段。
     //
     // 默认值全部取自 docs/real-device-parameters-20260929.md —— 那是本机
     // 2026-09-29 真机联调确认过的工作点，不是通用占位值。于是进程启动即可
@@ -95,7 +95,7 @@ public:
     libs::VoidResult seed_defaults();
 
     // "本机已标定"不再来自 site.json 的 commissioned 字段，而是按参数库
-    // 实际内容算：laser 组 9 个字段齐备且全部落在协议量程内。
+    // 实际内容算：laser 组必填字段齐备且全部落在协议量程内。
     // 参数管理页面因此成了唯一的标定入口 —— 填齐合法值即视为已标定。
     bool commissioned_from_store() const;
 
@@ -131,7 +131,7 @@ private:
     double value_or(const std::string& group, const std::string& field,
                     double fallback) const;
 
-    // 从参数库读出全部 9 个出光参数。**缺失即报错**，不回落装机配置 ——
+    // 从参数库读出全部必需出光参数。**缺失即报错**，不回落装机配置 ——
     // 出光参数只有参数库一个来源，操作员在参数管理页面改什么就是什么。
     libs::VoidResult collect_laser(measurement::FireParameters& out) const;
 

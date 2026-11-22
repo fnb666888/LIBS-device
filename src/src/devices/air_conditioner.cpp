@@ -143,9 +143,12 @@ AirConditionerEnvironment AirConditioner::readEnvironment() {
     environment.status_error = reading.status_error;
     environment.parameters_error = reading.params_error;
     for (const auto& bit : reading.status.bits) {
-        if (bit.address == reg::kPowerState) environment.power_on = bit.active;
+        if (bit.address == reg::kPowerState)
+            environment.power_on = libs::air_conditioner::power_on_from_status_bit(bit.active);
         if (bit.address == reg::kCoolingOn) environment.cooling = bit.active;
         if (bit.address == reg::kHeaterOn) environment.heating = bit.active;
+        if (bit.address == reg::kIndoorFan) environment.indoor_fan_on = bit.active;
+        if (bit.address == reg::kOutdoorFan) environment.outdoor_fan_on = bit.active;
         if (bit.is_alarm && bit.active) environment.active_alarms.push_back(bit.name);
     }
     for (const auto& field : reading.params.registers) {

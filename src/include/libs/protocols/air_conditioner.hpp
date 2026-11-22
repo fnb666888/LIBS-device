@@ -39,7 +39,7 @@ constexpr std::uint16_t kCoolingOn    = 10035;   // 制冷状态
 constexpr std::uint16_t kHeaterOn     = 10036;   // 加热器状态
 constexpr std::uint16_t kIndoorFan    = 10037;   // 内风机状态
 constexpr std::uint16_t kOutdoorFan   = 10038;   // 外风机状态
-constexpr std::uint16_t kPowerState   = 10042;   // 监控开关机（0 关 / 1 开）
+constexpr std::uint16_t kPowerState   = 10042;   // FC01 监控开关机回读（0 开 / 1 关）
 constexpr std::uint16_t kIndoorSensorFault    = 10043;
 constexpr std::uint16_t kEvaporatorSensorFault = 10044;
 constexpr std::uint16_t kCondenserSensorFault  = 10045;
@@ -81,10 +81,13 @@ constexpr std::uint16_t kOff = 0x0000;
 constexpr std::uint16_t kOn  = 0xFF00;
 }  // namespace coil
 
+// FC01 10042 回读按手册 §7.9/§7.10 低有效。FC05 写入按上面的 coil 定义。
+constexpr bool power_on_from_status_bit(bool raw_bit) noexcept { return !raw_bit; }
+
 enum class Mode : std::uint16_t { standby = 0, cooling = 1, heating = 2, dehumidify = 3 };
 const char* to_string(Mode mode) noexcept;
 
-// 状态位：每一位一个开关/告警。0 关，1 开/告警。
+// active 保存原始位值。多数状态 1 表示开启或告警，10042 例外。
 struct StatusBit {
     std::uint16_t address = 0;   // 文档地址，如 10035
     bool active = false;

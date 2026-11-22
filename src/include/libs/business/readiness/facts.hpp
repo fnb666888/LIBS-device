@@ -102,6 +102,7 @@ struct ReadinessFacts {
     std::uint64_t sampled_at_ms = 0;   // 本次采样时刻（进程内单调）
     std::vector<AuxiliaryDeviceFacts> auxiliary;  // 已启用的辅助设备，供告警展示
     bool stop_unconfirmed = false;
+    bool head_stopped = true;
 };
 
 }  // namespace business::readiness

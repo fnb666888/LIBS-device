@@ -68,7 +68,7 @@ VoidResult DeviceSession::open(const config::SiteConfig& config) {
 
     open_ = true;
     for (auto device : {Device::laser, Device::indicator, Device::rangefinder,
-                        Device::air_conditioner, Device::spectrometer}) {
+                        Device::air_conditioner, Device::spectrometer, Device::motor}) {
         retry_open(device);
     }
     return libs::VoidResult();
@@ -107,6 +107,14 @@ void DeviceSession::retry_open(Device device) {
             break;
         case Device::spectrometer:
             if (!spectrometer()) open_spectrometer();
+            break;
+        case Device::motor:
+            if (!motor()) {
+                const auto& motor_config = config_.motor.connection;
+                open_serial_device(motor_config.serial, "SU300", motor_, motor_state_, [&](auto& link) {
+                    return std::make_unique<libs::devices::Su300>(link, motor_config.address, motor_config.serial.timeout_ms);
+                });
+            }
             break;
     }
 }
@@ -184,6 +192,11 @@ libs::devices::AirConditioner* DeviceSession::air_conditioner() {
     return air_conditioner_.get();
 }
 
+libs::devices::Su300* DeviceSession::motor() {
+    std::lock_guard<std::mutex> lock(devices_mutex_);
+    return motor_.get();
+}
+
 VoidResult DeviceSession::close() {
     std::string first_error;
 
@@ -199,10 +212,11 @@ VoidResult DeviceSession::close() {
     indicator_.reset();
     rangefinder_.reset();
     air_conditioner_.reset();
+    motor_.reset();
     spectrometer_channels_.clear();
     links_.clear();
     for (auto* state : {&laser_state_, &indicator_state_, &spectrometer_state_,
-                        &rangefinder_state_, &air_conditioner_state_}) {
+                        &rangefinder_state_, &air_conditioner_state_, &motor_state_}) {
         if (state->opened) {
             state->opened = false;
             state->note = "会话已关闭";
@@ -225,6 +239,7 @@ HealthReport DeviceSession::health() const {
     report.spectrometer = spectrometer_state_;
     report.rangefinder = rangefinder_state_;
     report.air_conditioner = air_conditioner_state_;
+    report.motor = motor_state_;
 
     std::ostringstream os;
     bool all = true;
@@ -249,6 +264,7 @@ HealthReport DeviceSession::health() const {
     account("光谱仪", spectrometer_state_, true);
     account("测距仪", rangefinder_state_, false);
     account("空调", air_conditioner_state_, false);
+    account("检测头移位", motor_state_, false);
 
     report.all_required_open = all;
     report.summary = os.str();

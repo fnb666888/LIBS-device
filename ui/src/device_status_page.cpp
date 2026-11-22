@@ -1,193 +1,151 @@
 #include "device_status_page.hpp"
 
-#include <algorithm>
-
-#include <QDateTime>
-#include <QGridLayout>
-#include <QHBoxLayout>
 #include <QJsonArray>
-#include <QLabel>
-#include <QPushButton>
-#include <QScrollArea>
-#include <QVBoxLayout>
-
-#include "widgets.hpp"
+#include <algorithm>
+#include <limits>
 
 namespace libs::ui {
 namespace {
 
-QString reading(const QJsonObject& data, const char* key, const QString& unit = {}) {
-    const auto value = data.value(QLatin1String(key));
-    return value.isDouble() ? QString::number(value.toDouble(), 'g', 10) + unit : QStringLiteral("—");
+QString value_text(const QJsonObject& object, const char* key, const QString& unit = {}) {
+    const auto value = object.value(QLatin1String(key));
+    return value.isDouble() ? QString::number(value.toDouble()) + unit : QStringLiteral("—");
 }
 
-QString state(const QJsonObject& data, const char* key, const QString& yes, const QString& no) {
-    const auto value = data.value(QLatin1String(key));
-    return value.isBool() ? (value.toBool() ? yes : no) : QStringLiteral("—");
+DevicePresentation present_motor(const MachineSnapshot& snapshot) {
+    const auto& data = snapshot.motor;
+    const auto* health = snapshot.device(QStringLiteral("motor"));
+    if (!data.value("configured").toBool(health && health->configured))
+        return {Level::Idle, QStringLiteral("未启用"), {}, {}};
+    const auto detail = data.value("error").toString();
+    if (!data.value("opened").toBool(health && health->opened))
+        return {Level::Danger, QStringLiteral("未连接"), {}, detail};
+    const bool forward = data.value("forward_limit").toBool();
+    const bool reverse = data.value("reverse_limit").toBool();
+    const auto limit = forward && reverse ? QStringLiteral("双向触发") : forward ? QStringLiteral("正向触发")
+        : reverse ? QStringLiteral("反向触发") : data.value("forward_limit").isBool() && data.value("reverse_limit").isBool()
+        ? QStringLiteral("未触发") : QStringLiteral("—");
+    QStringList readings{QStringLiteral("输出频率  %1").arg(value_text(data, "frequency_hz", QStringLiteral(" Hz"))),
+                         QStringLiteral("行程限位  %1").arg(limit)};
+    if (data.value("input_word").isDouble()) {
+        const int inputs = data.value("input_word").toInt();
+        readings << QStringLiteral("DI0 %1 / DI1 %2 / DI2 %3 / DI3 %4")
+            .arg(inputs & 1).arg((inputs >> 1) & 1).arg((inputs >> 2) & 1).arg((inputs >> 3) & 1);
+    }
+    const auto direction = data.value("direction").toString();
+    if (direction == QLatin1String("forward")) readings << QStringLiteral("运行方向  正向");
+    if (direction == QLatin1String("reverse")) readings << QStringLiteral("运行方向  反向");
+    const auto jog_error = data.value("jog_error").toString();
+    if (!jog_error.isEmpty()) readings << jog_error;
+    const int fault = data.value("fault_code").toInt();
+    if (fault) {
+        readings << QStringLiteral("故障码  %1").arg(fault);
+        return {Level::Danger, QStringLiteral("变频器故障"), readings, detail};
+    }
+    if (data.value("stop_pending").toBool()) return {Level::Warn, QStringLiteral("等待停机回读"), readings, detail};
+    if (data.value("jog_requested").toBool())
+        return {Level::Warn, data.value("jogging").toBool() ? QStringLiteral("点动中") :
+            QStringLiteral("等待点动回读"), readings, detail};
+    if (!data.value("stopped").toBool()) return {Level::Warn, QStringLiteral("停机未确认"), readings, detail};
+    if (!jog_error.isEmpty()) return {Level::Warn, QStringLiteral("点动结束，已停机"), readings, jog_error};
+    if (forward || reverse) return {Level::Warn, QStringLiteral("限位触发"), readings, detail};
+    return {Level::Ok, QStringLiteral("停机已回读"), readings, detail};
 }
 
-QString lamp_color(const QString& intent) {
-    if (intent == QLatin1String("ready_green")) return QStringLiteral("绿灯");
-    if (intent == QLatin1String("standby_yellow")) return QStringLiteral("黄灯");
-    if (intent == QLatin1String("fault_red")) return QStringLiteral("红灯");
-    if (intent == QLatin1String("offline_all_off")) return QStringLiteral("全灭");
-    return QStringLiteral("—");
+QStringList spectrum_readings(const QJsonArray& channels) {
+    if (channels.isEmpty()) return {QStringLiteral("可用通道  —")};
+    int count = 0;
+    double lowest = std::numeric_limits<double>::infinity();
+    double highest = -lowest;
+    for (const auto& value : channels) {
+        const auto channel = value.toObject();
+        if (!channel.value("pixels").isDouble()) continue;
+        ++count;
+        if (channel.value("wavelength_min_nm").isDouble())
+            lowest = std::min(lowest, channel.value("wavelength_min_nm").toDouble());
+        if (channel.value("wavelength_max_nm").isDouble())
+            highest = std::max(highest, channel.value("wavelength_max_nm").toDouble());
+    }
+    QStringList result{QStringLiteral("可用通道  %1 路").arg(count)};
+    if (lowest <= highest) result << QStringLiteral("波段范围  %1–%2 nm").arg(lowest, 0, 'f', 1).arg(highest, 0, 'f', 1);
+    return result;
 }
 
 }  // namespace
 
-DeviceStatusPage::DeviceStatusPage(QWidget* parent) : QWidget(parent) {
-    auto* outer = new QVBoxLayout(this);
-    outer->setContentsMargins(24, 22, 24, 22);
-    outer->setSpacing(16);
-    auto* bar = new QHBoxLayout;
-    setAccessibleName(QStringLiteral("设备状态"));
-    bar->addStretch();
-    updated_ = new QLabel(QStringLiteral("等待读取设备"), this);
-    updated_->setObjectName(QStringLiteral("caption"));
-    bar->addWidget(updated_);
-    refresh_ = new QPushButton(QStringLiteral("刷新状态"), this);
-    refresh_->setObjectName(QStringLiteral("ghost"));
-    bar->addWidget(refresh_);
-    outer->addLayout(bar);
-
-    auto* scroll = new QScrollArea(this);
-    scroll->setWidgetResizable(true);
-    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    auto* host = new QWidget(scroll);
-    auto* grid = new QGridLayout(host);
-    grid->setContentsMargins(0, 0, 4, 0);
-    grid->setSpacing(16);
-    const char* titles[] = {"激光器", "光谱仪", "三色状态灯", "测距仪", "空调"};
-    for (int i = 0; i < static_cast<int>(cards_.size()); ++i) {
-        auto& view = cards_[i];
-        auto* card = new Card(QString::fromUtf8(titles[i]), host);
-        view.frame = card;
-        card->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-        view.dot = new StatusDot(card);
-        card->add_header_widget(view.dot);
-        view.detail = new QLabel(card);
-        view.detail->setObjectName(QStringLiteral("dim"));
-        view.detail->setTextFormat(Qt::PlainText);
-        view.detail->setWordWrap(true);
-        view.detail->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        card->body()->addWidget(view.detail);
-        card->body()->addStretch();
-        grid->addWidget(card, i / 3, i % 3);
+QString air_mode_name(int code) {
+    switch (code) {
+        case 0: return QStringLiteral("待机／送风");
+        case 1: return QStringLiteral("制冷");
+        case 2: return QStringLiteral("加热");
+        case 3: return QStringLiteral("除湿");
+        default: return QStringLiteral("未知");
     }
-    for (int column = 0; column < 3; ++column) grid->setColumnStretch(column, 1);
-    grid->setRowStretch(2, 1);
-    scroll->setWidget(host);
-    outer->addWidget(scroll, 1);
-    render();
 }
 
-void DeviceStatusPage::apply_status(const MachineSnapshot& snapshot) {
-    snapshot_ = snapshot;
-    render();
-}
+DevicePresentation present_device(const QString& key, const MachineSnapshot& snapshot,
+                                  const QJsonObject& readings, const QString& error) {
+    if (!snapshot.valid || !snapshot.error.isEmpty())
+        return {Level::Idle, QStringLiteral("状态未知"), {}, snapshot.error};
+    if (key == QLatin1String("motor")) return present_motor(snapshot);
+    const auto* health = snapshot.device(key);
+    if (!health || !health->configured) return {Level::Idle, QStringLiteral("未启用"), {}, {}};
+    if (!health->opened) return {Level::Danger, QStringLiteral("未连接"), {}, health->note};
+    const auto data = readings.value(key).toObject();
+    const auto reading_error = data.value("error").toString();
+    if (!error.isEmpty() || !reading_error.isEmpty())
+        return {Level::Warn, QStringLiteral("读取失败"), {}, reading_error.isEmpty() ? error : reading_error};
 
-void DeviceStatusPage::set_reading_pending(bool pending) {
-    refresh_->setEnabled(!pending);
-    if (pending && readings_.isEmpty()) updated_->setText(QStringLiteral("正在读取设备…"));
-}
-
-void DeviceStatusPage::apply_readings(const QJsonObject& readings, const QString& error) {
-    readings_ = readings;
-    reading_error_ = error;
-    updated_->setText(error.isEmpty() ? QStringLiteral("最近读取 %1").arg(QDateTime::currentDateTime().toString("HH:mm:ss"))
-                                     : QStringLiteral("设备读数刷新失败"));
-    render();
-}
-
-void DeviceStatusPage::render() {
-    const bool connected = snapshot_.valid && snapshot_.error.isEmpty();
-    for (auto& card : cards_) {
-        const auto key = QLatin1String(card.key);
-        const auto* health = snapshot_.device(key);
-        QStringList lines;
-        if (!connected || !health) {
-            card.dot->set_state(Level::Idle, QStringLiteral("未知"));
-            card.detail->setText(connected ? QStringLiteral("服务未返回设备状态") : QStringLiteral("等待读取服务状态"));
-            continue;
+    DevicePresentation result{Level::Ok, QStringLiteral("在线"), {}, {}};
+    if (key == QLatin1String("laser")) {
+        const auto shutter = data.value("q_gate_open");
+        const auto first = data.value("interlock_1");
+        const auto second = data.value("interlock_2");
+        const bool interlocked = (first.isBool() && !first.toBool()) || (second.isBool() && !second.toBool());
+        result.readings << QStringLiteral("光闸  %1").arg(!shutter.isBool() ? QStringLiteral("—") :
+            shutter.toBool() ? QStringLiteral("开启") : QStringLiteral("关闭"));
+        result.readings << QStringLiteral("安全联锁  %1").arg(interlocked ? QStringLiteral("断开") :
+            first.isBool() && second.isBool() ? QStringLiteral("已闭合") : QStringLiteral("—"));
+        if (interlocked || data.value("emergency_stop").toBool() || data.value("overtemperature").toBool() ||
+            data.value("fault_bits").toInt() != 0 || snapshot.gate.state == QLatin1String("fault")) {
+            result.level = Level::Danger;
+            result.status = interlocked ? QStringLiteral("联锁断开") : data.value("emergency_stop").toBool()
+                ? QStringLiteral("急停触发") : data.value("overtemperature").toBool()
+                ? QStringLiteral("激光器超温") : QStringLiteral("设备告警");
+            result.detail = snapshot.gate.detail;
         }
-        if (!health->configured || !health->opened) {
-            card.dot->set_state(health->configured ? Level::Danger : Level::Idle,
-                                health->configured ? QStringLiteral("打开失败") : QStringLiteral("未启用"));
-            card.detail->setText(health->note.isEmpty() ? QStringLiteral("站点未启用设备") : health->note);
-            continue;
+    } else if (key == QLatin1String("spectrometer")) {
+        result.readings = spectrum_readings(readings.value("spectrometer_channels").toArray());
+    } else if (key == QLatin1String("air_conditioner")) {
+        result.readings << QStringLiteral("模式回读  %1").arg(air_mode_name(data.value("mode_code").toInt(-1)));
+        const auto fan_state = [&data](const char* key) {
+            const auto state = data.value(QLatin1String(key));
+            if (!state.isBool()) return QStringLiteral("未知");
+            return state.toBool() ? QStringLiteral("运行") : QStringLiteral("停止");
+        };
+        result.readings << QStringLiteral("内风机 %1 / 外风机 %2")
+            .arg(fan_state("indoor_fan_on"), fan_state("outdoor_fan_on"));
+        if (data.value("cooling").toBool()) result.readings << QStringLiteral("制冷负载运行中");
+        if (data.value("heating").toBool()) result.readings << QStringLiteral("加热负载运行中");
+        result.readings << QStringLiteral("柜内温度  %1").arg(value_text(data, "temperature_c", QStringLiteral(" °C")));
+        result.readings << QStringLiteral("相对湿度  %1").arg(value_text(data, "humidity_percent", QStringLiteral(" %RH")));
+        QStringList alarms;
+        for (const auto& alarm : data.value("alarms").toArray()) alarms << alarm.toString();
+        const auto status_error = data.value("status_error").toString();
+        const auto parameters_error = data.value("parameters_error").toString();
+        if (data.value("fault").toBool() || !alarms.isEmpty() || !status_error.isEmpty()) {
+            result.level = data.value("fault").toBool() ? Level::Danger : Level::Warn;
+            result.status = result.level == Level::Danger ? QStringLiteral("设备故障")
+                : !alarms.isEmpty() ? QStringLiteral("设备告警") : QStringLiteral("读取失败");
+            result.detail = alarms.isEmpty() ? status_error : alarms.join(QStringLiteral("、"));
         }
-        card.dot->set_state(Level::Ok, QStringLiteral("已打开"));
-        if (!health->endpoint.isEmpty()) lines << QStringLiteral("连接  %1").arg(health->endpoint);
-        if (!health->model.isEmpty()) lines << QStringLiteral("型号  %1").arg(health->model);
-
-        if (key == QLatin1String("indicator")) {
-            lines << QStringLiteral("目标灯态  %1").arg(lamp_color(snapshot_.lamp_intent));
-            if (!snapshot_.lamp_intent.isEmpty()) {
-                lines << (snapshot_.lamp_applied ? QStringLiteral("下发并读回成功") : QStringLiteral("灯态未确认"));
-                if (!snapshot_.lamp_applied) card.dot->set_state(Level::Warn, QStringLiteral("灯态未确认"));
-            }
-            if (!snapshot_.lamp_error.isEmpty()) lines << snapshot_.lamp_error;
-        } else if (!reading_error_.isEmpty()) {
-            card.dot->set_state(Level::Warn, QStringLiteral("读取失败"));
-            lines << reading_error_;
-        } else if (key == QLatin1String("laser")) {
-            const auto data = readings_.value(key).toObject();
-            if (data.value("error").isString()) {
-                card.dot->set_state(Level::Warn, QStringLiteral("读取失败"));
-                lines << data.value("error").toString();
-            } else {
-                lines << QStringLiteral("工作状态码  %1    光闸  %2").arg(reading(data, "work_state"), state(data, "q_gate_open", "开", "关"));
-                lines << QStringLiteral("联锁 1  %1    联锁 2  %2").arg(state(data, "interlock_1", "闭合", "断开"), state(data, "interlock_2", "闭合", "断开"));
-                lines << QStringLiteral("急停  %1    过温  %2").arg(state(data, "emergency_stop", "触发", "正常"), state(data, "overtemperature", "触发", "正常"));
-                lines << QStringLiteral("故障码  %1    放电计数  %2").arg(reading(data, "fault_bits"), reading(data, "discharge_counter"));
-            }
-        } else if (key == QLatin1String("spectrometer")) {
-            const auto channels = readings_.value("spectrometer_channels").toArray();
-            for (const auto& value : channels) {
-                const auto channel = value.toObject();
-                lines << (channel.value("pixels").isDouble()
-                    ? QStringLiteral("%1  %2 像素  %3–%4 nm").arg(channel.value("serial").toString(),
-                        reading(channel, "pixels"), reading(channel, "wavelength_min_nm"), reading(channel, "wavelength_max_nm"))
-                    : QStringLiteral("%1  通道不可用").arg(channel.value("serial").toString()));
-            }
-            if (!channels.isEmpty()) lines << QStringLiteral("通道信息来自最近一次空闲枚举");
-            if (snapshot_.measurement_known) lines << QStringLiteral("采集 %1  失败 %2").arg(snapshot_.shots_captured).arg(snapshot_.shots_failed);
-        } else if (key == QLatin1String("rangefinder")) {
-            const auto data = readings_.value(key).toObject();
-            if (data.value("error").isString()) {
-                card.dot->set_state(Level::Warn, QStringLiteral("读取失败"));
-                lines << data.value("error").toString();
-            } else {
-                if (!data.isEmpty() && !data.value("distance_mm").isDouble())
-                    card.dot->set_state(Level::Warn, QStringLiteral("距离无效"));
-                lines << QStringLiteral("距离  %1    置信度  %2").arg(reading(data, "distance_mm", " mm"), reading(data, "confidence_percent", "%"));
-                lines << QStringLiteral("采样计数  %1").arg(reading(data, "sample_counter"));
-            }
-        } else if (key == QLatin1String("air_conditioner")) {
-            const auto data = readings_.value(key).toObject();
-            lines << QStringLiteral("柜内温度  %1    湿度  %2").arg(reading(data, "temperature_c", " °C"), reading(data, "humidity_percent", " %RH"));
-            lines << QStringLiteral("电源  %1    模式码  %2").arg(state(data, "power_on", "开", "关"), reading(data, "mode_code"));
-            lines << QStringLiteral("制冷  %1    加热  %2").arg(state(data, "cooling", "运行", "停止"), state(data, "heating", "运行", "停止"));
-            QStringList alarms;
-            for (const auto& alarm : data.value("alarms").toArray()) alarms << alarm.toString();
-            const auto status_error = data.value("status_error").toString();
-            const auto parameters_error = data.value("parameters_error").toString();
-            lines << QStringLiteral("告警  %1").arg(!alarms.isEmpty() ? alarms.join(QStringLiteral("、")) :
-                data.value("alarms").isArray() && status_error.isEmpty() ? QStringLiteral("无") : QStringLiteral("—"));
-            if (!alarms.isEmpty()) card.dot->set_state(Level::Warn, QStringLiteral("设备告警"));
-            if (!status_error.isEmpty() || !parameters_error.isEmpty()) {
-                card.dot->set_state(Level::Warn, QStringLiteral("读数不完整"));
-                if (!status_error.isEmpty()) lines << status_error;
-                if (!parameters_error.isEmpty()) lines << parameters_error;
-            }
-            if (data.value("fault").toBool()) card.dot->set_state(Level::Danger, QStringLiteral("设备故障"));
-        }
-        card.detail->setText(lines.isEmpty() ? QStringLiteral("等待读取设备") : lines.join('\n'));
+        if (result.detail.isEmpty()) result.detail = parameters_error;
+    } else if (key == QLatin1String("indicator") && !snapshot.lamp_error.isEmpty()) {
+        result.level = Level::Warn;
+        result.status = QStringLiteral("灯态未确认");
+        result.detail = snapshot.lamp_error;
     }
-    int height = 0;
-    for (const auto& card : cards_) height = std::max(height, card.frame->sizeHint().height());
-    for (const auto& card : cards_) card.frame->setMinimumHeight(height);
+    return result;
 }
 
 }  // namespace libs::ui

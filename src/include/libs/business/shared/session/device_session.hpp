@@ -18,6 +18,7 @@
 #include "libs/devices/laser.hpp"
 #include "libs/devices/rangefinder.hpp"
 #include "libs/devices/spectrometer.hpp"
+#include "libs/devices/su300.hpp"
 #include "libs/error.hpp"
 #include "libs/transport/serial.hpp"
 
@@ -43,12 +44,13 @@ struct HealthReport {
     DeviceState spectrometer;
     DeviceState rangefinder;
     DeviceState air_conditioner;
+    DeviceState motor;
 };
 
 // 进程内唯一的设备持有者。不可拷贝、不可移动。
 class DeviceSession {
 public:
-    enum class Device { laser, indicator, rangefinder, air_conditioner, spectrometer };
+    enum class Device { laser, indicator, rangefinder, air_conditioner, spectrometer, motor };
     DeviceSession() = default;
     ~DeviceSession();
     DeviceSession(const DeviceSession&) = delete;
@@ -78,6 +80,7 @@ public:
     libs::devices::Spectrometer* spectrometer();
     libs::devices::Rangefinder* rangefinder();
     libs::devices::AirConditioner* air_conditioner();
+    libs::devices::Su300* motor();
     const std::vector<libs::devices::SpectrometerInfo>& spectrometer_channels() const noexcept {
         return spectrometer_channels_;
     }
@@ -102,6 +105,7 @@ private:
     std::unique_ptr<libs::devices::Spectrometer> spectrometer_;
     std::unique_ptr<libs::devices::Rangefinder> rangefinder_;
     std::unique_ptr<libs::devices::AirConditioner> air_conditioner_;
+    std::unique_ptr<libs::devices::Su300> motor_;
     std::vector<libs::devices::SpectrometerInfo> spectrometer_channels_;
 
     DeviceState laser_state_;
@@ -109,6 +113,7 @@ private:
     DeviceState spectrometer_state_;
     DeviceState rangefinder_state_;
     DeviceState air_conditioner_state_;
+    DeviceState motor_state_;
 };
 
 }  // namespace business::session

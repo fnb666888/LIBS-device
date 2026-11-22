@@ -204,7 +204,6 @@ Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
         {"q_delay_us",          &cfg.q_delay_us},
         {"q_warmup_s",          &cfg.q_warmup_s},
         {"settle_timeout_ms",   &cfg.settle_timeout_ms},
-        {"emission_hold_ms",    &cfg.emission_hold_ms},
         {"min_discharges",      &cfg.min_discharges},
     };
     for (const Field& f : fields) {
@@ -220,7 +219,6 @@ Result<LaserFireConfig> parse_laser_fire(const json::Value& parent) {
         if (cfg.pulse_width_us == 0)      return invalid("laser_fire.pulse_width_us is required when commissioned=true");
         if (cfg.frequency_hz == 0)        return invalid("laser_fire.frequency_hz is required when commissioned=true");
         if (cfg.q_delay_us == 0)          return invalid("laser_fire.q_delay_us is required when commissioned=true");
-        if (cfg.emission_hold_ms == 0)    return invalid("laser_fire.emission_hold_ms is required when commissioned=true");
         if (cfg.min_discharges == 0)      return invalid("laser_fire.min_discharges must be at least 1");
     }
     return cfg;
@@ -284,6 +282,28 @@ Result<SiteConfig> from_json(const json::Value& value) {
     if (!air_conditioner) return air_conditioner.error();
     cfg.air_conditioner = air_conditioner.value();
 
+    const auto motor = parse_optional_modbus(value, "motor");
+    if (!motor) return motor.error();
+    cfg.motor.connection = motor.value();
+    if (value.has("motor")) {
+        const auto& node = value["motor"];
+        const auto jog = optional_uint(node, "jog_ms", "motor", 0);
+        const auto forward = optional_uint(node, "forward_limit_mask", "motor", 0);
+        const auto reverse = optional_uint(node, "reverse_limit_mask", "motor", 0);
+        const auto active_low = optional_bool(node, "limits_active_low", false);
+        if (!jog) return jog.error();
+        if (!forward) return forward.error();
+        if (!reverse) return reverse.error();
+        if (!active_low) return active_low.error();
+        cfg.motor.jog_ms = jog.value();
+        cfg.motor.forward_limit_mask = forward.value();
+        cfg.motor.reverse_limit_mask = reverse.value();
+        cfg.motor.limits_active_low = active_low.value();
+        if (cfg.motor.connection.serial.enabled && cfg.motor.jog_ms && (forward.value() || reverse.value()) &&
+                !node.has("limits_active_low"))
+            return invalid("motor.limits_active_low is required when limit inputs are configured");
+    }
+
     const VoidResult v = validate(cfg);
     if (!v) return v.error();
     return cfg;
@@ -315,7 +335,6 @@ json::Value to_json(const SiteConfig& config) {
     lf.set("q_delay_us", json::Value(static_cast<double>(config.laser_fire.q_delay_us)));
     lf.set("q_warmup_s", json::Value(static_cast<double>(config.laser_fire.q_warmup_s)));
     lf.set("settle_timeout_ms", json::Value(static_cast<double>(config.laser_fire.settle_timeout_ms)));
-    lf.set("emission_hold_ms", json::Value(static_cast<double>(config.laser_fire.emission_hold_ms)));
     lf.set("min_discharges", json::Value(static_cast<double>(config.laser_fire.min_discharges)));
     v.set("laser_fire", std::move(lf));
 
@@ -328,6 +347,12 @@ json::Value to_json(const SiteConfig& config) {
     };
     v.set("rangefinder", modbus_json(config.rangefinder));
     v.set("air_conditioner", modbus_json(config.air_conditioner));
+    auto motor = modbus_json(config.motor.connection);
+    motor.set("jog_ms", json::Value(static_cast<double>(config.motor.jog_ms)));
+    motor.set("forward_limit_mask", json::Value(static_cast<double>(config.motor.forward_limit_mask)));
+    motor.set("reverse_limit_mask", json::Value(static_cast<double>(config.motor.reverse_limit_mask)));
+    motor.set("limits_active_low", json::Value(config.motor.limits_active_low));
+    v.set("motor", std::move(motor));
     return v;
 }
 
@@ -460,6 +485,18 @@ VoidResult validate(const SiteConfig& config) {
     if (!rangefinder) return rangefinder;
     const auto air_conditioner = check_modbus("air_conditioner", config.air_conditioner);
     if (!air_conditioner) return air_conditioner;
+    const auto motor = check_modbus("motor", config.motor.connection);
+    if (!motor) return motor;
+    if (config.motor.connection.serial.enabled && config.motor.jog_ms) {
+        const auto single_bit = [](unsigned mask) { return mask && mask <= 0xffff && (mask & (mask - 1)) == 0; };
+        if (config.motor.jog_ms < libs::measurement_limits::kMotorJogMinMs ||
+                config.motor.jog_ms > libs::measurement_limits::kMotorJogMaxMs)
+            return invalid("motor.jog_ms must be in 100..50000, or 0 for status only");
+        if ((config.motor.forward_limit_mask || config.motor.reverse_limit_mask) &&
+            (!single_bit(config.motor.forward_limit_mask) || !single_bit(config.motor.reverse_limit_mask) ||
+             config.motor.forward_limit_mask == config.motor.reverse_limit_mask))
+            return invalid("motor limit mappings must be omitted or use distinct one-bit masks");
+    }
     if (config.spectrometer.enabled) {
         if (config.spectrometer.sdk_dll.empty())
             return invalid("spectrometer is enabled but sdk_dll is empty");
@@ -490,7 +527,7 @@ VoidResult validate_laser_fire(const LaserFireConfig& lf) {
         {"discharge_current_a", lf.discharge_current_a}, {"pulse_width_us", lf.pulse_width_us},
         {"frequency_hz", lf.frequency_hz}, {"discharge_delay_us", lf.discharge_delay_us},
         {"q_delay_us", lf.q_delay_us}, {"q_warmup_s", lf.q_warmup_s},
-        {"settle_timeout_ms", lf.settle_timeout_ms}, {"emission_hold_ms", lf.emission_hold_ms},
+        {"settle_timeout_ms", lf.settle_timeout_ms},
         {"min_discharges", lf.min_discharges},
     };
     for (const auto& field : fields) {

@@ -9,6 +9,7 @@
 #include "libs/devices/indicator.hpp"
 #include "libs/devices/laser.hpp"
 #include "libs/devices/rangefinder.hpp"
+#include "libs/devices/su300.hpp"
 #include "libs/hex.hpp"
 #include "libs/protocols/laser.hpp"
 #include "libs/protocols/modbus_rtu.hpp"
@@ -372,6 +373,145 @@ TEST_MAIN_BEGIN()
     auto result = lamp.applyAll({{indicator::Channel::green, indicator::State::on}}, true);
     CHECK(!result.ok());
     CHECK_EQ(result.error().code, std::string("indicator_state_mismatch"));
+}
+
+{
+    CASE(su300_status_and_jog_use_manual_registers);
+    FakeLink link;
+    devices::Su300 drive(link, 1, 650);
+    link.queue(modbus_read_reply(1, 0x2100, 4, {0, 0, 750, 0}));
+    link.queue(modbus_read_reply(1, 0x2114, 4, {8, 0, 0x2000, 2}));
+    const auto status = drive.read_status();
+    CHECK(status);
+    if (status) {
+        CHECK(status.value().stopped());
+        CHECK(status.value().communication_control);
+        CHECK_EQ(status.value().inputs, 8);
+        CHECK_EQ(status.value().reference_centihz, 750);
+    }
+    CHECK(drive.jog(devices::Su300Direction::forward));
+    CHECK(drive.jog(devices::Su300Direction::reverse));
+    CHECK(drive.stop());
+    CHECK(!drive.jog(devices::Su300Direction::unknown));
+    CHECK_EQ(link.sent[0].request, modbus::make_request(1, 3, 0x2100, 4));
+    CHECK_EQ(link.sent[1].request, modbus::make_request(1, 3, 0x2114, 4));
+    CHECK_EQ(link.sent[2].request, modbus::make_request(1, 6, 0x2000, 0x0013));
+    CHECK_EQ(link.sent[3].request, modbus::make_request(1, 6, 0x2000, 0x0023));
+    const Bytes manual_stop{0x01, 0x06, 0x20, 0x00, 0x00, 0x01, 0x43, 0xca};
+    CHECK_EQ(link.sent[4].request, manual_stop);
+}
+
+{
+    CASE(su300_confirms_stop_for_field_status_only_with_consistent_readback);
+    const auto read_status = [](std::uint16_t run_status, std::uint16_t flags,
+                                std::uint16_t frequency, std::uint16_t direction,
+                                std::uint16_t fault = 0) {
+        FakeLink link;
+        devices::Su300 drive(link, 1, 650);
+        link.queue(modbus_read_reply(1, 0x2100, 4, {fault, run_status, 4760, frequency}));
+        link.queue(modbus_read_reply(1, 0x2114, 4, {0, 0, flags, direction}));
+        return drive.read_status();
+    };
+
+    const auto field_status = read_status(0x040a, 0x2000, 0, 3);
+    CHECK(field_status);
+    if (field_status) CHECK(field_status.value().stopped());
+    const auto forward = read_status(0x340d, 0x2005, 130, 3);
+    const auto reverse = read_status(0x3415, 0x2005, 130, 3);
+    CHECK(forward && forward.value().jogging && forward.value().direction == devices::Su300Direction::forward);
+    CHECK(reverse && reverse.value().jogging && reverse.value().direction == devices::Su300Direction::reverse);
+    const auto forward_with_stale_direction = read_status(0x340d, 0x2005, 130, 1);
+    const auto reverse_with_stale_direction = read_status(0x3415, 0x2005, 130, 2);
+    CHECK(forward_with_stale_direction && forward_with_stale_direction.value().confirms_jog(devices::Su300Direction::forward));
+    CHECK(reverse_with_stale_direction && reverse_with_stale_direction.value().confirms_jog(devices::Su300Direction::reverse));
+    const auto reverse_before_output = read_status(0x3415, 0x2005, 0, 2);
+    CHECK(reverse_before_output && !reverse_before_output.value().stopped());
+    CHECK(reverse_before_output && !reverse_before_output.value().confirms_jog(devices::Su300Direction::reverse));
+
+    for (const auto& uncertain : {read_status(0x0408, 0x2000, 0, 3),
+                                  read_status(0x140a, 0x2000, 0, 3),
+                                  read_status(0x040e, 0x2000, 0, 3),
+                                  read_status(0x040a, 0x2001, 0, 3),
+                                  read_status(0x040a, 0x2004, 0, 3),
+                                  read_status(0x040a, 0x2008, 0, 3),
+                                  read_status(0x040a, 0x2100, 0, 3),
+                                  read_status(0x040a, 0x2000, 1, 3),
+                                  read_status(0x040a, 0x2000, 0, 4),
+                                  read_status(0x040a, 0x2000, 0, 3, 1)}) {
+        CHECK(uncertain);
+        if (uncertain) CHECK(!uncertain.value().stopped());
+    }
+}
+
+{
+    CASE(su300_timed_jog_profile_uses_verified_watchdog_readbacks);
+    FakeLink link;
+    devices::Su300 drive(link, 1, 180);
+    link.queue(modbus_read_reply(1, 0x0018, 1, {0}));
+    link.queue(modbus_read_reply(1, 0x0109, 4, {200, 200, 100, 100}));
+    link.queue(modbus_read_reply(1, 0x0500, 1, {0x1001}));
+    link.queue(modbus_read_reply(1, 0x0602, 1, {0}));
+    const auto profile = drive.read_jog_profile();
+    CHECK(profile);
+    if (profile) {
+        CHECK_EQ(profile.value().forward_hz, 20.0);
+        CHECK_EQ(profile.value().reverse_hz, 20.0);
+        CHECK_EQ(profile.value().deceleration_ms, 10000u);
+        CHECK_EQ(profile.value().communication_timeout_ms, 0u);
+    }
+    link.queue(modbus_read_reply(1, 0x0500, 1, {0}));
+    const auto unverified = drive.read_stop_watchdog();
+    CHECK(!unverified);
+    if (!unverified) CHECK_EQ(unverified.error().code, std::string("su300_loss_action_unverified"));
+
+    link.queue(modbus_read_reply(1, 0x0500, 1, {0x1001}));
+    link.queue(modbus_read_reply(1, 0x0602, 1, {0}));
+    const auto original = drive.read_stop_watchdog();
+    CHECK(original && original.value() == 0);
+
+    link.queue(modbus_read_reply(1, 0x0602, 1, {0}));
+    const auto mismatch = drive.set_communication_watchdog(10);
+    CHECK(!mismatch);
+    if (!mismatch) CHECK_EQ(mismatch.error().code, std::string("su300_watchdog_mismatch"));
+
+    link.queue(modbus_read_reply(1, 0x0602, 1, {10}));
+    CHECK(drive.set_communication_watchdog(10));
+    CHECK_EQ(link.sent[link.sent.size() - 2].request, modbus::make_request(1, 6, 0x0602, 10));
+}
+
+{
+    CASE(su300_frequency_updates_both_directions_and_verifies_rollback);
+    const auto queue_preflight = [](FakeLink& link) {
+        link.queue(modbus_read_reply(1, 0x2100, 4, {0, 0x040a, 2000, 0}));
+        link.queue(modbus_read_reply(1, 0x2114, 4, {0, 0, 0x2000, 3}));
+        link.queue(modbus_read_reply(1, 0x0018, 1, {0}));
+        link.queue(modbus_read_reply(1, 0x0004, 2, {500, 400}));
+    };
+    FakeLink link;
+    devices::Su300 drive(link, 1, 180);
+    CHECK(!drive.set_jog_frequency(0));
+    CHECK(link.sent.empty());
+    queue_preflight(link);
+    const auto limited = drive.set_jog_frequency(401);
+    CHECK(!limited && limited.error().code == "su300_jog_frequency_device_limit");
+    CHECK_EQ(link.sent.size(), 4u);
+
+    queue_preflight(link);
+    link.queue(modbus_read_reply(1, 0x0109, 2, {200, 190}));
+    link.queue(modbus_read_reply(1, 0x0109, 2, {250, 250}));
+    CHECK(drive.set_jog_frequency(250));
+    CHECK_EQ(link.sent[9].request, modbus::make_request(1, 6, 0x0109, 250));
+    CHECK_EQ(link.sent[10].request, modbus::make_request(1, 6, 0x010a, 250));
+
+    const auto first = link.sent.size();
+    queue_preflight(link);
+    link.queue(modbus_read_reply(1, 0x0109, 2, {250, 220}));
+    link.queue(modbus_read_reply(1, 0x0109, 2, {300, 220}));
+    link.queue(modbus_read_reply(1, 0x0109, 2, {250, 220}));
+    const auto mismatch = drive.set_jog_frequency(300);
+    CHECK(!mismatch && mismatch.error().code == "su300_jog_frequency_mismatch");
+    CHECK_EQ(link.sent[first + 8].request, modbus::make_request(1, 6, 0x0109, 250));
+    CHECK_EQ(link.sent[first + 9].request, modbus::make_request(1, 6, 0x010a, 220));
 }
 
 TEST_MAIN_RETURN()

@@ -47,6 +47,14 @@ struct ModbusDeviceConfig {
     std::uint8_t address = 1;
 };
 
+struct MotorConfig {
+    ModbusDeviceConfig connection;
+    unsigned jog_ms = 0;
+    unsigned forward_limit_mask = 0;
+    unsigned reverse_limit_mask = 0;
+    bool limits_active_low = false;
+};
+
 // 光谱仪配置。通道数量与序列号都来自配置，USB 口没有"端口名"概念。
 struct SpectrometerConfig {
     std::string sdk_dll;                    // 绝对 UTF-8 路径的 avaspecx64.dll
@@ -100,9 +108,6 @@ struct LaserFireConfig {
     // 厂家日志里这个过渡约 5~6 秒且不是常数，所以只能轮询状态位、不能固定 sleep。
     unsigned settle_timeout_ms = 20000;
 
-    // 光闸保持打开的时间窗口 = 连续出光的时长。按设定频率算够打的发数。
-    unsigned emission_hold_ms = 3000;
-
     // 至少要有这么多次放电才算"真的出光了"。计数器不涨 = 没放电 = 失败。
     unsigned min_discharges = 1;
 };
@@ -125,6 +130,7 @@ struct SiteConfig {
     std::uint8_t indicator_address = 1;
     ModbusDeviceConfig rangefinder;
     ModbusDeviceConfig air_conditioner;
+    MotorConfig motor;
 };
 
 // 从 JSON 文本解析。任一字段非法都返回 invalid_argument，不回落默认值。

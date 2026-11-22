@@ -289,10 +289,28 @@ TEST_MAIN_BEGIN()
     devices::AirConditioner ac(link, 8);
     const auto environment = ac.readEnvironment();
     CHECK(environment.cooling.value_or(false));
-    CHECK(environment.power_on.has_value());
+    CHECK(environment.power_on.value_or(false));
+    CHECK(environment.indoor_fan_on.value_or(false));
+    CHECK(environment.outdoor_fan_on.has_value());
+    CHECK(!environment.outdoor_fan_on.value_or(true));
     CHECK(!environment.cabinet_temperature_c.has_value());
     CHECK(environment.status_error.empty());
     CHECK_EQ(environment.parameters_error, std::string("link lost"));
+}
+
+{
+    CASE(environment_decodes_set_power_bit_as_off);
+    FakeLink link;
+    Bytes reply{8, 1, 3, 0x80, 0, 0}; // 10042 is bit 7 when reading from 10035.
+    const auto crc = modbus::crc16(reply.data(), reply.size());
+    reply.push_back(static_cast<std::uint8_t>(crc));
+    reply.push_back(static_cast<std::uint8_t>(crc >> 8));
+    link.queue(reply);
+    link.queue_error(Error::make(ErrorKind::transport, "cable_unplugged", "link lost"));
+    devices::AirConditioner ac(link, 8);
+    const auto environment = ac.readEnvironment();
+    CHECK(environment.power_on.has_value());
+    CHECK(!environment.power_on.value_or(true));
 }
 
 {

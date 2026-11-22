@@ -40,6 +40,7 @@ enum class GateReason {
     not_enabled,              // 设备未使能
     laser_not_commissioned,   // 本机出光参数未标定
     stop_unconfirmed,
+    head_stop_unconfirmed,
 };
 const char* to_string(GateReason reason) noexcept;
 

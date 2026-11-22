@@ -58,6 +58,8 @@ MachineSnapshot parse_status(const QJsonObject& p) {
         s.devices.push_back(parse_device(QStringLiteral("rangefinder"), QStringLiteral("测距仪"), h.value("rangefinder").toObject()));
     if (h.value("air_conditioner").isObject())
         s.devices.push_back(parse_device(QStringLiteral("air_conditioner"), QStringLiteral("空调"), h.value("air_conditioner").toObject()));
+    if (h.value("motor").isObject())
+        s.devices.push_back(parse_device(QStringLiteral("motor"), QStringLiteral("检测头移位电机"), h.value("motor").toObject()));
 
     // ── gate ──────────────────────────────────────────────────────────
     const QJsonObject g = p.value("gate").toObject();
@@ -82,6 +84,7 @@ MachineSnapshot parse_status(const QJsonObject& p) {
     s.lamp_error = text_of(lamp, "last_error");
     s.lamp_applied = bool_of(lamp, "applied");
     s.prediction = p.value("prediction").toObject();
+    s.motor = p.value("motor").toObject();
     return s;
 }
 

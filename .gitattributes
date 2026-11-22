@@ -1,2 +1,5 @@
 # Feature windows are a hash-verified model asset; preserve exact bytes.
 src/algorithms/iron_ore/model/current/feature_windows.csv -text
+
+# Keep the vendor manual byte-for-byte and omit its binary contents from text diffs.
+device-references/inverter/*.pdf binary

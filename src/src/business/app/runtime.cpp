@@ -22,6 +22,7 @@ json::Value to_json(const session::HealthReport& report) {
     v.set("spectrometer", device(report.spectrometer));
     v.set("rangefinder", device(report.rangefinder));
     v.set("air_conditioner", device(report.air_conditioner));
+    v.set("motor", device(report.motor));
     return v;
 }
 
@@ -97,7 +98,7 @@ libs::VoidResult Runtime::start(const config::SiteConfig& config, const Options&
     monitor_->set_parameters_ready(parameters_service_.readiness().ready);
     monitor_->set_laser_enabled(config_.laser.enabled);
     // 出光参数是否已标定，**按参数库实际内容算**，不再读 site.json 的 commissioned：
-    // 参数管理页面填齐 9 个合法值即视为已标定。未标定 -> 判定拦截，一条写指令都不发。
+    // 参数管理页面的必填值齐备且合法时才视为已标定。
     monitor_->set_laser_commissioned(parameters_service_.commissioned_from_store());
 
     // ── shared：数据交付 ────────────────────────────────────────────────
@@ -194,6 +195,7 @@ libs::VoidResult Runtime::stop() {
                                stopped.error().message));
     }
     stop_device_monitoring();
+    const auto motor_stopped = stop_motor_on_exit();
     // The job destructor also stops the laser. Destroy it while its device
     // pointers are still valid, before DeviceSession releases those objects.
     measurement_.reset();
@@ -209,7 +211,7 @@ libs::VoidResult Runtime::stop() {
     const libs::VoidResult closed = devices_.close();
     log_->write(logging::RecordKind::general,
                 closed ? "设备已关闭" : ("设备关闭报错: " + closed.error().message));
-    return closed;
+    return motor_stopped ? closed : motor_stopped;
 }
 
 void Runtime::set_last_delivery(data_delivery::DeliveryStatus status) {

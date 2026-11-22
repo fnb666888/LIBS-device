@@ -60,6 +60,8 @@ int main(int argc, char** argv) {
             QMetaObject::invokeMethod(&window, "show_parameter_page", Qt::DirectConnection);
         if (page == QLatin1String("device_status"))
             QMetaObject::invokeMethod(&window, "show_device_status_page", Qt::DirectConnection);
+        if (page == QLatin1String("help"))
+            QMetaObject::invokeMethod(&window, "show_help_page", Qt::DirectConnection);
         int delay = qEnvironmentVariableIntValue("LIBS_UI_SHOT_DELAY_MS");
         if (delay <= 0) delay = 2500;   // 没设或设坏了都用 2.5s
         QTimer::singleShot(delay, [&window, &shot] {

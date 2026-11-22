@@ -54,7 +54,7 @@ class QTimer;
 namespace libs::ui {
 
 class ParameterPage;
-class DeviceStatusPage;
+class HelpPage;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -96,6 +96,7 @@ private slots:
     void show_main_page();
     void show_parameter_page();
     void show_device_status_page();
+    void show_help_page();
 
     void on_auto_y_toggled(bool on);
     void on_lock_y_toggled(bool on);
@@ -159,12 +160,12 @@ private:
     StatusDot* readiness_dot_ = nullptr;
     QPushButton* param_page_btn_ = nullptr;
     QPushButton* main_page_btn_ = nullptr;
-    QPushButton* device_status_btn_ = nullptr;
+    QPushButton* help_page_btn_ = nullptr;
 
     // ── 页面容器 ─────────────────────────────────────────────────────
     QStackedWidget* pages_ = nullptr;
     ParameterPage* param_page_ = nullptr;
-    DeviceStatusPage* device_status_page_ = nullptr;
+    HelpPage* help_page_ = nullptr;
     bool device_status_reading_ = false;
     bool air_read_queued_ = false;
     QLabel* banner_ = nullptr;
@@ -200,6 +201,7 @@ private:
     StatusDot* spectrometer_dot_ = nullptr;
     StatusDot* rangefinder_dot_ = nullptr;
     StatusDot* air_dot_ = nullptr;
+    StatusDot* motor_dot_ = nullptr;
     QLabel* measurement_label_ = nullptr;
 
     // ── 导出 ─────────────────────────────────────────────────────────

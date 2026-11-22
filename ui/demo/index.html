@@ -21,28 +21,22 @@
     <nav class="tabs primary-nav" aria-label="主页面">
       <a href="#spectrum" data-page-link="spectrum">实时光谱</a>
       <a href="#parameters" data-page-link="parameters">仪器参数</a>
-      <a href="#devices" data-page-link="devices">设备状态</a>
+      <a href="#help" data-page-link="help">帮助</a>
     </nav>
     <time class="hint clock" id="clock"></time>
   </header>
 
   <main>
+    <p class="banner" id="measurement-message" role="status">实时显示模拟采集的光谱。数据保存进度可在下方采集状态中查看。</p>
     <section id="page-spectrum" aria-label="实时光谱">
-      <p class="banner" id="measurement-message" role="status">模拟采集，可启停并导出光谱。</p>
       <section class="card control-card" id="measurement-controls" aria-labelledby="control-title">
         <h1 id="control-title">检测控制</h1>
         <div class="actions">
           <button type="button" id="start-measurement" class="primary">开始检测</button>
           <button type="button" id="stop-measurement" class="danger" disabled>停止检测</button>
-          <span class="hint" id="gate-state" role="status">等待读取安全门禁</span>
-          <div class="scenario">
-            <label for="demo-scenario">演示场景</label>
-            <select id="demo-scenario">
-              <option value="ready">设备就绪</option>
-              <option value="standby">待就绪</option>
-              <option value="interlock">门禁告警</option>
-              <option value="offline">设备离线</option>
-            </select>
+          <div class="gate-status" role="status">
+            <span class="status"><span class="dot" id="gate-dot" aria-hidden="true"></span><span id="gate-state">等待读取安全门禁</span></span>
+            <p class="hint" id="gate-detail" hidden></p>
           </div>
         </div>
       </section>
@@ -53,7 +47,7 @@
             <label class="check"><input type="checkbox" id="auto-axis" checked>纵轴自动</label>
             <label class="check"><input type="checkbox" id="lock-axis">锁定纵轴</label>
             <label class="check"><input type="checkbox" id="pause-display">暂停刷新</label>
-            <button type="button" id="export-spectrum" disabled>导出数据</button>
+            <button type="button" id="export-spectrum" class="ghost" disabled>导出数据</button>
           </div>
           <div class="plot" id="spectrum-plot">
             <canvas id="spectrum-canvas" role="img" aria-label="模拟光谱，横轴为波长，纵轴为强度"></canvas>
@@ -64,9 +58,7 @@
           </div>
           <div class="spectrum-footer">
             <p class="hint" id="capture-note">等待采集 · 尚无光谱数据</p>
-            <div class="legend" id="spectrum-legend" hidden>
-              <span><i class="trace blue"></i>通道 1</span><span><i class="trace green"></i>通道 2</span><span><i class="trace amber"></i>通道 3</span>
-            </div>
+            <div class="legend" id="spectrum-legend" hidden></div>
           </div>
         </section>
 
@@ -89,70 +81,350 @@
       <section class="card capture-card" id="capture-summary" aria-labelledby="capture-title">
         <h2 id="capture-title">设备状态与采集计数</h2>
         <div class="capture-line">
-          <ul class="quick-status" id="quick-status" aria-label="五台设备状态"></ul>
+          <ul class="quick-status" id="quick-status" aria-label="设备状态"></ul>
           <p class="hint counters" id="capture-counters">采集 0 / 失败 0 · 落盘 0 / 失败 0 · 积压 0</p>
         </div>
       </section>
     </section>
 
     <section id="page-parameters" class="parameters-layout" aria-label="仪器参数" hidden>
+      <div class="parameter-status-toolbar actions">
+        <p class="hint parameter-mode-note">手动测试使用模拟设备</p>
+        <p class="hint" id="refresh-note">等待读取设备</p>
+        <button type="button" class="ghost" id="refresh-devices">刷新状态</button>
+      </div>
       <form class="card parameter-card" id="laser-parameters" aria-labelledby="laser-parameter-title" novalidate></form>
       <form class="card parameter-card" id="air-parameters" aria-labelledby="air-parameter-title" novalidate></form>
       <form class="card parameter-card" id="spectrometer-parameters" aria-labelledby="spectrometer-parameter-title" novalidate></form>
       <form class="card parameter-card" id="rangefinder-parameters" aria-labelledby="rangefinder-parameter-title" novalidate>
-        <h2 id="rangefinder-parameter-title">测距仪参数</h2>
-        <div class="tile-grid" id="rangefinder-rule-fields"></div>
-        <div class="range-result" id="rangefinder-preview">
-          <span class="status">模拟距离 <strong id="range-distance">—</strong></span>
-          <span class="status" id="range-material"><span class="dot" aria-hidden="true"></span><span>待判定</span></span>
-          <span class="status" id="range-window"><span class="dot" aria-hidden="true"></span><span>待判定</span></span>
-        </div>
-        <div class="parameter-footer">
-          <p class="hint" id="rangefinder-rule-note" role="status"></p>
-          <button type="submit" id="save-range-rules" class="primary" aria-label="保存测距仪参数">保存参数</button>
-        </div>
-      </form>
-      <form class="card parameter-card" id="indicator-parameters" aria-labelledby="indicator-parameter-title">
         <div class="card-title">
-          <h2 id="indicator-parameter-title">状态灯参数</h2>
-          <span class="status" id="indicator-preview"><span class="dot warning" aria-hidden="true"></span><span>自动 · 黄灯</span></span>
+          <h2 id="rangefinder-parameter-title">测距仪</h2>
         </div>
-        <div class="tile-grid">
-          <div class="parameter-tile">
-            <label for="indicator-color">试灯颜色</label>
-            <select id="indicator-color" name="color">
-              <option value="red">红灯</option>
-              <option value="yellow">黄灯</option>
-              <option value="green">绿灯</option>
-              <option value="off">全灭</option>
-            </select>
+        <section class="parameter-section" aria-label="参数调节">
+          <div class="card-title">
+            <h3>参数调节</h3>
+            <a class="parameter-help-link" href="#help/rangefinder" aria-label="测距仪参数说明">参数说明</a>
           </div>
-          <div class="parameter-tile">
-            <label for="indicator-pattern">显示方式</label>
-            <select id="indicator-pattern" name="pattern">
-              <option value="steady">常亮</option>
-              <option value="fast">快闪（2 Hz）</option>
-            </select>
+          <div class="tile-grid" id="rangefinder-rule-fields"></div>
+          <div class="parameter-footer">
+            <p class="hint" id="rangefinder-rule-note" role="status"></p>
+            <div class="actions">
+              <button type="button" id="reload-range-rules" class="ghost" aria-label="重新读取测距仪参数">重新读取</button>
+              <button type="submit" id="save-range-rules" class="primary" aria-label="保存测距仪参数">保存参数</button>
+            </div>
           </div>
-        </div>
-        <div class="parameter-footer">
-          <p class="hint" id="indicator-test-note" role="status"></p>
+        </section>
+        <section class="manual-section" aria-label="手动测试">
+          <h3>手动测试</h3>
           <div class="actions">
-            <button type="button" id="end-lamp-test" class="ghost" hidden>恢复自动</button>
-            <button type="button" id="start-lamp-test" class="ghost">模拟试灯</button>
-            <button type="submit" id="save-lamp-preset" class="primary" aria-label="保存状态灯试灯参数">保存参数</button>
+            <button type="button" id="read-rangefinder">单次测距</button>
           </div>
-        </div>
+          <p class="hint manual-result" id="rangefinder-trial-result" role="status"></p>
+        </section>
       </form>
+      <section class="card parameter-card" id="indicator-parameters" aria-labelledby="indicator-parameter-title">
+        <div class="card-title">
+          <h2 id="indicator-parameter-title">三色状态灯</h2>
+        </div>
+        <section class="manual-section" aria-label="手动测试">
+          <div class="card-title">
+            <h3>手动测试</h3>
+            <a class="parameter-help-link" href="#help/indicator" aria-label="三色状态灯参数说明">参数说明</a>
+          </div>
+          <div class="tile-grid">
+            <div class="parameter-tile">
+              <label for="indicator-color">试灯颜色</label>
+              <select id="indicator-color" name="color">
+                <option value="red">红灯</option>
+                <option value="yellow">黄灯</option>
+                <option value="green">绿灯</option>
+                <option value="off">全灭</option>
+              </select>
+            </div>
+            <div class="parameter-tile">
+              <label for="indicator-pattern">显示方式</label>
+              <select id="indicator-pattern" name="pattern">
+                <option value="steady">常亮</option>
+                <option value="fast">快闪（2 Hz）</option>
+              </select>
+            </div>
+          </div>
+          <div class="actions">
+            <button type="button" id="start-lamp-test">预览试灯</button>
+            <button type="button" id="end-lamp-test" disabled>恢复自动</button>
+          </div>
+          <p class="hint manual-result" id="indicator-test-note" role="status"></p>
+        </section>
+      </section>
+      <section class="card parameter-card" id="motor-parameters" aria-labelledby="motor-parameter-title">
+        <div class="card-title">
+          <h2 id="motor-parameter-title">检测头移位电机</h2>
+        </div>
+        <form class="parameter-section" id="motor-settings" aria-label="参数调节" novalidate>
+          <div class="card-title">
+            <h3>参数调节</h3>
+            <a class="parameter-help-link" href="#help/motor" aria-label="检测头移位电机参数说明">参数说明</a>
+          </div>
+          <div class="tile-grid" id="motor-setting-fields"></div>
+          <div class="parameter-footer">
+            <p class="hint" id="motor-settings-note" role="status"></p>
+            <div class="actions">
+              <button type="button" id="read-motor-settings" class="ghost" aria-label="重新读取电机参数">重新读取</button>
+              <button type="submit" id="save-motor-settings" class="primary" aria-label="保存电机参数">保存参数</button>
+            </div>
+          </div>
+        </form>
+        <section class="manual-section" aria-label="手动测试">
+          <h3>手动测试</h3>
+          <div class="actions motor-actions" role="group" aria-label="检测头移位控制" aria-describedby="motor-control-note">
+            <button type="button" id="motor-forward">正向点动</button>
+            <button type="button" id="motor-reverse">反向点动</button>
+            <button type="button" id="motor-stop" class="danger">停止点动</button>
+          </div>
+          <p class="hint manual-result" id="motor-control-note">检测停止后可手动移位。</p>
+          <p class="hint manual-result" id="motor-result" role="status" hidden></p>
+        </section>
+      </section>
     </section>
 
-    <section id="page-devices" aria-label="设备状态" hidden>
-      <header class="device-toolbar actions">
-        <p class="hint" id="refresh-note" role="status">等待读取设备</p>
-        <button type="button" class="ghost" id="refresh-devices">刷新状态</button>
-      </header>
-      <div class="device-layout" id="device-cards"></div>
+    <section id="page-help" class="help-page" aria-label="仪器调试帮助" hidden>
+      <aside class="help-sidebar">
+        <label for="help-search">搜索帮助</label>
+        <input id="help-search" type="search" placeholder="参数名称或提示信息" autocomplete="off" aria-controls="help-nav">
+        <p class="hint" id="help-search-status" role="status"></p>
+        <nav class="help-nav" id="help-nav" aria-label="帮助目录">
+          <div class="help-nav-group">
+            <h2>调试指南</h2>
+            <a href="#help" data-help-topic="start">开始调试</a>
+            <a href="#help/troubleshooting" data-help-topic="troubleshooting">常见问题</a>
+          </div>
+          <div class="help-nav-group">
+            <h2>设备参数</h2>
+            <a href="#help/laser" data-help-topic="laser">激光器</a>
+            <a href="#help/spectrometer" data-help-topic="spectrometer">光谱仪</a>
+            <a href="#help/air" data-help-topic="air">空调</a>
+            <a href="#help/rangefinder" data-help-topic="rangefinder">测距仪</a>
+            <a href="#help/indicator" data-help-topic="indicator">状态灯</a>
+            <a href="#help/motor" data-help-topic="motor">检测头移位电机</a>
+          </div>
+        </nav>
+      </aside>
+      <div class="help-content">
+        <article class="help-article" id="help-start" aria-labelledby="help-title" tabindex="-1">
+          <h1 id="help-title">开始调试</h1>
+          <p class="help-lead">在仪器参数页查看设备状态、修改设置并执行各设备的调试操作。</p>
+          <h2>修改、测试和保存</h2>
+          <ol>
+            <li>停止当前检测，打开「仪器参数」，找到要调的设备。</li>
+            <li>在「参数调节」里修改参数，再到「手动测试」执行设备动作。三色灯直接在「手动测试」里选颜色和闪烁方式。</li>
+            <li>查看「状态」和操作结果。用「保存参数」保留当前设置。Qt 的「重新读取」会按设备读取已保存参数或当前设备设定，网页 Demo 则读取浏览器里的保存值。</li>
+          </ol>
+          <h2>从哪里查</h2>
+          <ul>
+            <li>要核对参数用途和单位，选择目录里的设备。每张参数卡上的「参数说明」也能直接打开对应文档。</li>
+            <li>要查超时、按钮灰色或测距超窗等提示，在「搜索帮助」里输入提示，或打开<a href="#help/troubleshooting">常见问题</a>。</li>
+          </ul>
+          <p class="help-note">网页 Demo 使用模拟设备。Qt 的「开始真机连续检测」走正式检测和联锁；真机单帧采集、空调试运行、试灯、单次测距以及已启用的电机点动都通过后端操作设备。</p>
+        </article>
+        <article class="help-article" id="help-troubleshooting" aria-labelledby="help-troubleshooting-title" tabindex="-1" hidden>
+          <h1 id="help-troubleshooting-title">常见问题</h1>
+          <p class="help-lead">根据参数卡或检测控制区显示的提示，先检查对应条件。</p>
+          <h2>手动测试按钮灰色</h2>
+          <p>先确认检测已停止，再检查当前是否正在执行同一设备的测试或读写操作。Qt 的电机点动还要求通信控制可用、停机已回读且对应方向限位未触发，单次测距要求测距仪已连接。</p>
+          <h2>光谱仪提示「等待触发超时」</h2>
+          <p>demo 在发起试采后 20 ms 模拟送达触发，采集超时小于 20 ms 时会显示这条提示。真机若提示采集超时，需要核对触发是否到达、哪些通道未返回，以及等待上限是否覆盖这一帧的采集过程。<a href="#help/spectrometer">查看采集时序</a></p>
+          <h2>测距仪显示「距离超窗」</h2>
+          <p>把结果中的当前距离与「可测距离下限」「可测距离上限」比较。即使判定为有料，距离仍可能落在窗口外。<a href="#help/rangefinder">查看判定示例</a></p>
+          <h2>检测头不能点动</h2>
+          <p>看电机卡上的连接、故障、限位和停机状态。正在检测或等待停机回读时先等待。只触发一侧限位时，可查看另一方向的按钮是否可用。<a href="#help/motor">查看点动说明</a></p>
+          <h2>检测控制提示「等待停机回读」</h2>
+          <p>打开<a href="#parameters/motor">仪器参数里的移位电机卡</a>，查看电机是否在线以及当前输出频率。电机已启用时，系统会在确认停机后重新判定能否检测。</p>
+        </article>
+        <article class="help-article" id="help-laser" aria-labelledby="help-laser-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-laser-title">激光器参数</h1>
+            <a class="parameter-help-link" href="#parameters/laser" aria-label="返回激光器参数">返回调节</a>
+          </div>
+          <p class="help-lead">激光器先由电源给泵浦供能，再由 Q 开关控制储存的能量何时释放成短光脉冲。</p>
+          <h2>一发激光是怎么产生的</h2>
+          <ol class="help-timing" aria-label="泵浦、Q 开关和样品发光的概念顺序">
+            <li><strong>泵浦供能</strong><span>放电电流与放电脉宽描述电流脉冲</span></li>
+            <li><strong>Q 开关释放</strong><span>储存的能量以短激光脉冲输出</span></li>
+            <li><strong>样品发出等离子体光</strong><span>光谱仪记录各波长的发光强度</span></li>
+          </ol>
+          <p>可把 Q 开关理解成控制释放时刻的开关。泵浦期间，能量先积存在激光介质中。Q 开关动作时，激光腔的损耗快速降低，能量集中释放。界面上的「光闸」是电源允许或屏蔽 Q 信号的状态，放电电流、光闸状态和光谱采集结果分别描述这条链上的不同环节。</p>
+          <h2>电源与脉冲参数</h2>
+          <dl>
+            <div><dt>放电电流</dt><dd>电源设定的泵浦电流，单位为 A。它影响每次泵浦注入的能量。实际激光脉冲能量通常以 mJ 表示，还取决于脉宽、器件效率和 Q 开关时序。</dd></div>
+            <div><dt>放电脉宽</dt><dd>一次泵浦电流脉冲持续的时间，单位为 μs。它描述电源供能的时长。实际光脉冲的持续时间与 Q 开关、腔内损耗和增益有关，可以用光电探测器测量。</dd></div>
+            <div><dt>放电频率</dt><dd>电源计划每秒重复放电的次数，单位为 Hz。相邻两次放电的周期等于 1 除以频率，1 Hz 对应 1 s，2 Hz 对应 0.5 s。光谱仪要在下一个触发前留出完成采集的时间。</dd></div>
+            <div><dt>放电延时</dt><dd>调整泵浦电流脉冲在激光器电源时序中的起点，单位为 μs。这个量作用在激光器内部，光谱仪另有自己的「积分延时」。</dd></div>
+            <div><dt>Q 延时</dt><dd>调整电源发出 Q 信号的时刻，单位为 μs。它影响激光介质在释放光脉冲前能储存多久、储存多少能量。现有串口协议列出了设定值和单位，精确的参考边沿需要查对应电源的时序图。</dd></div>
+            <div><dt>Q 预热</dt><dd>送给激光器电源的预热时间设定，单位为 s，属于启动阶段。网页 Demo 会在模拟就绪后等待这段时间。</dd></div>
+          </dl>
+          <h2>软件等待与手动测试</h2>
+          <dl>
+            <div><dt>稳定等待超时</dt><dd>从工作使能后开始计时，软件等待设备报告「正在工作且放电」的上限，单位为 ms。超过上限会终止启动，光闸保持关闭。</dd></div>
+          </dl>
+          <h2>如何看测试结果</h2>
+          <p>Qt 的手动测试使用「开始真机连续检测」和「停止真机检测」。仪器参数中保存的激光和光谱设置用于下次正式检测。网页 Demo 可估算模拟放电次数。</p>
+          <p class="help-note">真机中已经放电、光闸已开启和成功采到一帧分别有不同的回读。若提示「等待超时」，先确认超时发生在激光器就绪阶段，还是光谱仪采集阶段。<a href="#help/spectrometer">查看光谱仪参数</a>。</p>
+          <p class="help-reference">原理资料 <a href="https://www.newport.com.cn/n/pulsed-laser-methods" target="_blank" rel="noopener noreferrer">Newport 脉冲激光与 Q 开关</a></p>
+        </article>
+        <article class="help-article" id="help-air" aria-labelledby="help-air-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-air-title">空调参数</h1>
+            <a class="parameter-help-link" href="#parameters/air" aria-label="返回空调参数">返回调节</a>
+          </div>
+          <p class="help-lead">柜内空调用温度判断是否需要制冷或加热，用相对湿度判断是否需要除湿。每种功能都用两个阈值控制启停。</p>
+          <h2>为什么开启和停止用两个值</h2>
+          <p>两个阈值之间留有一段区间，读数在区间内波动时，控制器会保持原来的状态。这段区间称为回差，可以减少反复启停。</p>
+          <p>例如设定 32 °C 开始制冷、27 °C 停止制冷。柜温从 33 °C 降到 29 °C 时，制冷仍在运行。若柜温从 26 °C 升到 29 °C，制冷仍保持停止。同样是 29 °C，结果取决于进入这段区间前的状态。</p>
+          <h2>六个阈值各自控制什么</h2>
+          <dl>
+            <div><dt>制冷开启</dt><dd>柜温达到或超过这个值时请求制冷。开启值设得越低，柜温上升时越早进入制冷。</dd></div>
+            <div><dt>制冷停止</dt><dd>柜温降到这个值或以下时结束制冷。它必须低于开启值，两者的差是制冷回差，单位为 °C。</dd></div>
+            <div><dt>加热开启</dt><dd>柜温降到这个值或以下时请求加热。开启值调高，柜温下降时就会更早请求加热。</dd></div>
+            <div><dt>加热停止</dt><dd>柜温升到这个值或以上时结束加热。它必须高于开启值，两者的差是加热回差，单位为 °C。</dd></div>
+            <div><dt>除湿开启</dt><dd>相对湿度达到或超过这个值时请求除湿。开启值调低，会在更低的相对湿度下开始除湿。</dd></div>
+            <div><dt>除湿停止</dt><dd>相对湿度降到这个值或以下时结束除湿。它必须低于开启值，两个值都用 %RH 表示。</dd></div>
+          </dl>
+          <p class="help-note">相对湿度表示当前水蒸气压占同温度下饱和水蒸气压的百分比。即使空气含水量一样，温度下降时相对湿度也可能升高。判断除湿动作时，要同时看柜温和 %RH。</p>
+          <h2>试运行时看什么</h2>
+          <ol>
+            <li>打开页面时会载入本机保存值，可以直接修改启停值。Qt 连接空调时，「重新读取」从控制器获取当前设定。空调离线时，该按钮载入本机保存值。</li>
+            <li>Qt 显示模式回读、内外风机和制冷、加热负载。点击「待机／送风」「制冷」「加热」或「除湿」试运行。连续 100 秒没有收到模式指令后，空调会恢复自动运行。</li>
+            <li>Qt 连接空调时，「保存参数」将设定下发给控制器，回读一致后保存到本机。离线时只保存到本机，连机后需再次保存以应用到控制器。网页 Demo 的试运行是模拟，数值保存在浏览器。</li>
+          </ol>
+          <p class="help-reference">原理资料 <a href="https://forecast.weather.gov/glossary.php?word=humidity" target="_blank" rel="noopener noreferrer">美国国家气象局的相对湿度定义</a></p>
+        </article>
+        <article class="help-article" id="help-spectrometer" aria-labelledby="help-spectrometer-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-spectrometer-title">光谱仪参数</h1>
+            <a class="parameter-help-link" href="#parameters/spectrometer" aria-label="返回光谱仪参数">返回调节</a>
+          </div>
+          <p class="help-lead">激光打到样品后会产生短暂发光的等离子体。光谱仪像一台按波长分别计光的相机，只把积分窗口内收到的光累积到这一帧。</p>
+          <p>四路光谱仪分别覆盖 185.6–312.1、305.8–415.9、403.7–496.7 和 512.0–564.7 nm。Qt 的「真机单帧采集」使用已保存的积分时间和各通道内部触发，无需激光触发。Qt 卡片的「可用通道」来自设备最近一次空闲枚举。</p>
+          <h2>光谱仪在什么时候采光</h2>
+          <p>项目以激光器发出的 TTL 电信号作为采集触发。收到这个同步信号后，光谱仪先等待积分延时，再开启积分窗口。这里的窗口起止以电触发为零点。</p>
+          <ol class="help-timing" aria-label="光谱采集时序">
+            <li><strong>收到 TTL 触发</strong><span>窗口时序从这里计时</span></li>
+            <li><strong>等待积分延时</strong><span>决定什么时候开始收光</span></li>
+            <li><strong>按积分时间采光</strong><span>结束积分后读出这一帧</span></li>
+          </ol>
+          <h2>三个参数各自控制什么</h2>
+          <dl>
+            <div><dt>积分时间</dt><dd>探测器各像素累计光信号的时长，单位为 ms。开始时间固定时，积分越长，窗口结束得越晚。等离子体发光很快衰减，后半段可能主要增加背景和暗信号。若像素累计的信号超过量程，谱峰会饱和。</dd></div>
+            <div><dt>积分延时</dt><dd>收到电触发后到开始积分的等待时间，单位为 ns。延时增大时，整个采集窗口后移。LIBS 早期常有较强的连续背景，稍后的谱线可能更容易与背景区分。延时太长时，待测谱线也可能已经变弱。</dd></div>
+            <div><dt>采集超时</dt><dd>软件为一组采集设置的总等待上限，单位为 ms。真机从布防各采集通道之前开始计时，直到各通道数据就绪，期间包含等待触发与积分。模拟单帧采集时，软件会把这个值与 20 ms 的模拟触发到达时间比较。</dd></div>
+          </dl>
+          <h2>怎么看积分窗口</h2>
+          <p>例如积分延时为 1,280 ns（1.28 μs），积分时间为 1.050 ms（1,050 μs）。执行模拟单帧采集后，模拟窗口是触发后的 <strong>1,280–1,051,280 ns</strong>。只改延时会平移窗口，只改积分时间会改变窗口长度。</p>
+          <p class="help-note">正式检测启动时会检查「积分延时＋积分时间」是否小于激光放电周期。出现采集超时，先查看是否收到触发、哪些通道未就绪，再核对等待上限。<a href="#help/troubleshooting">查看常见问题</a>。</p>
+          <p class="help-reference">参考资料 <a href="https://www.avantes.com/content/uploads/2020/12/020379-AvaSoft-8-Manual.pdf" target="_blank" rel="noopener noreferrer">Avantes AvaSoft 手册</a> · <a href="https://onlinelibrary.wiley.com/doi/10.1155/2014/849310" target="_blank" rel="noopener noreferrer">LIBS 等离子体发光的时间演变实验</a></p>
+        </article>
+        <article class="help-article" id="help-rangefinder" aria-labelledby="help-rangefinder-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-rangefinder-title">测距仪参数</h1>
+            <a class="parameter-help-link" href="#parameters/rangefinder" aria-label="返回测距仪参数">返回调节</a>
+          </div>
+          <p class="help-lead">测距仪给出探头到当前反射表面的距离。同一个读数会分别用来判断皮带有没有料，以及该距离是否在设定的可测窗口内。</p>
+          <h2>从测距读数到两个判定</h2>
+          <p>飞行时间（ToF）测距通过记录光信号发出到返回的时间来计算距离。信号经过往返，所以距离等于光速乘以往返时间再除以二。项目读取 TOF101 返回的毫米值，并用下面的规则做判定。</p>
+          <dl>
+            <div><dt>空带基准</dt><dd>无料时探头到皮带表面的参考距离，单位为 mm。探头位置调整后，空带距离也会改变，需用新位置下的空带读数重新确定。</dd></div>
+            <div><dt>来料阈值</dt><dd>软件用「空带基准－当前距离」估算表面沿探测方向靠近了多少。差值达到阈值就判为有料。阈值越大，越不容易把空带波动算成来料，也越可能漏掉薄料。</dd></div>
+            <div><dt>可测距离下限</dt><dd>项目接受的最近距离，单位为 mm。读数小于下限时，物料表面相对当前测量要求过近，显示「距离超窗」。</dd></div>
+            <div><dt>可测距离上限</dt><dd>项目接受的最远距离，单位为 mm。读数大于上限时显示「距离超窗」。上下限都包含在窗口内，窗口由软件用于判定。</dd></div>
+          </dl>
+          <h2>判定示例</h2>
+          <p>空带基准为 240 mm、来料阈值为 20 mm，可测窗口为 160–230 mm。</p>
+          <table class="help-table">
+            <thead><tr><th scope="col">当前距离</th><th scope="col">表面靠近量</th><th scope="col">来料</th><th scope="col">距离</th></tr></thead>
+            <tbody>
+              <tr><td>150 mm</td><td>90 mm</td><td>有料</td><td>超窗</td></tr>
+              <tr><td>220 mm</td><td>20 mm</td><td>有料</td><td>可测</td></tr>
+              <tr><td>225 mm</td><td>15 mm</td><td>无料</td><td>可测</td></tr>
+            </tbody>
+          </table>
+          <h2>单次测距时看什么</h2>
+          <p>点「单次测距」，结果会同时列出当次读数、来料判定和距离判定。Qt 读取已连接的测距仪，网页 Demo 使用模拟读数。两者都使用当前输入做判定。卡片上方的状态仍按已保存规则显示，改动未保存时，两处判定可能不同。</p>
+          <p class="help-reference">原理资料 <a href="https://www.st.com/resource/en/application_note/an5191-using-the-programmable-region-of-interest-roi-with-the-vl53l1x-stmicroelectronics.pdf" target="_blank" rel="noopener noreferrer">STMicroelectronics 光学飞行时间原理</a></p>
+        </article>
+        <article class="help-article" id="help-indicator" aria-labelledby="help-indicator-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-indicator-title">状态灯参数</h1>
+            <a class="parameter-help-link" href="#parameters/indicator" aria-label="返回状态灯参数">返回调节</a>
+          </div>
+          <p class="help-lead">三色灯用颜色把系统状态显示给现场人员。试灯则让操作员临时预览某个颜色和闪烁方式。</p>
+          <h2>试灯参数</h2>
+          <dl>
+            <div><dt>试灯颜色</dt><dd>选择预览时点亮的红、黄或绿灯。选「全灭」表示三个灯都关，适合检查熄灭状态。</dd></div>
+            <div><dt>显示方式</dt><dd>常亮会持续点亮选中的灯。快闪 2 Hz 表示每秒重复两次完整的亮灭循环，每个循环为 0.5 秒。选择全灭时，显示方式不可选。</dd></div>
+          </dl>
+          <h2>怎么读自动灯态</h2>
+          <ul>
+            <li><strong>绿灯</strong>表示检测可开始或正在检测。要区分两种状态，看顶栏的「检测状态」。</li>
+            <li><strong>黄灯</strong>表示待机或尚未满足启动条件，例如等检测头确认停机。</li>
+            <li><strong>红灯</strong>表示故障场景，例如联锁断开。详细原因在检测控制区查看。</li>
+            <li><strong>离线</strong>表示状态灯连接不可用。连接不可用时，自动灯态读数随之隐藏。</li>
+          </ul>
+          <h2>试灯与恢复</h2>
+          <p>设备就绪且待机时，在 Qt 选择颜色和显示方式后点「真机试灯」。程序确认设备回读后自动恢复业务灯态。网页 Demo 的「预览试灯」只在界面显示。</p>
+          <p class="help-note">判断能否开始检测，以顶部和检测控制区的门禁结论为准。</p>
+        </article>
+        <article class="help-article" id="help-motor" aria-labelledby="help-motor-title" tabindex="-1" hidden>
+          <div class="help-heading">
+            <h1 id="help-motor-title">检测头移位电机参数</h1>
+            <a class="parameter-help-link" href="#parameters/motor" aria-label="返回检测头移位电机参数">返回调节</a>
+          </div>
+          <p class="help-lead">检测头靠电机和传动机构完成移位。点动让它沿指定方向短时运行，正反两个方向对应现场的实际机械方向。</p>
+          <h2>频率怎样影响移位</h2>
+          <ol class="help-timing" aria-label="从变频器输出到检测头位移">
+            <li><strong>SU300 输出交流电</strong><span>频率用 Hz 表示</span></li>
+            <li><strong>电机转动</strong><span>转速还受电机和负载影响</span></li>
+            <li><strong>传动机构移动检测头</strong><span>位移取决于速度、持续时间和传动关系</span></li>
+          </ol>
+          <h2>点动参数</h2>
+          <dl>
+            <div><dt>点动时长</dt><dd>后台在这段时间后请求停止，单位为 ms。比如 600 ms 等于 0.6 s。也可以中途点「停止点动」。真机发出停止指令后，还要等变频器回报停机。实际行程也受加减速影响。</dd></div>
+            <div><dt>模拟点动频率</dt><dd>仅在网页 Demo 中用于控制点动频率的模拟显示。Qt 从 SU300 回读输出频率，实际点动频率由 SU300 的现场设定决定。换算为检测头的毫米每秒，还需要知道电机转速和传动比例。</dd></div>
+          </dl>
+          <h2>如何看点动回读</h2>
+          <ul>
+            <li><strong>等待点动回读</strong>表示启动请求已发出，界面还在等运行状态。</li>
+            <li><strong>点动中</strong>可以看运行方向和输出频率，确认是否与这次测试的预期一致。</li>
+            <li><strong>等待停机回读</strong>表示已发出停止请求，检测控制需等停机确认。</li>
+            <li><strong>停机已回读</strong>表示变频器报告停止，输出频率为 0 Hz。要确认检测头停在哪，还需要独立的位置反馈。</li>
+          </ul>
+          <p class="help-note">一侧限位触发时，该方向的点动会被禁用。已启用的电机在移位中、未连接或停机未确认时，软件门禁会拦截开始检测。</p>
+          <p class="help-reference">原理资料 <a href="https://www.abb.com/global/en/areas/motion/drives/expertise-technology/what-is-a-variable-speed-drive" target="_blank" rel="noopener noreferrer">ABB 变频器与电机转速</a></p>
+        </article>
+      </div>
     </section>
   </main>
+  <details class="demo-controls" id="demo-controls">
+    <summary>界面调试 · 模拟数据</summary>
+    <div class="scenario">
+      <label for="demo-scenario">检测场景</label>
+      <select id="demo-scenario">
+        <option value="ready">设备就绪</option>
+        <option value="standby">待就绪</option>
+        <option value="interlock">联锁断开</option>
+        <option value="offline">设备离线</option>
+        <option value="aux-warning">辅助设备告警</option>
+      </select>
+      <label for="demo-motor">移位电机</label>
+      <select id="demo-motor">
+        <option value="ready">可手动移位</option>
+        <option value="forward-limit">正向限位触发</option>
+        <option value="reverse-limit">反向限位触发</option>
+        <option value="fault">变频器故障</option>
+        <option value="offline">变频器未连接</option>
+        <option value="read-only">只读状态</option>
+        <option value="disabled">站点未启用</option>
+      </select>
+    </div>
+  </details>
 </body>
 </html>

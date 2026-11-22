@@ -58,6 +58,8 @@ QPushButton#stopBig:hover, QPushButton#danger:hover { background:#FFE7EB; border
 QPushButton#stopBig:disabled, QPushButton#danger:disabled { background:#FAF5F6; color:#C9ABB2; border-color:#EDE2E5; }
 QPushButton#startBig, QPushButton#stopBig, QPushButton#actionBtn { font-size:15px; padding:10px 20px; }
 QPushButton#ghost { background:transparent; }
+QPushButton#parameterHelp { border:none; background:transparent; color:#2563EB; padding:0 4px; font-size:12px; }
+QPushButton#parameterHelp:hover { background:#EAF1FF; }
 QPushButton#navTab { background:transparent; border:none; color:#53657D; font-weight:600; padding:10px 17px; }
 QPushButton#navTab:hover { background:#F1F5FC; }
 QPushButton#navTab:checked { background:#EAF1FF; color:#2563EB; }
@@ -79,6 +81,11 @@ QFrame#parameterTile { background:#F8FAFD; border:1px solid #EAF0F7; border-radi
 QLabel#parameterLabel { color:#53657D; font-size:13px; font-weight:600; }
 QFrame#parameterTile QDoubleSpinBox { font-size:19px; font-weight:600; }
 QLabel#parameterError { color:#CD4052; font-size:12px; }
+QLabel#deviceReadings { color:#40536C; font-weight:600; }
+QTextBrowser#helpArticle { background:#FFFFFF; border:1px solid #E2E8F0; border-radius:12px; }
+QListWidget#helpNavigation { background:transparent; border:none; }
+QListWidget#helpNavigation::item { padding:8px 10px; }
+QListWidget#helpNavigation::item:selected { background:#EAF1FF; color:#2563EB; }
 QLabel#bannerIdle, QLabel#bannerOk, QLabel#bannerWarn, QLabel#bannerDanger {
     padding:10px 14px; border-radius:9px; font-size:12px; }
 QLabel#bannerIdle { background:#EAF0F8; color:#60728C; }

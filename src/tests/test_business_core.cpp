@@ -249,7 +249,7 @@ CASE(config_laser_fire_commissioned_rejects_out_of_range_values); {
         "spectrometer":    { "enabled": false },
         "laser_fire":      { "commissioned": true, "discharge_current_a": 80,
                              "pulse_width_us": 200, "frequency_hz": 1,
-                             "q_delay_us": 210, "emission_hold_ms": 3000,
+                             "q_delay_us": 210, "emission_hold_ms": 0,
                              "min_discharges": 1 }
     })", ok);
     CHECK(ok);
@@ -283,7 +283,6 @@ CASE(config_laser_fire_roundtrip_keeps_commissioned_parameters); {
     c.laser_fire.pulse_width_us = 200;
     c.laser_fire.frequency_hz = 1;
     c.laser_fire.q_delay_us = 210;
-    c.laser_fire.emission_hold_ms = 3000;
     c.laser_fire.min_discharges = 1;
 
     const auto text = config::save_string(c);
@@ -298,7 +297,7 @@ CASE(config_laser_fire_roundtrip_keeps_commissioned_parameters); {
             CHECK(back.value().laser_fire.commissioned);
             CHECK_EQ(back.value().laser_fire.discharge_current_a, 80u);
             CHECK_EQ(back.value().laser_fire.q_delay_us, 210u);
-            CHECK_EQ(back.value().laser_fire.emission_hold_ms, 3000u);
+            CHECK(!v["laser_fire"].has("emission_hold_ms"));
         }
     }
 }
@@ -332,6 +331,13 @@ CASE(evaluate_all_safe_and_parameters_ready_allows); {
     const readiness::GateVerdict verdict = readiness::evaluate(armed_facts());
     CHECK(verdict.allowed);
     CHECK(verdict.blocked_by.empty());
+}
+
+CASE(gate_requires_head_stop_confirmation_when_supplied); {
+    auto facts = armed_facts();
+    facts.head_stopped = false;
+    CHECK(blocked_by(readiness::evaluate(facts), readiness::GateReason::head_stop_unconfirmed));
+    CHECK(!readiness::evaluate(facts, readiness::GateCheckPhase::during_emission).allowed);
 }
 
 CASE(auxiliary_device_conditions_warn_without_blocking_measurement); {

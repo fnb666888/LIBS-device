@@ -31,6 +31,7 @@
 
 #include "parameter_page.hpp"
 #include "device_status_page.hpp"
+#include "help_page.hpp"
 #include "theme.hpp"
 #include "widgets.hpp"
 #include <cmath>
@@ -63,6 +64,7 @@ QString humanize_reason_impl(const QString& code) {
         {QStringLiteral("interlock_open"),        QStringLiteral("联锁断开")},
         {QStringLiteral("emergency_stopped"),     QStringLiteral("急停已触发")},
         {QStringLiteral("q_gate_open"),           QStringLiteral("光闸处于打开位置")},
+        {QStringLiteral("head_stop_unconfirmed"), QStringLiteral("移位变频器尚未确认停机")},
         {QStringLiteral("indicator_unavailable"), QStringLiteral("状态灯不可用（不影响出光判定）")},
         {QStringLiteral("devices_not_opened"),    QStringLiteral("设备尚未全部打开")},
         {QStringLiteral("spectrometer_not_ready"), QStringLiteral("光谱仪未就绪")},
@@ -125,15 +127,70 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
                        param_page_->show_air_result(payload, ok, error, true);
                    });
     });
-    connect(param_page_, &ParameterPage::range_read_requested, this, &MainWindow::refresh_device_status);
+    connect(param_page_, &ParameterPage::range_read_requested, this, [this] {
+        call_async(QStringLiteral("device_diagnostics"), {{"action", "read_rangefinder"}}, 15000,
+            [this](const QJsonObject& data, bool ok, const QString& error) {
+                param_page_->finish_range_sample(data, ok ? QString{} : error);
+            });
+    });
+    connect(param_page_, &ParameterPage::hardware_start_requested, this, [this] {
+        if (QMessageBox::question(this, QStringLiteral("开始真机连续检测"),
+                QStringLiteral("这会启动激光出光及光谱采集。确认设备防护就绪并开始？"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) on_start_detection();
+    });
+    connect(param_page_, &ParameterPage::hardware_stop_requested, this, &MainWindow::on_stop_detection);
+    connect(param_page_, &ParameterPage::capture_requested, this, [this] {
+        call_async(QStringLiteral("capture"), {{"trigger", "free_run"}}, 650000,
+            [this](const QJsonObject& data, bool ok, const QString& error) {
+                param_page_->finish_capture(data, ok, error);
+            });
+    });
+    connect(param_page_, &ParameterPage::air_control_requested, this, [this](const QJsonObject& request) {
+        call_async(QStringLiteral("device_diagnostics"), request, 30000,
+            [this](const QJsonObject& data, bool ok, const QString& error) {
+                param_page_->finish_air_control(data, ok, error);
+                refresh_device_status();
+            });
+    });
+    connect(param_page_, &ParameterPage::indicator_test_requested, this, [this](const QJsonObject& request) {
+        call_async(QStringLiteral("device_diagnostics"), request, request.value("duration_ms").toInt() + 30000,
+            [this](const QJsonObject&, bool ok, const QString& error) {
+                param_page_->finish_indicator_test(ok, error);
+                state_poller_->request_refresh();
+            });
+    });
+    connect(param_page_, &ParameterPage::refresh_requested, this, &MainWindow::refresh_device_status);
     pages_->addWidget(build_main_page());   // 0 = 主页面
     pages_->addWidget(param_page_);         // 1 = 参数页
-    device_status_page_ = new DeviceStatusPage(pages_);
-    pages_->addWidget(device_status_page_);
-    connect(device_status_page_->refresh_button(), &QPushButton::clicked, this, &MainWindow::refresh_device_status);
+    help_page_ = new HelpPage(pages_);
+    pages_->addWidget(help_page_);
+    connect(param_page_, &ParameterPage::help_requested, this, [this](const QString& topic) {
+        show_help_page();
+        help_page_->show_topic(topic);
+    });
+    connect(help_page_, &HelpPage::parameters_requested, this, [this](const QString& topic) {
+        show_parameter_page();
+        param_page_->show_device(topic);
+    });
+    connect(param_page_, &ParameterPage::motor_requested, this, [this](const QString& action, int duration) {
+        QJsonObject request{{"action", action}};
+        if (duration != 0) request.insert("duration_ms", duration);
+        call_async(QStringLiteral("motor"), request, 20000,
+            [this, action](const QJsonObject& data, bool ok, const QString& error) {
+                param_page_->finish_motor(action, data, ok, error);
+                state_poller_->request_refresh();
+            });
+    });
+    connect(param_page_, &ParameterPage::motor_frequency_requested, this, [this](double frequency_hz) {
+        call_async(QStringLiteral("motor"), {{"action", "set_frequency"}, {"frequency_hz", frequency_hz}}, 20000,
+            [this](const QJsonObject& data, bool ok, const QString& error) {
+                param_page_->finish_motor(QStringLiteral("set_frequency"), data, ok, error);
+                state_poller_->request_refresh();
+            });
+    });
     auto* device_refresh = new QTimer(this);
     connect(device_refresh, &QTimer::timeout, this, [this] {
-        if (pages_->currentWidget() == device_status_page_) refresh_device_status();
+        if (pages_->currentWidget() == param_page_) refresh_device_status();
     });
     device_refresh->start(4000);
     root->addWidget(pages_, 1);
@@ -218,11 +275,11 @@ void MainWindow::build_header(QVBoxLayout* root) {
     connect(main_page_btn_, &QPushButton::clicked, this, &MainWindow::show_main_page);
     h->addWidget(main_page_btn_);
     h->addWidget(param_page_btn_);
-    device_status_btn_ = new QPushButton(QStringLiteral("设备状态"), header);
-    device_status_btn_->setObjectName(QStringLiteral("navTab"));
-    device_status_btn_->setCheckable(true);
-    connect(device_status_btn_, &QPushButton::clicked, this, &MainWindow::show_device_status_page);
-    h->addWidget(device_status_btn_);
+    help_page_btn_ = new QPushButton(QStringLiteral("帮助"), header);
+    help_page_btn_->setObjectName(QStringLiteral("navTab"));
+    help_page_btn_->setCheckable(true);
+    connect(help_page_btn_, &QPushButton::clicked, this, &MainWindow::show_help_page);
+    h->addWidget(help_page_btn_);
 
     clock_ = new QLabel(header);
     clock_->setObjectName(QStringLiteral("appClock"));
@@ -566,6 +623,7 @@ void MainWindow::build_device_bar(QVBoxLayout* root) {
     const struct { StatusDot** dot; const char* name; } devices[] = {
         {&laser_dot_, "激光器"}, {&spectrometer_dot_, "光谱仪"}, {&indicator_dot_, "三色状态灯"},
         {&rangefinder_dot_, "测距仪"}, {&air_dot_, "空调"},
+        {&motor_dot_, "检测头移位电机"},
     };
     for (const auto& device : devices) {
         auto* status = new QWidget(card);
@@ -631,7 +689,6 @@ void MainWindow::render_snapshot(const MachineSnapshot& s) {
     render_measurement(s);
     render_buttons(s);
     if (param_page_) param_page_->apply_snapshot(s);
-    if (device_status_page_) device_status_page_->apply_status(s);
 }
 
 void MainWindow::render_gate(const MachineSnapshot& s) {
@@ -666,6 +723,8 @@ void MainWindow::render_gate(const MachineSnapshot& s) {
 }
 
 void MainWindow::render_devices(const MachineSnapshot& s) {
+    const auto motor = present_device(QStringLiteral("motor"), s);
+    motor_dot_->set_indicator(motor.level, motor.status, motor.detail);
     const struct { StatusDot* dot; const char* key; } devices[] = {
         {laser_dot_, "laser"}, {spectrometer_dot_, "spectrometer"}, {indicator_dot_, "indicator"},
         {rangefinder_dot_, "rangefinder"}, {air_dot_, "air_conditioner"},
@@ -768,6 +827,7 @@ void MainWindow::render_frame_info(const FrameData& f) {
 void MainWindow::render_buttons(const MachineSnapshot& s) {
     const bool connected = s.valid && s.error.isEmpty();
     const bool unconfirmed = s.stop_confirmation == QLatin1String("unconfirmed");
+    if (param_page_) param_page_->set_measurement_command_pending(command_in_flight_);
 
     if (start_btn_) {
         start_btn_->setEnabled(connected && s.gate.allowed && !command_in_flight_ && !s.laser_running && !unconfirmed);
@@ -947,16 +1007,14 @@ void MainWindow::call_async(const QString& command, const QJsonObject& args, int
 }
 
 void MainWindow::refresh_device_status() {
-    if (!device_status_page_ || device_status_reading_) return;
+    if (device_status_reading_) return;
     device_status_reading_ = true;
-    device_status_page_->set_reading_pending(true);
+    param_page_->set_reading_pending(true);
     call_async(QStringLiteral("device_diagnostics"), {}, 55000,
                [this](const QJsonObject& payload, bool ok, const QString& error) {
                    device_status_reading_ = false;
-                   device_status_page_->set_reading_pending(false);
-                   device_status_page_->apply_readings(ok ? payload : QJsonObject{}, ok ? QString{} : error);
-                   param_page_->apply_range_reading(ok ? payload.value("rangefinder").toObject()
-                                                       : QJsonObject{{"error", error}});
+                   param_page_->set_reading_pending(false);
+                   param_page_->apply_readings(ok ? payload : QJsonObject{}, ok ? QString{} : error);
                    if (air_read_queued_) {
                        air_read_queued_ = false;
                        read_air_parameters();
@@ -1078,7 +1136,7 @@ void MainWindow::show_main_page() {
     if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
     if (param_page_btn_) param_page_btn_->setChecked(false);
     if (main_page_btn_) main_page_btn_->setChecked(true);
-    if (device_status_btn_) device_status_btn_->setChecked(false);
+    if (help_page_btn_) help_page_btn_->setChecked(false);
 }
 
 void MainWindow::show_parameter_page() {
@@ -1086,18 +1144,21 @@ void MainWindow::show_parameter_page() {
     if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
     if (param_page_btn_) param_page_btn_->setChecked(true);
     if (main_page_btn_) main_page_btn_->setChecked(false);
-    if (device_status_btn_) device_status_btn_->setChecked(false);
+    if (help_page_btn_) help_page_btn_->setChecked(false);
     refresh_device_status();
     if (state_poller_) state_poller_->request_refresh();
 }
 
 void MainWindow::show_device_status_page() {
-    pages_->setCurrentWidget(device_status_page_);
+    show_parameter_page();
+}
+
+void MainWindow::show_help_page() {
+    pages_->setCurrentWidget(help_page_);
     if (banner_->objectName() == QLatin1String("bannerIdle")) set_banner_default();
     param_page_btn_->setChecked(false);
     main_page_btn_->setChecked(false);
-    device_status_btn_->setChecked(true);
-    refresh_device_status();
+    help_page_btn_->setChecked(true);
 }
 
 // ── 光谱小工具 ──────────────────────────────────────────────────────────

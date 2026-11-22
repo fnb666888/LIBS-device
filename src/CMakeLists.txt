@@ -49,6 +49,7 @@ add_library(libs_devices STATIC
   src/devices/indicator.cpp
   src/devices/spectrometer.cpp
   src/devices/air_conditioner.cpp
+  src/devices/su300.cpp
 )
 target_link_libraries(libs_devices PUBLIC libs_transport)
 target_link_libraries(libs_devices PRIVATE libs_warnings)
@@ -144,6 +145,7 @@ add_library(libs_business STATIC
   # 因为它要引用 measurement 的参数类型。
   src/business/app/parameter_service.cpp
   src/business/app/device_monitoring.cpp
+  src/business/app/motor_control.cpp
   src/business/app/runtime.cpp
   src/business/app/facade.cpp
 )

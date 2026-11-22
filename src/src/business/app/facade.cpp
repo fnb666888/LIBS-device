@@ -1,6 +1,7 @@
 #include "libs/business/app/facade.hpp"
 #include "libs/measurement_limits.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <sstream>
 #include <utility>
@@ -9,6 +10,7 @@
 #include "libs/business/measurement/frame_bus.hpp"
 #include "libs/business/measurement/prediction/algorithm_contract.hpp"
 #include "libs/business/measurement/job.hpp"
+#include "libs/business/readiness/lamp.hpp"
 #include "libs/business/readiness/monitor.hpp"
 #include "libs/business/readiness/verdict.hpp"
 #include "libs/business/shared/data_delivery.hpp"
@@ -161,6 +163,7 @@ std::vector<std::string> BusinessFacade::commands() {
         "measurement_stop",
         "measurement_status",
         "device_diagnostics",
+        "motor",
         "device_connection_config",
         // 只剩"显示通道"了。start/stop 动作**故意不再提供** ——
         // 采集只有一个来源，就是 measurement_start。以前这个命令同时管
@@ -227,6 +230,7 @@ Response BusinessFacade::handle(const std::string& command, const json::Value& a
     if (command == "measurement_stop")   return cmd_measurement_stop(args);
     if (command == "measurement_status") return cmd_measurement_status(args);
     if (command == "device_diagnostics") return cmd_device_diagnostics(args);
+    if (command == "motor")            return cmd_motor(args);
     if (command == "device_connection_config") return cmd_device_connection_config(args);
     if (command == "recovery_list")   return cmd_recovery_list(args);
     if (command == "recovery_write")  return cmd_recovery_write(args);
@@ -297,6 +301,7 @@ Response BusinessFacade::cmd_status(const json::Value& args) {
     json::Value v = json::object();
     v.set("running", json::Value(runtime_.running()));
     v.set("gate", gate_snapshot_json(*monitor));
+    v.set("motor", runtime_.motor_status());
     // 出光会话是否在进行。界面靠它决定「开始检测 / 停止」哪个可点。
     const auto job_status = runtime_.measurement() ? runtime_.measurement()->status() : measurement::MeasurementStatus{};
     v.set("laser_running", json::Value(job_status.running));
@@ -458,7 +463,10 @@ Response BusinessFacade::cmd_param_get(const json::Value& args) {
 }
 
 Response BusinessFacade::cmd_capture(const json::Value& args) {
-    (void)args;
+    const bool free_run = args["trigger"].as_string() == "free_run";
+    if (args.has("trigger") && !free_run)
+        return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+            "capture_trigger_invalid", "独立采集 trigger 只支持 free_run"));
     std::unique_lock<std::mutex> poll(runtime_.spectrometer_poll_mutex());
     std::unique_lock<std::mutex> acquisition(runtime_.acquisition_mutex(), std::try_to_lock);
     poll.unlock();
@@ -491,11 +499,11 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
     // 是**装机配置**（接法事实），积分时间/超时/积分延时是**测量参数**（参数库）。
     const config::SiteConfig& site = runtime_.config();
     libs::devices::CaptureRequest request{measurement.integration_ms, measurement.timeout_ms,
-                                         measurement.integration_delay_ns,
-                                         site.spectrometer.wait_for_laser_trigger};
+                                         free_run ? 0.0 : measurement.integration_delay_ns,
+                                         !free_run && site.spectrometer.wait_for_laser_trigger};
     request.serials = site.spectrometer.serials;
     request.master_serial = site.spectrometer.master_serial;
-    request.synchronized = site.spectrometer.synchronized;
+    request.synchronized = !free_run && site.spectrometer.synchronized;
     request.scans = 1;
     const libs::Result<libs::devices::CaptureResult> result = device->captureOnce(request);
     if (!result) {
@@ -505,6 +513,7 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
     v.set("expected_groups", json::Value(static_cast<double>(result.value().expected_groups)));
     v.set("received_groups", json::Value(static_cast<double>(result.value().received_groups)));
     v.set("measurement_source", json::Value("parameters.json"));
+    v.set("channel_count", json::Value(static_cast<double>(result.value().devices.size())));
     json::Array syncs;
     for (const auto& group : result.value().groups) {
         json::Value g = json::object();
@@ -512,7 +521,7 @@ Response BusinessFacade::cmd_capture(const json::Value& args) {
         g.set("complete", json::Value(group.complete));
         // 原样上送，不推断：SDK 报什么就是什么。
         g.set("hardware_synchronized", json::Value(group.hardware_synchronized));
-        g.set("requested_sync", json::Value(runtime_.config().spectrometer.synchronized));
+        g.set("requested_sync", json::Value(request.synchronized));
         json::Value order = json::array();
         for (const auto& s : group.arm_order) order.push_back(json::Value(s));
         g.set("arm_order", std::move(order));
@@ -640,7 +649,7 @@ Response BusinessFacade::cmd_measurement_start(const json::Value& args) {
     // **刻意不取 device_mutex**：门禁判定要读激光 B2，而事实源 lambda 自己
     // 会去拿那把锁。外层已经持有同一把锁的话就是 std::mutex 自锁 —— 死锁。
     // 串行化由事实源那一层负责，不需要门面再包一层。
-    const libs::Result<measurement::MeasurementStartRecord> result = job->start(params);
+    const libs::Result<measurement::MeasurementStartRecord> result = runtime_.start_measurement(params);
 
     if (!result) {
         runtime_.log().write(logging::RecordKind::exception_recovery, "测量作业启动失败", [&] {
@@ -840,6 +849,41 @@ Response BusinessFacade::cmd_device_connection_config(const json::Value& args) {
     return Response::success(std::move(result));
 }
 
+Response BusinessFacade::cmd_motor(const json::Value& args) {
+    if (!runtime_.running())
+        return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+            "motor_not_available", "电机服务尚未启动"));
+    const auto action = args.has("action") ? args["action"].as_string() : "status";
+    std::optional<unsigned> duration;
+    if (args.has("duration_ms")) {
+        const auto& value = args["duration_ms"];
+        const double ms = value.as_number();
+        if ((action != "forward" && action != "reverse") || !value.is_number() ||
+            !std::isfinite(ms) || ms < libs::measurement_limits::kMotorJogMinMs ||
+            ms > libs::measurement_limits::kMotorJogMaxMs || std::floor(ms) != ms)
+            return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                "motor_duration_invalid", "点动时长须为 100–50000 ms 之间的整数"));
+        duration = static_cast<unsigned>(ms);
+    }
+    if (action == "profile") {
+        const auto result = runtime_.motor_jog_profile();
+        return result ? Response::success(result.value()) : Response::failure(result.error());
+    }
+    if (action == "set_frequency") {
+        const auto& value = args["frequency_hz"];
+        const double tenths = value.as_number() * 10.0;
+        const double rounded = std::round(tenths);
+        if (!value.is_number() || !std::isfinite(tenths) || rounded < libs::measurement_limits::kMotorJogMinTenthsHz ||
+                rounded > libs::measurement_limits::kMotorJogMaxTenthsHz || std::abs(tenths - rounded) > 1e-8)
+            return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                "motor_frequency_invalid", "点动频率须为 0.1–50.0 Hz，步进 0.1 Hz"));
+        const auto result = runtime_.set_motor_jog_frequency(static_cast<unsigned>(rounded));
+        return result ? Response::success(result.value()) : Response::failure(result.error());
+    }
+    const auto result = runtime_.motor_command(action, duration);
+    return result ? Response::success(result.value()) : Response::failure(result.error());
+}
+
 Response BusinessFacade::cmd_device_diagnostics(const json::Value& args) {
     using Setpoints = libs::devices::AirConditionerSetpoints;
     static constexpr struct Field { const char* name; double Setpoints::*value; } fields[] = {
@@ -855,7 +899,43 @@ Response BusinessFacade::cmd_device_diagnostics(const json::Value& args) {
     };
 
     const auto action = args.has("action") ? args["action"].as_string() : std::string("read");
-    if (action != "read" && action != "read_air_conditioner_setpoints" && action != "apply_air_conditioner")
+    if (action == "read_rangefinder") {
+        if (!runtime_.running())
+            return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+                "diagnostics_not_available", "设备服务尚未启动"));
+        return Response::success(runtime_.sample_rangefinder());
+    }
+    if (action == "test_indicator") {
+        using Channel = libs::indicator::Channel;
+        using State = libs::indicator::State;
+        const std::string color = args["color"].as_string();
+        const auto mode = libs::indicator::parse_state(args["mode"].as_string());
+        const auto channel = libs::indicator::parse_channel(color);
+        if (!mode || (mode.value() != State::on && mode.value() != State::blink_2hz) ||
+            (color != "off" && (!channel || (channel.value() != Channel::red &&
+                 channel.value() != Channel::yellow && channel.value() != Channel::green)))) {
+            return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                "indicator_test_invalid", "试灯仅支持三色或全灭，以及常亮或快闪"));
+        }
+        using namespace libs::measurement_limits;
+        unsigned duration_ms = kLampTestDefaultMs;
+        if (args.has("duration_ms")) {
+            const auto& value = args["duration_ms"];
+            const double ms = value.as_number();
+            if (!value.is_number() || !std::isfinite(ms) || ms < kLampTestMinMs ||
+                    ms > kLampTestMaxMs || std::floor(ms) != ms) {
+                return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                    "indicator_test_duration_invalid", "试灯持续时间须为 500–20000 ms 的整数"));
+            }
+            duration_ms = static_cast<unsigned>(ms);
+        }
+        auto states = readiness::lamp_states(readiness::MachineState::offline);
+        if (color != "off") states[channel.value()] = mode.value();
+        const auto verified = runtime_.test_indicator(states, duration_ms);
+        return verified ? Response::success(json::object()) : Response::failure(verified.error());
+    }
+    const bool air_control = action == "set_air_mode" || action == "set_air_power";
+    if (action != "read" && action != "read_air_conditioner_setpoints" && action != "apply_air_conditioner" && !air_control)
         return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
             "diagnostics_action_invalid", "不支持的设备状态或参数操作"));
 
@@ -866,6 +946,45 @@ Response BusinessFacade::cmd_device_diagnostics(const json::Value& args) {
         return Response::failure(libs::Error::make(libs::ErrorKind::device,
             "diagnostics_busy", "已有联调操作正在进行"));
     auto* air = runtime_.devices().air_conditioner();
+    if (air_control) {
+        if (!air) return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
+            "air_conditioner_not_open", "空调未启用或串口未打开"));
+        std::unique_lock<std::mutex> idle(runtime_.acquisition_mutex(), std::try_to_lock);
+        if (!idle.owns_lock() || runtime_.laser_session_active() ||
+                (runtime_.measurement() && runtime_.measurement()->stop_unconfirmed()))
+            return Response::failure(libs::Error::make(libs::ErrorKind::device,
+                "air_control_busy", "检测未结束或停机未确认，暂不能试运行空调"));
+        auto observed = json::object();
+        if (action == "set_air_power") {
+            if (!args["on"].is_bool()) return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+                "air_power_invalid", "空调开关机需要布尔值 on"));
+            const auto set = air->setPower(args["on"].as_bool());
+            if (!set) return Response::failure(set.error());
+            const auto status = air->readStatus();
+            if (!status) return Response::failure(status.error());
+            const auto& bits = status.value().bits;
+            const auto power = std::find_if(bits.begin(), bits.end(), [](const auto& bit) {
+                return bit.address == libs::air_conditioner::reg::kPowerState;
+            });
+            if (power == bits.end()) return Response::failure(libs::Error::make(libs::ErrorKind::device,
+                "air_power_not_read", "指令已应答，空调电源状态尚未回读"));
+            observed.set("power_on", json::Value(libs::air_conditioner::power_on_from_status_bit(power->active)));
+            return Response::success(std::move(observed));
+        }
+        using Mode = libs::air_conditioner::Mode;
+        std::optional<Mode> selected;
+        for (const auto mode : {Mode::standby, Mode::cooling, Mode::heating, Mode::dehumidify}) {
+            if (args["mode"].as_string() == libs::air_conditioner::to_string(mode)) selected = mode;
+        }
+        if (!selected) return Response::failure(libs::Error::make(libs::ErrorKind::invalid_argument,
+            "air_mode_invalid", "空调模式须为待机、制冷、加热或除湿"));
+        const auto set = air->setMode(*selected);
+        if (!set) return Response::failure(set.error());
+        const auto actual = air->readParam(libs::air_conditioner::reg::kMode);
+        if (!actual) return Response::failure(actual.error());
+        observed.set("mode_code", json::Value(static_cast<double>(actual.value().raw)));
+        return Response::success(std::move(observed));
+    }
     if (action == "read_air_conditioner_setpoints") {
         if (!air) return Response::failure(libs::Error::make(libs::ErrorKind::unsupported,
             "air_conditioner_not_open", "空调未启用或串口未打开"));

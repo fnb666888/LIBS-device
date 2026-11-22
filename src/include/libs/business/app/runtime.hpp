@@ -24,6 +24,7 @@
 #include <memory>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -95,6 +96,14 @@ public:
     json::Value health_json() const;
     json::Value device_readings() const;
     json::Value indicator_status() const;
+    libs::VoidResult test_indicator(const std::map<libs::indicator::Channel, libs::indicator::State>& states,
+                                    unsigned duration_ms);
+    json::Value motor_status() const;
+    libs::Result<json::Value> motor_jog_profile();
+    libs::Result<json::Value> set_motor_jog_frequency(unsigned tenths_hz);
+    libs::Result<json::Value> motor_command(const std::string& action, std::optional<unsigned> duration_ms = std::nullopt);
+    json::Value sample_rangefinder();
+    libs::Result<measurement::MeasurementStartRecord> start_measurement(const measurement::FireParameters& params);
     config::ParameterStore* parameters() noexcept { return parameters_.get(); }
 
     // 业务一：就绪判定。**未构造（start 未跑）时返回 nullptr**，调用方必须判空。
@@ -154,9 +163,18 @@ private:
     void sample_laser();
     void collect_gate_facts(readiness::ReadinessFacts& facts);
     void sample_indicator();
-    void sample_rangefinder();
     void sample_air_conditioner();
     void sample_spectrometer();
+    void sample_motor();
+    void sample_motor_locked();
+    void publish_motor(const libs::Result<libs::devices::Su300Status>& status);
+    void log_motor_jog(const std::string& message, const libs::Result<libs::devices::Su300Status>& status,
+                       unsigned duration_ms = 0);
+    libs::VoidResult arm_motor_watchdog(libs::devices::Su300& drive);
+    libs::VoidResult restore_motor_watchdog(libs::devices::Su300& drive);
+    libs::VoidResult stop_motor_locked(libs::devices::Su300& drive);
+    libs::VoidResult stop_motor_on_exit();
+    bool motor_limit(const libs::devices::Su300Status& status, libs::devices::Su300Direction direction) const;
     void publish_auxiliary(AuxiliaryDevice device, readiness::DeviceCondition condition,
                            std::string detail, std::vector<std::string> warnings = {});
 
@@ -165,8 +183,24 @@ private:
     Options options_;
     std::mutex device_mutex_;
     std::mutex auxiliary_device_mutex_;
+    std::mutex indicator_sample_mutex_;
+    std::mutex rangefinder_sample_mutex_;
     std::mutex acquisition_mutex_;
     std::mutex spectrometer_poll_mutex_;
+    std::mutex motor_mutex_;
+    bool measurement_starting_ = false;
+    std::optional<libs::devices::Su300Direction> motor_jog_;
+    std::chrono::steady_clock::time_point motor_deadline_{};
+    std::chrono::steady_clock::time_point motor_feedback_deadline_{};
+    bool motor_jog_confirmed_ = false;
+    std::string motor_jog_error_;
+    std::chrono::steady_clock::time_point motor_watchdog_quiet_until_{};
+    std::optional<std::uint16_t> motor_watchdog_restore_;
+    bool motor_watchdog_armed_ = false;
+    bool motor_frequency_unverified_ = false;
+    bool motor_stop_pending_ = false;
+    bool motor_stop_retry_ = false;
+    std::atomic<bool> head_stopped_{false};
     std::atomic<bool> shutdown_requested_{false};
 
     // ── shared：共同底座 ────────────────────────────────────────────────

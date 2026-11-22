@@ -1,28 +1,41 @@
 #include "parameter_page.hpp"
 
 #include <algorithm>
+#include <QApplication>
 #include <QDateTime>
 #include <QGridLayout>
 #include <QComboBox>
 #include <QHBoxLayout>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLocale>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QScrollArea>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QSettings>
 #include <QSignalBlocker>
-#include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
 
+#include "device_status_page.hpp"
 #include "widgets.hpp"
 #include "libs/measurement_limits.hpp"
 
 namespace libs::ui {
 namespace {
+
+void set_control_enabled(QWidget* control, bool enabled) {
+    if (!enabled && control->isEnabled()) {
+        auto* focused = QApplication::focusWidget();
+        // Disabling the focused widget would make Qt focus and scroll to the next control.
+        if (focused && (focused == control || control->isAncestorOf(focused)))
+            focused->clearFocus();
+    }
+    control->setEnabled(enabled);
+}
 
 // ── 字段表（唯一真值来源）───────────────────────────────────────────────
 //
@@ -36,13 +49,8 @@ namespace {
 // 不抄设计文档：文档里的 0~50 A / 200 Hz 是当年那份 0x17 电压限值取 0 V
 // 时的产物，照抄会把整台设备配置到不出光。
 
-// laser 组 9 字段，**全部 required**（required_fields() 里逐个点名）。
-//
-// 这 9 个字段在启动时由后端按**真机默认值**播种（只补缺失），默认值取自
-// docs/real-device-parameters-20260929.md，所以开箱状态下这里显示的就是
-// 真机工作点，而不是量程下限。操作员改过并保存的值永远优先，重启不会打回。
-// 后端 commissioned_from_store() 仍按"9 个字段齐备且都在协议量程内"
-// 判定是否已标定，界面这边如实呈现。
+// 后端启动时补齐缺失工艺值。Qt 仅提交界面上修改过的字段，保留测量配置中
+// 的历史字段和值，例如旧配置中的 min_discharges。
 
 // spectrometer 组 3 字段，**全部 required**。
 //
@@ -93,16 +101,11 @@ const ParameterPage::FieldSpec* ParameterPage::laser_specs(std::size_t& count) {
         {"discharge_delay_us", "放电延时", 0, "μs",
          "协议 0x14：量程 0~500 μs。真机默认 0 μs。"},
         {"q_delay_us", "Q 延时", 0, "μs",
-         "协议 0x16：量程 2~500 μs。真机默认 210 μs —— Q 开关靠这个值决定巨脉冲，"
-         "取量程下限(2 μs)等于不调 Q、不出光。"},
+         "协议 0x16：量程 2~500 μs。调节 Q 开关打开的时刻，影响激光脉冲形成。"},
         {"q_warmup_s", "Q 预热", 0, "s",
          "协议 0x19 未标厂家量程，软件允许 0~3600 s。真机默认 0 s。"},
         {"settle_timeout_ms", "稳定等待超时", 0, "ms",
          "设备从 02「自适应中」走到 01「正在工作」的等待上限。真机默认 20000 ms。"},
-        {"emission_hold_ms", "出光保持", 0, "ms",
-         "光闸保持打开的时长 = 连续出光窗口。真机默认 3000 ms。"},
-        {"min_discharges", "最小放电次数", 0, "次",
-         "至少放这么多次电才算出光。真机默认 1 次。计数器不涨 = 没放电 = 失败。"},
     };
     count = sizeof(kLaserFields) / sizeof(FieldSpec);
     return kLaserFields;
@@ -120,7 +123,7 @@ const ParameterPage::FieldSpec* ParameterPage::spectrometer_specs(std::size_t& c
         {"integration_delay_ns", "积分延时", 0, "ns",
          "收到激光 TTL 后延迟多久开始积分。真机默认 1280 ns；每个样品要重新标定。"},
         {"capture_timeout_ms", "采集超时", 0, "ms",
-         "等 pin6 触发的超时，必须覆盖整个出光窗口。真机默认 10000 ms。"},
+         "每帧等待 pin6 触发的超时。真机默认 10000 ms。"},
     };
     count = sizeof(kSpectrometerFields) / sizeof(FieldSpec);
     return kSpectrometerFields;
@@ -152,8 +155,6 @@ protected:
     void wheelEvent(QWheelEvent* event) override { event->ignore(); }
 };
 
-const Level lamp_levels[] = {Level::Danger, Level::Warn, Level::Ok, Level::Idle};
-
 }  // namespace
 
 const ParameterPage::FieldSpec* ParameterPage::range_specs(std::size_t& count) {
@@ -172,7 +173,17 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
     setAccessibleName(QStringLiteral("仪器参数"));
     auto* outer = new QVBoxLayout(this);
     outer->setContentsMargins(24, 18, 24, 22);
+    auto* toolbar = new QHBoxLayout;
+    toolbar->addWidget(make_hint(QStringLiteral("真机调试操作会下发到设备。正式检测使用已保存的激光和光谱参数。")), 1);
+    refreshed_ = make_hint(QStringLiteral("等待读取设备"));
+    toolbar->addWidget(refreshed_);
+    refresh_ = new QPushButton(QStringLiteral("刷新状态"), this);
+    refresh_->setObjectName(QStringLiteral("ghost"));
+    toolbar->addWidget(refresh_);
+    outer->addLayout(toolbar);
+    connect(refresh_, &QPushButton::clicked, this, &ParameterPage::refresh_requested);
     auto* scroll = new QScrollArea(this);
+    scroll_ = scroll;
     scroll->setWidgetResizable(true);
     scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     auto* host = new QWidget(scroll);
@@ -186,23 +197,33 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
     std::size_t count = 0;
     laser_.name = QStringLiteral("laser");
     auto* specs = laser_specs(count);
-    build_group(laser_, QStringLiteral("激光器参数"), specs, count);
+    build_group(laser_, QStringLiteral("激光器"), specs, count);
     spectrometer_.name = QStringLiteral("spectrometer");
     specs = spectrometer_specs(count);
-    build_group(spectrometer_, QStringLiteral("光谱仪参数"), specs, count);
+    build_group(spectrometer_, QStringLiteral("光谱仪"), specs, count);
     air_.name = QStringLiteral("air_conditioner");
     specs = air_specs(count);
-    build_group(air_, QStringLiteral("空调参数"), specs, count);
+    build_group(air_, QStringLiteral("空调"), specs, count);
     range_.name = QStringLiteral("rangefinder");
     specs = range_specs(count);
-    build_group(range_, QStringLiteral("测距仪参数"), specs, count);
+    build_group(range_, QStringLiteral("测距仪"), specs, count);
+    motor_.name = QStringLiteral("motor");
+    static const FieldSpec jog[] = {
+        {"jog_s", "点动时长", 3, "s", "点动后发出停止指令的时间。",
+         libs::measurement_limits::kMotorJogMinMs / 1000.0, libs::measurement_limits::kMotorJogMaxMs / 1000.0},
+        {"jog_hz", "正反向点动频率", 1, "Hz", "保存后写入变频器，正反向采用同一频率。",
+         libs::measurement_limits::kMotorJogMinTenthsHz / 10.0, libs::measurement_limits::kMotorJogMaxTenthsHz / 10.0},
+    };
+    build_group(motor_, QStringLiteral("检测头移位电机"), jog, sizeof(jog) / sizeof(jog[0]));
     build_lamp_card();
+    build_manual_controls();
 
     grid->addWidget(laser_.card, 0, 0, Qt::AlignTop);
     grid->addWidget(air_.card, 0, 1, Qt::AlignTop);
     grid->addWidget(spectrometer_.card, 1, 0, Qt::AlignTop);
-    grid->addWidget(range_.card, 1, 1, 2, 1, Qt::AlignTop);
+    grid->addWidget(range_.card, 1, 1, Qt::AlignTop);
     grid->addWidget(lamp_card_, 2, 0, Qt::AlignTop);
+    grid->addWidget(motor_.card, 2, 1, Qt::AlignTop);
     scroll->setWidget(host);
     outer->addWidget(scroll);
 
@@ -217,19 +238,31 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
         });
         update_measurement_controls(*group);
     }
-    air_.read->setText(QStringLiteral("读取设定"));
-    air_.save->setText(QStringLiteral("保存并回读"));
-    air_.feedback->setText(QStringLiteral("读取设定后可编辑。"));
+    load_air_settings();
     connect(air_.read, &QPushButton::clicked, this, [this] {
+        const auto* health = snapshot_.device(air_.name);
+        if (!snapshot_.valid || !health || !health->opened) {
+            load_air_settings();
+            air_.feedback->setText(QStringLiteral("已重新读取本机设定。"));
+            return;
+        }
         set_air_busy(true);
         air_.feedback->setText(QStringLiteral("正在读取空调设定…"));
         emit air_read_requested();
     });
     connect(air_.save, &QPushButton::clicked, this, [this] {
-        QJsonObject values;
-        for (const auto& field : air_.fields) {
-            field.box->interpretText();
-            values.insert(field.key, field.box->value());
+        const auto values = draft_values(air_);
+        const auto n = [&values](const char* key) { return values.value(QLatin1String(key)).toDouble(); };
+        if (n("cooling_on_c") <= n("cooling_off_c") || n("heating_on_c") >= n("heating_off_c") ||
+            n("dehumidify_on_percent") <= n("dehumidify_off_percent")) {
+            air_.feedback->setText(QStringLiteral("请检查制冷、加热和除湿的启停阈值。"));
+            return;
+        }
+        const auto* health = snapshot_.device(air_.name);
+        if (!snapshot_.valid || !health || !health->opened) {
+            air_.feedback->setText(save_air_settings(values) ? QStringLiteral("已保存到本机。")
+                                                            : QStringLiteral("本机保存失败。"));
+            return;
         }
         set_air_busy(true);
         air_.feedback->setText(QStringLiteral("正在保存并核对…"));
@@ -237,21 +270,28 @@ ParameterPage::ParameterPage(QWidget* parent) : QWidget(parent) {
     });
     set_air_busy(false);
 
-    range_.read->setText(QStringLiteral("刷新读数"));
-    range_result_ = make_hint(QStringLiteral("等待读取距离。"));
-    range_.card->body()->insertWidget(1, range_result_);
     connect(range_.read, &QPushButton::clicked, this, [this] {
-        range_.read->setEnabled(false);
-        emit range_read_requested();
+        load_range_rules();
+        render_range();
     });
     connect(range_.save, &QPushButton::clicked, this, &ParameterPage::save_range_rules);
     load_range_rules();
-    render_range();
+    connect(motor_.read, &QPushButton::clicked, this, [this] {
+        load_motor_settings();
+        request_motor_profile();
+    });
+    connect(motor_.save, &QPushButton::clicked, this, &ParameterPage::save_motor_settings);
+    load_motor_settings();
+    render_status();
+    update_manual_controls();
 }
 
 void ParameterPage::build_group(Group& group, const QString& title, const FieldSpec* specs, std::size_t count) {
     group.card = new Card(title, this);
     group.card->setProperty("deviceGroup", group.name);
+    build_status(group.card, group.name);
+    build_section(group.card, QStringLiteral("参数调节"), group.name == QLatin1String("air_conditioner")
+                  ? QStringLiteral("air") : group.name);
     auto* grid = new QGridLayout;
     grid->setSpacing(10);
     grid->setColumnStretch(0, 1);
@@ -301,6 +341,10 @@ void ParameterPage::build_group(Group& group, const QString& title, const FieldS
             if (changed.known) changed.error->hide();
             if (&group == &laser_ || &group == &spectrometer_)
                 group.feedback->setText(QStringLiteral("有未保存的改动。"));
+            if (&group == &motor_ && changed.key == QLatin1String("jog_hz") && changed.loaded) {
+                group.feedback->setText(QStringLiteral("频率已修改，保存并回读后可点动。"));
+                update_manual_controls();
+            }
         };
         connect(box, &QDoubleSpinBox::valueChanged, this, mark_edited);
         connect(box->editor(), &QLineEdit::textEdited, this, [box, mark_edited] {
@@ -314,13 +358,330 @@ void ParameterPage::build_group(Group& group, const QString& title, const FieldS
     footer->addWidget(group.feedback, 1);
     group.read = new QPushButton(QStringLiteral("重新读取"), group.card);
     group.read->setObjectName(QStringLiteral("ghost"));
-    group.read->setAccessibleName(QStringLiteral("读取") + title);
+    group.read->setAccessibleName(QStringLiteral("重新读取") + title + QStringLiteral("参数"));
     footer->addWidget(group.read);
     group.save = new QPushButton(QStringLiteral("保存参数"), group.card);
     group.save->setObjectName(QStringLiteral("primary"));
-    group.save->setAccessibleName(QStringLiteral("保存") + title);
+    group.save->setAccessibleName(QStringLiteral("保存") + title + QStringLiteral("参数"));
     footer->addWidget(group.save);
     group.card->body()->addLayout(footer);
+}
+
+void ParameterPage::build_section(Card* card, const QString& title, const QString& topic) {
+    card->body()->addWidget(make_divider());
+    auto* row = new QHBoxLayout;
+    auto* caption = new QLabel(title, card);
+    caption->setObjectName(QStringLiteral("parameterLabel"));
+    row->addWidget(caption);
+    row->addStretch();
+    if (!topic.isEmpty()) {
+        auto* help = new QPushButton(QStringLiteral("参数说明"), card);
+        help->setObjectName(QStringLiteral("parameterHelp"));
+        row->addWidget(help);
+        connect(help, &QPushButton::clicked, this, [this, topic] { emit help_requested(topic); });
+    }
+    card->body()->addLayout(row);
+}
+
+void ParameterPage::build_status(Card* card, const QString& key) {
+    card->body()->addWidget(make_divider());
+    auto* row = new QHBoxLayout;
+    auto* heading = new QLabel(QStringLiteral("状态"), card);
+    heading->setObjectName(QStringLiteral("parameterLabel"));
+    row->addWidget(heading);
+    auto* badge = new StatusDot(card);
+    row->addWidget(badge);
+    row->addStretch();
+    card->body()->addLayout(row);
+    auto* readings = make_hint({});
+    readings->setTextFormat(Qt::PlainText);
+    readings->setObjectName(QStringLiteral("deviceReadings"));
+    card->body()->addWidget(readings);
+    status_views_.insert(key, {badge, readings});
+}
+
+void ParameterPage::show_device(const QString& topic) {
+    const auto key = topic == QLatin1String("air") ? QStringLiteral("air_conditioner") : topic;
+    for (auto* card : scroll_->widget()->findChildren<Card*>(QString{}, Qt::FindDirectChildrenOnly)) {
+        if (card->property("deviceGroup").toString() == key) {
+            scroll_->verticalScrollBar()->setValue(card->y());
+            return;
+        }
+    }
+}
+
+void ParameterPage::set_reading_pending(bool pending) {
+    set_control_enabled(refresh_, !pending);
+    if (pending && readings_.isEmpty()) refreshed_->setText(QStringLiteral("正在读取设备…"));
+}
+
+void ParameterPage::apply_readings(const QJsonObject& readings, const QString& error) {
+    readings_ = readings;
+    reading_error_ = error;
+    range_reading_ = readings.value("rangefinder").toObject();
+    refreshed_->setText(error.isEmpty() ? QStringLiteral("最近读取 %1").arg(QDateTime::currentDateTime().toString("HH:mm:ss"))
+                                        : QStringLiteral("设备读数刷新失败"));
+    render_status();
+}
+
+void ParameterPage::render_status() {
+    for (auto it = status_views_.begin(); it != status_views_.end(); ++it) {
+        const auto value = present_device(it.key(), snapshot_, readings_, reading_error_);
+        it->badge->set_state(value.level, value.status);
+        it->badge->setToolTip(value.detail);
+        it->readings->setText(value.readings.join(QStringLiteral("    ·    ")));
+        it->readings->setVisible(!value.readings.isEmpty());
+    }
+    render_range();
+    render_lamp();
+}
+
+QJsonObject ParameterPage::draft_values(const Group& group) const {
+    QJsonObject values;
+    for (const auto& field : group.fields) {
+        field.box->interpretText();
+        values.insert(field.key, field.box->value());
+    }
+    return values;
+}
+
+void ParameterPage::load_air_settings() {
+    static constexpr double defaults[] = {32, 27, 5, 10, 65, 55};
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("airSetpoints"));
+    for (qsizetype i = 0; i < air_.fields.size(); ++i) {
+        const auto& field = air_.fields[i];
+        bool ok = false;
+        const auto value = settings.value(field.key).toDouble(&ok);
+        field.box->setValue(ok && value >= field.box->minimum() && value <= field.box->maximum() ? value : defaults[i]);
+    }
+}
+
+bool ParameterPage::save_air_settings(const QJsonObject& values) {
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("airSetpoints"));
+    for (auto it = values.constBegin(); it != values.constEnd(); ++it) settings.setValue(it.key(), it.value().toDouble());
+    settings.sync();
+    return settings.status() == QSettings::NoError;
+}
+
+void ParameterPage::load_motor_settings() {
+    const auto value = QSettings().value(QStringLiteral("motorTrial/jogMs"));
+    const int site_value = snapshot_.motor.value("jog_ms").toInt(500);
+    const int duration = value.isValid() ? value.toInt() : site_value;
+    const QSignalBlocker blocker(motor_.fields.front().box);
+    motor_.fields.front().box->setValue((duration >= static_cast<int>(libs::measurement_limits::kMotorJogMinMs) &&
+        duration <= static_cast<int>(libs::measurement_limits::kMotorJogMaxMs) ? duration : 500) / 1000.0);
+    motor_.fields.front().edited = false;
+}
+
+void ParameterPage::save_motor_settings() {
+    auto& frequency = motor_.fields.back();
+    frequency.box->interpretText();
+    if (frequency.loaded && frequency.edited) {
+        motor_pending_ = true;
+        motor_.feedback->setText(QStringLiteral("正在写入并回读点动频率…"));
+        update_manual_controls();
+        emit motor_frequency_requested(frequency.box->value());
+        return;
+    }
+    motor_.feedback->setText(persist_motor_duration() ? QStringLiteral("点动时长已保存到本机。")
+                                                    : QStringLiteral("点动时长本机保存失败。"));
+}
+
+bool ParameterPage::persist_motor_duration() const {
+    auto* duration = motor_.fields.front().box;
+    duration->interpretText();
+    QSettings settings;
+    settings.setValue(QStringLiteral("motorTrial/jogMs"), qRound(duration->value() * 1000.0));
+    settings.sync();
+    return settings.status() == QSettings::NoError;
+}
+
+void ParameterPage::request_motor_profile() {
+    motor_pending_ = true;
+    motor_.feedback->setText(QStringLiteral("正在读取变频器参数…"));
+    update_manual_controls();
+    emit motor_requested(QStringLiteral("profile"), 0);
+}
+
+void ParameterPage::build_manual_controls() {
+    const auto add_section = [this](Group& group) {
+        build_section(group.card, QStringLiteral("手动测试"));
+        auto* row = new QHBoxLayout;
+        row->addStretch();
+        group.card->body()->addLayout(row);
+        group.manual_feedback = make_hint({});
+        group.manual_feedback->setTextFormat(Qt::PlainText);
+        group.card->body()->addWidget(group.manual_feedback);
+        return row;
+    };
+    const auto button = [](QHBoxLayout* row, const QString& text, bool stop = false) {
+        auto* action = new QPushButton(text);
+        action->setFocusPolicy(Qt::TabFocus);
+        if (stop) action->setObjectName(QStringLiteral("danger"));
+        row->insertWidget(row->count() - 1, action);
+        return action;
+    };
+    auto* laser_row = add_section(laser_);
+    hardware_start_ = button(laser_row, QStringLiteral("开始真机连续检测"));
+    hardware_stop_ = button(laser_row, QStringLiteral("停止真机检测"), true);
+    connect(hardware_start_, &QPushButton::clicked, this, &ParameterPage::hardware_start_requested);
+    connect(hardware_stop_, &QPushButton::clicked, this, &ParameterPage::hardware_stop_requested);
+
+    spectrum_trial_ = button(add_section(spectrometer_), QStringLiteral("真机单帧采集"));
+    spectrum_trial_->setToolTip(QStringLiteral("按已保存的积分时间独立采集，使用光谱仪内部触发。"));
+    connect(spectrum_trial_, &QPushButton::clicked, this, [this] {
+        spectrum_pending_ = true;
+        spectrometer_.manual_feedback->setText(QStringLiteral("正在采集真机光谱…"));
+        update_manual_controls();
+        emit capture_requested();
+    });
+
+    auto* air_row = add_section(air_);
+    const QString modes[] = {QStringLiteral("standby"), QStringLiteral("cooling"),
+                             QStringLiteral("heating"), QStringLiteral("dehumidify")};
+    for (int mode_code = 0; mode_code < 4; ++mode_code) {
+        auto* action = button(air_row, air_mode_name(mode_code));
+        action->setToolTip(QStringLiteral("连续 100 秒未收到试运行指令后，空调恢复自动运行。"));
+        air_trials_.append(action);
+        connect(action, &QPushButton::clicked, this, [this, mode = modes[mode_code]] {
+            set_air_busy(true);
+            air_.manual_feedback->setText(QStringLiteral("正在下发试运行指令并读取空调模式…"));
+            emit air_control_requested({{"action", "set_air_mode"}, {"mode", mode}});
+        });
+    }
+
+    range_sample_ = button(add_section(range_), QStringLiteral("单次测距"));
+    connect(range_sample_, &QPushButton::clicked, this, [this] {
+        range_test_pending_ = true;
+        range_.manual_feedback->setText(QStringLiteral("正在读取测距仪…"));
+        update_manual_controls();
+        emit range_read_requested();
+    });
+
+    auto* motor_row = add_section(motor_);
+    motor_forward_ = button(motor_row, QStringLiteral("正向点动"));
+    motor_reverse_ = button(motor_row, QStringLiteral("反向点动"));
+    motor_stop_ = button(motor_row, QStringLiteral("停止点动"), true);
+    const auto connect_motor = [this](QPushButton* action_button, const QString& action) {
+        connect(action_button, &QPushButton::clicked, this, [this, action] {
+            motor_pending_ = true;
+            motor_.manual_feedback->setText(QStringLiteral("正在发送指令…"));
+            auto* seconds = motor_.fields.front().box;
+            seconds->interpretText();
+            const int duration = action == QLatin1String("stop") ? 0 : qRound(seconds->value() * 1000.0);
+            update_manual_controls();
+            emit motor_requested(action, duration);
+        });
+    };
+    connect_motor(motor_forward_, QStringLiteral("forward"));
+    connect_motor(motor_reverse_, QStringLiteral("reverse"));
+    connect_motor(motor_stop_, QStringLiteral("stop"));
+}
+
+void ParameterPage::update_manual_controls() {
+    const bool connected = snapshot_.valid && snapshot_.error.isEmpty();
+    const auto opened = [this, connected](const QString& name) {
+        const auto* device = snapshot_.device(name);
+        return connected && device && device->opened;
+    };
+    set_control_enabled(hardware_start_, connected && snapshot_.gate.allowed && !measuring_ && !measurement_command_pending_ &&
+                                !laser_.pending && !spectrometer_.pending && !spectrum_pending_ && !lamp_pending_);
+    hardware_start_->setToolTip(snapshot_.gate.allowed ? QStringLiteral("使用正式检测流程触发实际出光和光谱采集。")
+                                                       : snapshot_.gate.detail);
+    set_control_enabled(hardware_stop_, connected && measuring_ && !measurement_command_pending_);
+    set_control_enabled(spectrum_trial_, opened(spectrometer_.name) && !measuring_ && !spectrometer_.pending &&
+                                !spectrum_pending_ && !measurement_command_pending_);
+    const bool air_available = opened(air_.name) && !measuring_ && !air_.pending && !measurement_command_pending_;
+    for (auto* action : air_trials_) set_control_enabled(action, air_available);
+    set_control_enabled(range_sample_, opened(range_.name) && !range_test_pending_ && !measuring_);
+    const auto& data = snapshot_.motor;
+    const bool controls = snapshot_.valid && snapshot_.error.isEmpty() &&
+                          data.value("opened").toBool() && data.value("control_enabled").toBool();
+    const bool settled = !motor_pending_ && !measuring_ && (!controls || data.value("stopped").toBool());
+    const bool can_jog = controls && settled && data.value("communication_control").toBool() &&
+                         data.value("fault_code").toInt(-1) == 0;
+    const bool frequency_saved = !motor_.fields.back().edited;
+    set_control_enabled(motor_forward_, can_jog && frequency_saved && !data.value("forward_limit").toBool());
+    set_control_enabled(motor_reverse_, can_jog && frequency_saved && !data.value("reverse_limit").toBool());
+    set_control_enabled(motor_stop_, controls && !motor_pending_);
+    if (connected && data.value("opened").toBool() && !data.value("control_enabled").toBool()) {
+        motor_.manual_feedback->setText(QStringLiteral("当前站点只读，点动未启用。"));
+    }
+    set_control_enabled(motor_.read, settled && opened(motor_.name) && data.value("stopped").toBool());
+    set_control_enabled(motor_.save, settled);
+    set_control_enabled(motor_.fields.front().box->parentWidget(), settled);
+    set_control_enabled(motor_.fields.back().box->parentWidget(), can_jog && motor_.fields.back().loaded);
+}
+
+void ParameterPage::set_measurement_command_pending(bool pending) {
+    measurement_command_pending_ = pending;
+    update_manual_controls();
+    render_lamp();
+}
+
+void ParameterPage::finish_capture(const QJsonObject& result, bool ok, const QString& error) {
+    spectrum_pending_ = false;
+    if (!ok) {
+        spectrometer_.manual_feedback->setText(error);
+    } else {
+        const auto scans = result.value("scan_groups").toArray();
+        const bool complete = !scans.isEmpty() && scans.first().toObject().value("complete").toBool();
+        spectrometer_.manual_feedback->setText(complete
+            ? QStringLiteral("已采集并保存真机单帧 · %1 路通道").arg(result.value("channel_count").toInt())
+            : QStringLiteral("采集未获得完整一帧，请检查通道读回。"));
+        spectrometer_.manual_feedback->setToolTip(result.value("delivery").toObject().value("local_path").toString());
+    }
+    update_manual_controls();
+}
+
+void ParameterPage::finish_air_control(const QJsonObject& reading, bool ok, const QString& error) {
+    if (ok) {
+        auto actual = readings_.value(air_.name).toObject();
+        for (auto field = reading.constBegin(); field != reading.constEnd(); ++field) actual.insert(field.key(), field.value());
+        readings_.insert(air_.name, actual);
+        air_.manual_feedback->setText(QStringLiteral("模式回读为%1。连续 100 秒未收到模式指令后，空调会恢复自动运行。").arg(
+            air_mode_name(reading.value("mode_code").toInt(-1))));
+        render_status();
+    } else air_.manual_feedback->setText(error);
+    set_air_busy(false);
+}
+
+void ParameterPage::finish_motor(const QString& action, const QJsonObject& data, bool ok, const QString& error) {
+    motor_pending_ = false;
+    if (action == QLatin1String("profile") || action == QLatin1String("set_frequency")) {
+        QString message = error;
+        if (ok) {
+            auto& frequency = motor_.fields.back();
+            const double forward_hz = data.value("forward_hz").toDouble();
+            const double reverse_hz = data.value("reverse_hz").toDouble();
+            const QSignalBlocker blocker(frequency.box);
+            frequency.box->setValue(forward_hz);
+            frequency.loaded = true;
+            frequency.edited = false;
+            if (action == QLatin1String("set_frequency")) {
+                message = QStringLiteral("正反向 %1 Hz 已写入并回读。%2").arg(forward_hz).arg(
+                    persist_motor_duration() ? QStringLiteral("点动时长已保存到本机。")
+                                             : QStringLiteral("点动时长本机保存失败。"));
+            } else {
+                const int timeout = data.value("communication_timeout_ms").toInt();
+                message = QStringLiteral("正向 %1 Hz · 反向 %2 Hz · 点动减速 %3 ms · 当前通讯超时 %4")
+                    .arg(forward_hz).arg(reverse_hz).arg(data.value("deceleration_ms").toInt())
+                    .arg(timeout ? QStringLiteral("%1 ms").arg(timeout) : QStringLiteral("未启用"));
+            }
+        }
+        motor_.feedback->setText(message);
+        update_manual_controls();
+        return;
+    }
+    if (ok && !data.isEmpty()) snapshot_.motor = data;
+    motor_.manual_feedback->setText(!ok ? error : action != QLatin1String("stop")
+        ? QStringLiteral("已发送点动指令，请查看状态回读。")
+        : data.value("stopped").toBool() ? QStringLiteral("变频器停机已回读。")
+        : QStringLiteral("已发送停止指令，等待停机回读。"));
+    render_status();
+    update_manual_controls();
 }
 
 ParameterPage::Group* ParameterPage::measurement_group(const QString& name) {
@@ -335,13 +696,15 @@ void ParameterPage::apply_snapshot(const MachineSnapshot& snapshot) {
         || snapshot.stop_confirmation == QLatin1String("unconfirmed");
     if (measuring_ && !was_measuring) active_range_rules_ = range_rules_;
     snapshot_ = snapshot;
-    if (measuring_ && lamp_test_) {
-        lamp_test_ = false;
-        lamp_timer_->stop();
-        lamp_feedback_->setText(QStringLiteral("检测开始，已退出试灯预览。"));
+    if (!motor_site_loaded_ && snapshot_.motor.value("opened").toBool() &&
+            snapshot_.motor.value("stopped").toBool() && !motor_pending_) {
+        motor_site_loaded_ = true;
+        const auto& field = motor_.fields.front();
+        if (!field.edited && !field.box->hasFocus()) load_motor_settings();
+        request_motor_profile();
     }
-    render_lamp();
-    render_range();
+    render_status();
+    update_manual_controls();
     for (auto* group : {&laser_, &spectrometer_}) {
         update_measurement_controls(*group);
         if (group->pending || !snapshot.valid || snapshot.param_values.isEmpty()
@@ -372,13 +735,14 @@ void ParameterPage::apply_values(Group& group, const QJsonObject& groups) {
 void ParameterPage::update_measurement_controls(Group& group) {
     const bool enabled = snapshot_.valid && !measuring_ && !group.pending;
     for (const auto& field : group.fields) {
-        field.box->parentWidget()->setEnabled(enabled && field.loaded);
+        set_control_enabled(field.box->parentWidget(), enabled && field.loaded);
     }
     const bool can_request = enabled && !laser_.pending && !spectrometer_.pending;
-    group.read->setEnabled(can_request);
-    group.save->setEnabled(can_request && !group.fields.isEmpty() && group.fields.front().loaded);
+    set_control_enabled(group.read, can_request);
+    set_control_enabled(group.save, can_request && !group.fields.isEmpty() && group.fields.front().loaded);
     if (measuring_ && !group.pending) group.feedback->setText(QStringLiteral("检测中，停止后可修改。"));
     else if (group.feedback->text() == QStringLiteral("检测中，停止后可修改。")) group.feedback->clear();
+    update_manual_controls();
 }
 
 void ParameterPage::save_measurement(Group& group) {
@@ -421,7 +785,7 @@ void ParameterPage::finish_save(const QString& name, bool ok, const QString& mes
     group->pending = false;
     update_measurement_controls(laser_);
     update_measurement_controls(spectrometer_);
-    group->feedback->setText(ok ? QStringLiteral("已保存。") : message);
+    group->feedback->setText(ok ? QStringLiteral("已保存，下次正式检测使用。") : message);
     group->feedback->setToolTip(message);
 }
 
@@ -439,44 +803,54 @@ void ParameterPage::finish_reload(const QString& name, const QJsonObject& groups
 }
 
 void ParameterPage::set_air_busy(bool busy) {
-    air_.read->setEnabled(!busy);
-    air_.save->setEnabled(!busy && air_ready_);
-    for (const auto& field : air_.fields) {
-        field.box->setSpecialValueText(air_ready_ ? QString{} : QStringLiteral("—"));
-        if (!air_ready_) field.box->setValue(field.box->minimum());
-        field.box->parentWidget()->setEnabled(!busy && air_ready_);
-    }
+    air_.pending = busy;
+    set_control_enabled(air_.read, !busy);
+    set_control_enabled(air_.save, !busy);
+    for (const auto& field : air_.fields) set_control_enabled(field.box->parentWidget(), !busy);
+    update_manual_controls();
 }
 
 void ParameterPage::show_air_result(const QJsonObject& values, bool ok, const QString& message, bool applied) {
     if (!ok) {
-        if (!applied) air_ready_ = false;
         air_.feedback->setText(message);
         set_air_busy(false);
         return;
     }
-    air_ready_ = std::all_of(air_.fields.cbegin(), air_.fields.cend(), [&values](const auto& field) {
+    const bool valid = std::all_of(air_.fields.cbegin(), air_.fields.cend(), [&values](const auto& field) {
         const auto value = values.value(field.key);
         return value.isDouble() && value.toDouble() >= field.box->minimum() && value.toDouble() <= field.box->maximum();
     });
-    if (air_ready_) {
+    if (valid) {
         for (const auto& field : air_.fields) field.box->setValue(values.value(field.key).toDouble());
+        if (!save_air_settings(values)) {
+            air_.feedback->setText(QStringLiteral("设备设定已确认，本机缓存失败。"));
+            set_air_busy(false);
+            return;
+        }
     }
-    air_.feedback->setText(!air_ready_ ? QStringLiteral("设备返回的设定不完整或超出范围。")
+    air_.feedback->setText(!valid ? QStringLiteral("设备返回的设定不完整或超出范围。")
         : applied ? QStringLiteral("空调设定已保存，回读一致。") : QStringLiteral("已读取设备设定。"));
     set_air_busy(false);
 }
 
 void ParameterPage::load_range_rules() {
+    static const QHash<QString, int> defaults{
+        {QStringLiteral("empty_belt_mm"), 520}, {QStringLiteral("material_delta_mm"), 20},
+        {QStringLiteral("valid_min_mm"), 420}, {QStringLiteral("valid_max_mm"), 500},
+    };
     QSettings settings;
     settings.beginGroup(QStringLiteral("rangefinderRules"));
+    const bool needs_defaults = settings.childKeys().isEmpty();
+    range_rules_ = {};
     for (const auto& field : range_.fields) {
-        const int value = settings.value(field.key).toInt();
+        const int value = needs_defaults ? defaults.value(field.key) : settings.value(field.key).toInt();
         if (value > 0 && value <= field.box->maximum()) {
             field.box->setValue(value);
             range_rules_.insert(field.key, value);
-        }
+        } else field.box->setValue(0);
     }
+    range_.feedback->setText(needs_defaults ? QStringLiteral("已填入参考默认值，请按现场空带和可测距离校准。")
+                                            : QStringLiteral("已读取本机保存的判定参数。"));
 }
 
 void ParameterPage::save_range_rules() {
@@ -510,26 +884,40 @@ void ParameterPage::save_range_rules() {
     render_range();
 }
 
-void ParameterPage::apply_range_reading(const QJsonObject& reading) {
+void ParameterPage::finish_range_sample(const QJsonObject& reading, const QString& error) {
+    range_test_pending_ = false;
+    if (!error.isEmpty()) {
+        range_.manual_feedback->setText(error);
+        update_manual_controls();
+        return;
+    }
     range_reading_ = reading;
-    range_.read->setEnabled(true);
-    render_range();
+    readings_.insert("rangefinder", reading);
+    const auto current = reading.value("error").toString();
+    if (!current.isEmpty()) range_.manual_feedback->setText(current);
+    else if (!reading.value("opened").toBool()) range_.manual_feedback->setText(QStringLiteral("测距仪未打开。"));
+    else if (!reading.value("distance_mm").isDouble()) range_.manual_feedback->setText(QStringLiteral("本次距离读数无效。"));
+    else range_.manual_feedback->setText(range_summary(draft_values(range_)));
+    render_status();
+    update_manual_controls();
 }
 
 void ParameterPage::render_range() {
+    auto* label = status_views_.value(range_.name).readings;
+    const auto status = present_device(range_.name, snapshot_, readings_, reading_error_);
+    const bool show = status.level == Level::Ok;
+    label->setVisible(show);
+    if (show) label->setText(range_summary(measuring_ ? active_range_rules_ : range_rules_));
+}
+
+QString ParameterPage::range_summary(const QJsonObject& rules) const {
     const auto distance = range_reading_.value("distance_mm");
-    const auto error = range_reading_.value("error").toString();
-    if (!distance.isDouble() || !snapshot_.valid) {
-        const QString status = !error.isEmpty() ? QStringLiteral("读取失败")
-            : range_reading_.value("opened").isBool() && !range_reading_.value("opened").toBool()
-                ? QStringLiteral("设备未打开") : QStringLiteral("—");
-        range_result_->setText(QStringLiteral("当前距离 · %1").arg(status));
-        range_result_->setToolTip(error);
-        return;
-    }
+    if (!distance.isDouble()) return QStringLiteral("当前距离  —");
     QString text = QStringLiteral("当前距离 %1 mm").arg(distance.toDouble());
-    const auto& rules = measuring_ ? active_range_rules_ : range_rules_;
-    if (rules.size() == 4) {
+    if (rules.value("material_delta_mm").toDouble() > 0 &&
+        rules.value("empty_belt_mm").toDouble() > rules.value("material_delta_mm").toDouble() &&
+        rules.value("valid_min_mm").toDouble() > 0 &&
+        rules.value("valid_max_mm").toDouble() > rules.value("valid_min_mm").toDouble()) {
         const double mm = distance.toDouble();
         const bool material = rules.value("empty_belt_mm").toDouble() - mm >= rules.value("material_delta_mm").toDouble();
         const bool in_window = mm >= rules.value("valid_min_mm").toDouble() && mm <= rules.value("valid_max_mm").toDouble();
@@ -537,89 +925,92 @@ void ParameterPage::render_range() {
             .arg(material ? QStringLiteral("有料") : QStringLiteral("无料"),
                  in_window ? QStringLiteral("距离可测") : QStringLiteral("距离超窗"));
     }
-    range_result_->setText(text);
-    range_result_->setToolTip(QStringLiteral("判定预览用于调试。当前测试流程由操作员启停。"));
+    return text;
 }
 
 void ParameterPage::build_lamp_card() {
-    lamp_card_ = new Card(QStringLiteral("状态灯参数"), this);
+    using namespace libs::measurement_limits;
+    lamp_card_ = new Card(QStringLiteral("三色状态灯"), this);
+    lamp_card_->setProperty("deviceGroup", QStringLiteral("indicator"));
+    build_status(lamp_card_, QStringLiteral("indicator"));
     lamp_dot_ = new StatusDot(lamp_card_);
-    lamp_card_->add_header_widget(lamp_dot_);
+    lamp_card_->body()->addWidget(lamp_dot_);
+    build_section(lamp_card_, QStringLiteral("手动测试"), QStringLiteral("indicator"));
     auto* fields = new QGridLayout;
     auto* color_label = new QLabel(QStringLiteral("试灯颜色"), lamp_card_);
     auto* mode_label = new QLabel(QStringLiteral("显示方式"), lamp_card_);
+    auto* duration_label = new QLabel(QStringLiteral("试灯持续时间"), lamp_card_);
     lamp_color_ = new QComboBox(lamp_card_);
     lamp_color_->setAccessibleName(color_label->text());
     lamp_color_->addItems({QStringLiteral("红灯"), QStringLiteral("黄灯"), QStringLiteral("绿灯"), QStringLiteral("全灭")});
     lamp_mode_ = new QComboBox(lamp_card_);
     lamp_mode_->setAccessibleName(mode_label->text());
     lamp_mode_->addItems({QStringLiteral("常亮"), QStringLiteral("快闪（2 Hz）")});
+    lamp_duration_ = new ParameterSpinBox(lamp_card_);
+    lamp_duration_->setAccessibleName(duration_label->text());
+    lamp_duration_->setDecimals(1);
+    lamp_duration_->setSingleStep(0.1);
+    lamp_duration_->setRange(kLampTestMinMs / 1000.0, kLampTestMaxMs / 1000.0);
+    lamp_duration_->setSuffix(QStringLiteral(" s"));
+    lamp_duration_->setKeyboardTracking(false);
+    lamp_duration_->setToolTip(QStringLiteral("灯态回读成功后开始计时，到时自动恢复状态灯。"));
+    const auto key = QStringLiteral("indicatorTrial/durationMs");
+    const auto saved = QSettings().value(key, kLampTestDefaultMs).toUInt();
+    lamp_duration_->setValue((saved >= kLampTestMinMs && saved <= kLampTestMaxMs ? saved : kLampTestDefaultMs) / 1000.0);
+    connect(lamp_duration_, &QDoubleSpinBox::valueChanged, this, [key](double seconds) {
+        QSettings().setValue(key, qRound(seconds * 1000.0));
+    });
     fields->addWidget(color_label, 0, 0);
     fields->addWidget(mode_label, 0, 1);
+    fields->addWidget(duration_label, 0, 2);
     fields->addWidget(lamp_color_, 1, 0);
     fields->addWidget(lamp_mode_, 1, 1);
+    fields->addWidget(lamp_duration_, 1, 2);
     fields->setColumnStretch(0, 1);
     fields->setColumnStretch(1, 1);
+    fields->setColumnStretch(2, 1);
     lamp_card_->body()->addLayout(fields);
 
     auto* footer = new QHBoxLayout;
-    lamp_feedback_ = make_hint(QStringLiteral("在界面中预览灯态。"));
+    lamp_feedback_ = make_hint(QStringLiteral("设备就绪且待机时可试灯，到时自动恢复状态灯。"));
+    lamp_feedback_->setTextFormat(Qt::PlainText);
     footer->addWidget(lamp_feedback_, 1);
-    lamp_restore_ = new QPushButton(QStringLiteral("恢复自动"), lamp_card_);
-    lamp_restore_->setObjectName(QStringLiteral("ghost"));
-    footer->addWidget(lamp_restore_);
-    lamp_preview_ = new QPushButton(QStringLiteral("预览试灯"), lamp_card_);
-    lamp_preview_->setObjectName(QStringLiteral("ghost"));
-    footer->addWidget(lamp_preview_);
-    auto* save = new QPushButton(QStringLiteral("保存参数"), lamp_card_);
-    save->setObjectName(QStringLiteral("primary"));
-    save->setAccessibleName(QStringLiteral("保存状态灯试灯参数"));
-    footer->addWidget(save);
+    lamp_test_ = new QPushButton(QStringLiteral("真机试灯"), lamp_card_);
+    lamp_test_->setObjectName(QStringLiteral("ghost"));
+    lamp_test_->setFocusPolicy(Qt::TabFocus);
+    footer->addWidget(lamp_test_);
     lamp_card_->body()->addLayout(footer);
 
-    QSettings settings;
-    lamp_color_->setCurrentIndex(qBound(0, settings.value(QStringLiteral("lampTrial/color"), 0).toInt(), 3));
-    lamp_mode_->setCurrentIndex(qBound(0, settings.value(QStringLiteral("lampTrial/mode"), 0).toInt(), 1));
-    lamp_timer_ = new QTimer(this);
-    lamp_timer_->setInterval(250);
-    connect(lamp_timer_, &QTimer::timeout, this, [this] { lamp_phase_ = !lamp_phase_; render_lamp(); });
     connect(lamp_color_, &QComboBox::currentIndexChanged, this, [this] { render_lamp(); });
-    connect(lamp_restore_, &QPushButton::clicked, this, [this] {
-        lamp_test_ = false;
-        lamp_timer_->stop();
-        lamp_feedback_->setText(QStringLiteral("已退出试灯预览。"));
+    connect(lamp_test_, &QPushButton::clicked, this, [this] {
+        static const QStringList colors{QStringLiteral("red"), QStringLiteral("yellow"), QStringLiteral("green"), QStringLiteral("off")};
+        lamp_duration_->interpretText();
+        const int duration_ms = qRound(lamp_duration_->value() * 1000.0);
+        lamp_pending_ = true;
+        lamp_feedback_->setText(QStringLiteral("正在试灯及确认自动灯态恢复…"));
         render_lamp();
-    });
-    connect(lamp_preview_, &QPushButton::clicked, this, [this] {
-        lamp_test_ = true;
-        lamp_phase_ = true;
-        lamp_test_color_ = lamp_color_->currentIndex();
-        if (lamp_mode_->currentIndex() == 1 && lamp_test_color_ != 3) lamp_timer_->start();
-        else lamp_timer_->stop();
-        lamp_feedback_->setText(QStringLiteral("正在预览试灯。"));
-        render_lamp();
-    });
-    connect(save, &QPushButton::clicked, this, [this] {
-        QSettings state;
-        state.setValue(QStringLiteral("lampTrial/color"), lamp_color_->currentIndex());
-        state.setValue(QStringLiteral("lampTrial/mode"), lamp_mode_->currentIndex());
-        state.sync();
-        lamp_feedback_->setText(state.status() == QSettings::NoError
-            ? QStringLiteral("试灯预设已保存到本机。") : QStringLiteral("本机保存失败。"));
+        update_manual_controls();
+        emit indicator_test_requested({{"action", "test_indicator"}, {"color", colors.value(lamp_color_->currentIndex())},
+            {"mode", lamp_mode_->currentIndex() == 1 ? QStringLiteral("blink-2hz") : QStringLiteral("on")},
+            {"duration_ms", duration_ms}});
     });
     render_lamp();
 }
 
+void ParameterPage::finish_indicator_test(bool ok, const QString& error) {
+    lamp_pending_ = false;
+    lamp_feedback_->setText(ok ? QStringLiteral("真机灯态已回读，已恢复自动。") : error);
+    render_lamp();
+    update_manual_controls();
+}
+
 void ParameterPage::render_lamp() {
-    lamp_restore_->setVisible(lamp_test_);
-    lamp_preview_->setEnabled(!measuring_);
-    lamp_mode_->setEnabled(lamp_color_->currentIndex() != 3);
-    if (lamp_test_) {
-        const auto name = lamp_color_->itemText(lamp_test_color_);
-        lamp_dot_->set_state(lamp_phase_ ? lamp_levels[lamp_test_color_] : Level::Idle,
-            QStringLiteral("试灯 · %1").arg(name));
-        return;
-    }
+    const auto* indicator = snapshot_.device(QStringLiteral("indicator"));
+    set_control_enabled(lamp_test_, snapshot_.valid && snapshot_.error.isEmpty() && indicator && indicator->opened &&
+                           snapshot_.gate.allowed && !measuring_ && !lamp_pending_ && !measurement_command_pending_);
+    set_control_enabled(lamp_color_, !lamp_pending_);
+    set_control_enabled(lamp_mode_, !lamp_pending_ && lamp_color_->currentIndex() != 3);
+    set_control_enabled(lamp_duration_, !lamp_pending_);
     const QString intent = snapshot_.valid ? snapshot_.lamp_intent : QString{};
     if (intent == QLatin1String("ready_green")) lamp_dot_->set_state(Level::Ok, QStringLiteral("自动 · 绿灯"));
     else if (intent == QLatin1String("standby_yellow")) lamp_dot_->set_state(Level::Warn, QStringLiteral("自动 · 黄灯"));

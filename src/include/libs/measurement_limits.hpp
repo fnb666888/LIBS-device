@@ -5,6 +5,14 @@
 
 namespace libs::measurement_limits {
 
+inline constexpr unsigned kMotorJogMinMs = 100;
+inline constexpr unsigned kMotorJogMaxMs = 50000;
+inline constexpr unsigned kMotorJogMinTenthsHz = 1;
+inline constexpr unsigned kMotorJogMaxTenthsHz = 500;
+inline constexpr unsigned kLampTestMinMs = 500;
+inline constexpr unsigned kLampTestDefaultMs = 1000;
+inline constexpr unsigned kLampTestMaxMs = 20000;
+
 // 纯参数元数据：UI、业务和驱动共用，不引入设备操作或业务依赖。
 // 厂家量程来自 laser/air_cooled_laser_rs232_protocol.txt §3.1。
 // SDK 通用积分范围为 0.002~600000 ms，具体探测器下限由 SDK 再校验；

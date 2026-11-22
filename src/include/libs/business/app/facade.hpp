@@ -87,6 +87,7 @@ private:
     Response cmd_config_show(const json::Value& args);
     Response cmd_status(const json::Value& args);
     Response cmd_gate(const json::Value& args);
+    Response cmd_motor(const json::Value& args);
     Response cmd_param_set(const json::Value& args);
     Response cmd_param_get(const json::Value& args);
     Response cmd_capture(const json::Value& args);

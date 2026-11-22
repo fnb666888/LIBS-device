@@ -4,4 +4,7 @@
     <file alias="chevron-down.svg">assets/chevron-down.svg</file>
     <file alias="check.svg">assets/check.svg</file>
   </qresource>
+  <qresource prefix="/ui/help">
+    <file alias="index.html">demo/index.html</file>
+  </qresource>
 </RCC>

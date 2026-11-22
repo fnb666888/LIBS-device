@@ -44,6 +44,18 @@ bool air_fault(std::uint16_t address) {
            address == kCoolingAlarm;
 }
 
+libs::VoidResult verify_indicator_states(
+        libs::devices::Indicator& indicator,
+        const std::map<libs::indicator::Channel, libs::indicator::State>& expected) {
+    const auto actual = indicator.queryAll();
+    if (!actual) return actual.error();
+    for (const auto& [channel, response] : actual.value()) {
+        if (expected.at(channel) != response.state)
+            return libs::Error::make(libs::ErrorKind::device, "indicator_state_mismatch", "灯态与回读不一致");
+    }
+    return libs::VoidResult();
+}
+
 }  // namespace
 
 void Runtime::start_sampler(std::function<void()> sample, unsigned interval_ms) {
@@ -67,6 +79,7 @@ void Runtime::start_device_monitoring() {
     laser_safety_ = {};
     laser_opened_ = false;
     readings_ = json::object();
+    readings_.set("motor", json::object());
     readings_.set("laser", json::object());
     for (const char* name : {"rangefinder", "air_conditioner"}) {
         auto device = json::object();
@@ -76,12 +89,24 @@ void Runtime::start_device_monitoring() {
     readings_.set("spectrometer_channels", spectrum_channels(devices_.spectrometer_channels()));
     indicator_status_ = json::object();
     applied_lamp_state_.reset();
+    head_stopped_.store(false);
+    motor_jog_.reset();
+    motor_jog_confirmed_ = false;
+    motor_jog_error_.clear();
+    motor_watchdog_quiet_until_ = {};
+    motor_watchdog_restore_.reset();
+    motor_watchdog_armed_ = false;
+    motor_frequency_unverified_ = false;
+    motor_stop_pending_ = false;
+    motor_stop_retry_ = false;
+    measurement_starting_ = false;
     auxiliary_ = {};
     auxiliary_fresh_until_ms_ = {};
     if (config_.indicator.enabled) auxiliary_[0].name = "三色灯";
     if (config_.rangefinder.serial.enabled) auxiliary_[1].name = "测距仪";
     if (config_.air_conditioner.serial.enabled) auxiliary_[2].name = "空调";
 
+    if (config_.motor.connection.serial.enabled) sample_motor();
     monitor_->arm();
     measurement_->refresh_gate();
     if (options_.open_devices) {
@@ -89,6 +114,7 @@ void Runtime::start_device_monitoring() {
         if (config_.rangefinder.serial.enabled) start_sampler([this] { sample_rangefinder(); }, kAuxiliaryPollMs);
         if (config_.air_conditioner.serial.enabled) start_sampler([this] { sample_air_conditioner(); }, kAuxiliaryPollMs);
         if (config_.spectrometer.enabled) start_sampler([this] { sample_spectrometer(); }, kSpectrometerPollMs);
+        if (config_.motor.connection.serial.enabled) start_sampler([this] { sample_motor(); }, 100);
     }
     samplers_.emplace_back([this] { run_laser_sampler(); });
 }
@@ -167,6 +193,7 @@ void Runtime::sample_laser() {
 
 void Runtime::collect_gate_facts(readiness::ReadinessFacts& facts) {
     facts.stop_unconfirmed = measurement_ && measurement_->stop_unconfirmed();
+    facts.head_stopped = !config_.motor.connection.serial.enabled || head_stopped_.load();
     std::lock_guard<std::mutex> lock(readings_mutex_);
     facts.devices_opened = laser_opened_;
     facts.laser = laser_safety_;
@@ -209,6 +236,7 @@ void Runtime::publish_auxiliary(AuxiliaryDevice device, DeviceCondition conditio
 }
 
 void Runtime::sample_indicator() {
+    std::lock_guard<std::mutex> io_lock(indicator_sample_mutex_);
     devices_.retry_open(SessionDevice::indicator);
     auto* indicator = devices_.indicator();
     const auto target = monitor_->latest_state();
@@ -220,18 +248,10 @@ void Runtime::sample_indicator() {
         if (applied) applied_lamp_state_ = target;
         else error = applied.error();
     } else {
-        const auto actual = indicator->queryAll();
-        if (!actual) {
-            error = actual.error();
-        } else {
-            const auto expected = readiness::lamp_states(target);
-            for (const auto& [channel, response] : actual.value()) {
-                if (expected.at(channel) != response.state) {
-                    error = libs::Error::make(libs::ErrorKind::device, "indicator_state_mismatch", "灯态与回读不一致");
-                    applied_lamp_state_.reset();
-                    break;
-                }
-            }
+        const auto verified = verify_indicator_states(*indicator, readiness::lamp_states(target));
+        if (!verified) {
+            error = verified.error();
+            if (error.code == "indicator_state_mismatch") applied_lamp_state_.reset();
         }
     }
     const auto condition = !error ? DeviceCondition::normal :
@@ -245,7 +265,58 @@ void Runtime::sample_indicator() {
     indicator_status_ = std::move(lamp);
 }
 
-void Runtime::sample_rangefinder() {
+libs::VoidResult Runtime::test_indicator(
+        const std::map<libs::indicator::Channel, libs::indicator::State>& states, unsigned duration_ms) {
+    std::unique_lock<std::mutex> acquisition(acquisition_mutex_, std::try_to_lock);
+    if (!acquisition.owns_lock() || !measurement_ || measurement_->running() || measurement_->stop_unconfirmed())
+        return libs::Error::make(libs::ErrorKind::device, "indicator_test_busy", "检测或采集未结束，无法试灯");
+
+    std::lock_guard<std::mutex> lock(indicator_sample_mutex_);
+    auto* indicator = devices_.indicator();
+    if (!indicator)
+        return libs::Error::make(libs::ErrorKind::unsupported, "indicator_not_open", "状态灯未打开");
+    if (!measurement_->refresh_gate().allowed || monitor_->latest_state() != MachineState::ready)
+        return libs::Error::make(libs::ErrorKind::device, "indicator_test_not_ready", "仅在设备就绪且待机时允许试灯");
+
+    const auto applied = indicator->applyAll(states, true);
+    libs::VoidResult test_result = applied ? libs::VoidResult() : libs::VoidResult(applied.error());
+    if (applied) {
+        using Clock = std::chrono::steady_clock;
+        const auto started = Clock::now();
+        const auto until = started + std::chrono::milliseconds(duration_ms);
+        const auto poll_interval = std::chrono::milliseconds(kAuxiliaryPollMs);
+        auto next_poll = started + poll_interval;
+        publish_auxiliary(AuxiliaryDevice::indicator, DeviceCondition::normal, {});
+        while (Clock::now() < until) {
+            if (monitor_->latest_state() != MachineState::ready || shutdown_requested()) {
+                test_result = libs::Error::make(libs::ErrorKind::device, "indicator_test_interrupted",
+                                               "设备状态已变化，试灯提前结束");
+                break;
+            }
+            if (Clock::now() >= next_poll) {
+                // Keep the indicator observation current while the automatic sampler is paused.
+                test_result = verify_indicator_states(*indicator, states);
+                if (!test_result) break;
+                publish_auxiliary(AuxiliaryDevice::indicator, DeviceCondition::normal, {});
+                next_poll = Clock::now() + poll_interval;
+            }
+            std::this_thread::sleep_until(std::min(until, Clock::now() + std::chrono::milliseconds(50)));
+        }
+    }
+
+    applied_lamp_state_.reset();
+    const auto target = monitor_->latest_state();
+    const auto restored = readiness::apply_lamp(target, indicator);
+    if (!restored) {
+        return libs::Error::make(libs::ErrorKind::device, "indicator_restore_failed",
+                                 "自动灯态恢复未确认：" + restored.error().message);
+    }
+    applied_lamp_state_ = target;
+    return test_result;
+}
+
+json::Value Runtime::sample_rangefinder() {
+    std::lock_guard<std::mutex> sample_lock(rangefinder_sample_mutex_);
     auto data = json::object();
     devices_.retry_open(SessionDevice::rangefinder);
     auto* range = devices_.rangefinder();
@@ -270,7 +341,8 @@ void Runtime::sample_rangefinder() {
         }
     }
     std::lock_guard<std::mutex> lock(readings_mutex_);
-    readings_.set("rangefinder", std::move(data));
+    readings_.set("rangefinder", data);
+    return data;
 }
 
 void Runtime::sample_air_conditioner() {
@@ -293,9 +365,12 @@ void Runtime::sample_air_conditioner() {
             std::string fault;
             std::vector<std::string> warnings;
             for (const auto& bit : status.value().bits) {
-                if (bit.address == kPowerState) data.set("power_on", json::Value(bit.active));
+                if (bit.address == kPowerState)
+                    data.set("power_on", json::Value(libs::air_conditioner::power_on_from_status_bit(bit.active)));
                 if (bit.address == kCoolingOn) data.set("cooling", json::Value(bit.active));
                 if (bit.address == kHeaterOn) data.set("heating", json::Value(bit.active));
+                if (bit.address == kIndoorFan) data.set("indoor_fan_on", json::Value(bit.active));
+                if (bit.address == kOutdoorFan) data.set("outdoor_fan_on", json::Value(bit.active));
                 if (!bit.is_alarm || !bit.active) continue;
                 alarms.emplace_back(bit.name);
                 if (air_fault(bit.address)) {

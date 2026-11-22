@@ -17,14 +17,13 @@ struct MeasurementDefaults {
     unsigned q_delay_us;
     unsigned q_warmup_s;
     unsigned settle_timeout_ms;
-    unsigned emission_hold_ms;
     unsigned min_discharges;
 };
 
 inline constexpr MeasurementDefaults kRealDeviceDefaults{
     1.05, 10000, 1280.0,
     80, 200, 1, 0, 210, 0,
-    20000, 3000, 1,
+    20000, 1,
 };
 
 static_assert(
@@ -38,7 +37,6 @@ static_assert(
     libs::measurement_limits::accepts("laser", "q_delay_us", kRealDeviceDefaults.q_delay_us) &&
     libs::measurement_limits::accepts("laser", "q_warmup_s", kRealDeviceDefaults.q_warmup_s) &&
     libs::measurement_limits::accepts("laser", "settle_timeout_ms", kRealDeviceDefaults.settle_timeout_ms) &&
-    libs::measurement_limits::accepts("laser", "emission_hold_ms", kRealDeviceDefaults.emission_hold_ms) &&
     libs::measurement_limits::accepts("laser", "min_discharges", kRealDeviceDefaults.min_discharges),
     "real device defaults must stay within the declared parameter limits");
 
